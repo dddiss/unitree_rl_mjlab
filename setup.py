@@ -9,6 +9,7 @@ INSTALL_REQUIRES = [
     "mujoco-warp==3.11.0",
     "torch==2.9.0",
     "warp-lang==1.14.0",
+    "wandb==0.22.3",
 ]
 
 # Installation operation
