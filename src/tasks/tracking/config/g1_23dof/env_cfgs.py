@@ -8,7 +8,7 @@ from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.observation_manager import ObservationGroupCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg
-from mjlab.tasks.tracking.mdp import MotionCommandCfg
+from src.tasks.tracking.mdp import MotionCommandCfg
 
 from src.tasks.tracking.tracking_env_cfg import make_tracking_env_cfg
 

@@ -46,13 +46,15 @@ Run the following command to train a velocity tracking policy:
 python scripts/train.py Unitree-G1-Flat --env.scene.num-envs=4096
 ```
 
-Multi-GPU Training: Scale to multiple GPUs using --gpu-ids:
+Multi-GPU training: pass GPU indices as a quoted Python list to `--gpu-ids`:
 
 ```bash
 python scripts/train.py Unitree-G1-Flat \
-  --gpu-ids 0 1 \
+  --gpu-ids "[0, 1]" \
   --env.scene.num-envs=4096
 ```
+
+Use `--gpu-ids all` to select all available GPUs.
 
 - The first argument (e.g., Mjlab-Velocity-Flat-Unitree-G1) specifies the training task.
 Available velocity tracking tasks:
@@ -75,18 +77,36 @@ Train a Unitree G1 to mimic reference motion sequences.
 
 #### 2.1 Prepare Motion Files
 
-Prepare csv motion files in mjlab/motions/g1/ and convert them to npz format:
+Run the following commands from the project root to convert a CSV motion file to NPZ. Use `--robot g1` for the 29-DoF G1 or `--robot g1_23dof` for the 23-DoF G1, with a matching CSV file:
 
 ```bash
 python scripts/csv_to_npz.py \
---input-file src/assets/motions/g1/dance1_subject2.csv \
---output-name dance1_subject2.npz \
---input-fps 30 \
---output-fps 50 \
---robot g1 # g1 or g1_23dof
+  --robot g1 \
+  --input-file src/assets/motions/g1/dance1_subject2.csv \
+  --input-fps 30 \
+  --output-fps 50
 ```
 
-**npz files will be stored at:**：`src/motions/g1/...`
+The NPZ filename is derived automatically from the CSV filename: `dance1_subject2.csv` produces `dance1_subject2.npz`. The `--output-name` option has been removed. Output directories are:
+
+- `g1`: `src/assets/motions/g1/`
+- `g1_23dof`: `src/assets/motions/g1_23dof/`
+
+Video export is disabled by default (`--save-video False`). To also save one MP4 video for the motion, enable `--save-video True` and optionally set `--video-dir`:
+
+```bash
+python scripts/csv_to_npz.py \
+  --robot g1 \
+  --input-file src/assets/motions/g1/dance1_subject2.csv \
+  --input-fps 30 \
+  --output-fps 50 \
+  --save-video True \
+  --video-dir ./videos
+```
+
+This saves the NPZ in the robot's output directory and the video as `videos/dance1_subject2.mp4`. If `--video-dir` is omitted, the video is saved alongside the NPZ. The camera follows the `robot` entity, and the video frame rate matches `--output-fps` (default: 50 FPS). The input frame rate defaults to 30 FPS; set it to match the CSV recording.
+
+The converter uses `--device cuda:0` by default and automatically falls back to CPU when CUDA is unavailable. You can also select CPU explicitly with `--device cpu`.
 
 #### 2.2 Training
 

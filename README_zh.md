@@ -45,13 +45,15 @@ Mjlab 结合了 [Isaac Lab](https://github.com/isaac-sim/IsaacLab) 的成熟高�
 python scripts/train.py Unitree-G1-Flat --env.scene.num-envs=4096
 ```
 
-多 GPU 训练：使用 --gpu-ids 扩展到多块 GPU：
+多 GPU 训练：使用 `--gpu-ids` 指定 GPU 编号，参数需采用带引号的 Python 列表格式：
 
 ```bash
 python scripts/train.py Unitree-G1-Flat \
-  --gpu-ids 0 1 \
+  --gpu-ids "[0, 1]" \
   --env.scene.num-envs=4096
 ```
+
+使用 `--gpu-ids all` 可选择全部可用 GPU。
 
 - 第一个参数(如 Mjlab-Velocity-Flat-Unitree-G1)为必选参数，确定要启用的训练环境。可选：
   - Unitree-Go2-Flat
@@ -73,18 +75,36 @@ python scripts/train.py Unitree-G1-Flat \
 
 #### 2.1 准备动作文件
 
-将准备好的 csv 格式的动作文件保存在 mjlab/motions/g1/ 目录下，执行下面的指令将其转为训练可用的 npz 文件：
+在项目根目录执行以下命令，将 CSV 动作文件转换为 NPZ。29 自由度 G1 使用 `--robot g1`，23 自由度 G1 使用 `--robot g1_23dof`，并选择对应的 CSV 文件：
 
 ```bash
 python scripts/csv_to_npz.py \
---input-file src/assets/motions/g1/dance1_subject2.csv \
---output-name dance1_subject2.npz \
---input-fps 30 \
---output-fps 50 \
---robot g1 # g1 or g1_23dof
+  --robot g1 \
+  --input-file src/assets/motions/g1/dance1_subject2.csv \
+  --input-fps 30 \
+  --output-fps 50
 ```
 
-**npz文件默认保存路径为**：`src/motions/g1/...`
+NPZ 文件名由 CSV 文件名自动生成：`dance1_subject2.csv` 对应 `dance1_subject2.npz`，不再支持 `--output-name` 参数。输出目录为：
+
+- `g1`：`src/assets/motions/g1/`
+- `g1_23dof`：`src/assets/motions/g1_23dof/`
+
+默认不输出视频（`--save-video False`）。若需同时为该动作保存一份 MP4 视频，设置 `--save-video True`，并可通过 `--video-dir` 指定视频输出目录：
+
+```bash
+python scripts/csv_to_npz.py \
+  --robot g1 \
+  --input-file src/assets/motions/g1/dance1_subject2.csv \
+  --input-fps 30 \
+  --output-fps 50 \
+  --save-video True \
+  --video-dir ./videos
+```
+
+上述命令将 NPZ 保存到对应机器人的输出目录，视频保存为 `videos/dance1_subject2.mp4`。省略 `--video-dir` 时，视频与 NPZ 保存在同一目录。相机跟踪 `robot` 实体，视频帧率与 `--output-fps` 一致（默认 50 FPS）。输入帧率默认为 30 FPS，请按 CSV 动作的实际录制帧率设置。
+
+转换脚本默认使用 `--device cuda:0`，CUDA 不可用时自动回退到 CPU；也可通过 `--device cpu` 显式使用 CPU。
 
 #### 2.2 训练
 

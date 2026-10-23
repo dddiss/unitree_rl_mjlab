@@ -13,17 +13,20 @@ from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import MjlabOnPolicyRunner, RslRlVecEnvWrapper
 from mjlab.tasks.registry import list_tasks, load_env_cfg, load_rl_cfg, load_runner_cls
 from mjlab.tasks.tracking.mdp import MotionCommandCfg
-from mjlab.utils.os import get_wandb_checkpoint_path
 from mjlab.utils.torch import configure_torch_backends
 from mjlab.utils.wrappers import VideoRecorder
 from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
+
+from src.tasks.tracking.mdp import MotionCommandCfg as LocalMotionCommandCfg
 
 
 @dataclass(frozen=True)
 class PlayConfig:
   agent: Literal["zero", "random", "trained"] = "trained"
   checkpoint_file: str | None = None
+  """Local checkpoint file; required for the trained agent."""
   motion_file: str | None = None
+  """Local NPZ motion file; required for tracking tasks."""
   num_envs: int | None = None
   device: str | None = None
   video: bool = False
@@ -55,56 +58,33 @@ def run_play(task_id: str, cfg: PlayConfig):
     env_cfg.terminations = {}
     print("[INFO]: Terminations disabled")
 
-  # Check if this is a tracking task by checking for motion command.
-  is_tracking_task = "motion" in env_cfg.commands and isinstance(
-    env_cfg.commands["motion"], MotionCommandCfg
-  )
+  # Both project-local and upstream tracking tasks require a local motion file.
+  motion_cmd = env_cfg.commands.get("motion")
+  if isinstance(motion_cmd, (MotionCommandCfg, LocalMotionCommandCfg)):
+    if cfg._demo_mode:
+      # Demo mode: use uniform sampling to see more diversity with num_envs > 1.
+      motion_cmd.sampling_mode = "uniform"
+    if cfg.motion_file is None:
+      raise ValueError(
+        "Tracking tasks require --motion-file /path/to/motion.npz (local file)."
+      )
+    motion_path = Path(cfg.motion_file).expanduser()
+    if not motion_path.is_file():
+      raise FileNotFoundError(f"Motion file not found: {motion_path}")
+    print(f"[INFO]: Using local motion file: {motion_path}")
+    motion_cmd.motion_file = str(motion_path)
 
-  if is_tracking_task and cfg._demo_mode:
-    # Demo mode: use uniform sampling to see more diversity with num_envs > 1.
-    motion_cmd = env_cfg.commands["motion"]
-    assert isinstance(motion_cmd, MotionCommandCfg)
-    motion_cmd.sampling_mode = "uniform"
-
-  if is_tracking_task:
-    motion_cmd = env_cfg.commands["motion"]
-    assert isinstance(motion_cmd, MotionCommandCfg)
-
-    # Check for local motion file first (works for both dummy and trained modes).
-    if cfg.motion_file is not None and Path(cfg.motion_file).exists():
-      print(f"[INFO]: Using local motion file: {cfg.motion_file}")
-      motion_cmd.motion_file = cfg.motion_file
-    elif DUMMY_MODE:
-      if not cfg.registry_name:
-        raise ValueError(
-          "Tracking tasks require either:\n"
-          "  --motion-file /path/to/motion.npz (local file)\n"
-          "  --registry-name your-org/motions/motion-name (download from WandB)"
-        )
   log_dir: Path | None = None
   resume_path: Path | None = None
   if TRAINED_MODE:
-    log_root_path = (Path("logs") / "rsl_rl" / agent_cfg.experiment_name).resolve()
-    if cfg.checkpoint_file is not None:
-      resume_path = Path(cfg.checkpoint_file)
-      if not resume_path.exists():
-        raise FileNotFoundError(f"Checkpoint file not found: {resume_path}")
-      print(f"[INFO]: Loading checkpoint: {resume_path.name}")
-    else:
-      if cfg.wandb_run_path is None:
-        raise ValueError(
-          "`wandb_run_path` is required when `checkpoint_file` is not provided."
-        )
-      resume_path, was_cached = get_wandb_checkpoint_path(
-        log_root_path, Path(cfg.wandb_run_path)
+    if cfg.checkpoint_file is None:
+      raise ValueError(
+        "Trained agents require --checkpoint-file /path/to/model.pt (local file)."
       )
-      # Extract run_id and checkpoint name from path for display.
-      run_id = resume_path.parent.name
-      checkpoint_name = resume_path.name
-      cached_str = "cached" if was_cached else "downloaded"
-      print(
-        f"[INFO]: Loading checkpoint: {checkpoint_name} (run: {run_id}, {cached_str})"
-      )
+    resume_path = Path(cfg.checkpoint_file).expanduser()
+    if not resume_path.is_file():
+      raise FileNotFoundError(f"Checkpoint file not found: {resume_path}")
+    print(f"[INFO]: Loading checkpoint: {resume_path.name}")
     log_dir = resume_path.parent
 
   if cfg.num_envs is not None:

@@ -1,9 +1,10 @@
+from contextlib import ExitStack
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 import tyro
-import os
 from tqdm import tqdm
 
 import mjlab
@@ -190,9 +191,9 @@ def run_sim(
   input_fps,
   output_fps,
   output_path,
-  render,
   line_range,
   renderer: OffscreenRenderer | None = None,
+  video_writer: Any | None = None,
 ):
   motion = MotionLoader(
     motion_file=input_file,
@@ -216,11 +217,10 @@ def run_sim(
   }
   file_saved = False
 
-  frames = []
   scene.reset()
 
   print(f"\nStarting simulation with {motion.output_frames} frames...")
-  if render:
+  if video_writer is not None:
     print("Rendering enabled - generating video frames...")
 
   # Create progress bar
@@ -262,9 +262,10 @@ def run_sim(
 
     sim.forward()
     scene.update(sim.mj_model.opt.timestep)
-    if render and renderer is not None:
+    if video_writer is not None:
+      assert renderer is not None
       renderer.update(sim.data)
-      frames.append(renderer.render())
+      video_writer.add_image(renderer.render())
 
     if not file_saved:
       log["joint_pos"].append(robot.data.joint_pos[0, :].cpu().numpy().copy())
@@ -307,29 +308,36 @@ def run_sim(
         ):
           log[k] = np.stack(log[k], axis=0)
         np.savez(output_path, **log)  # type: ignore[arg-type]
+        print(f"Motion saved to {output_path}")
 
 
 def main(
   robot: str,
   input_file: str,
-  output_name: str,
   input_fps: float = 30.0,
   output_fps: float = 50.0,
   device: str = "cuda:0",
-  render: bool = False,
+  save_video: bool = False,
+  video_dir: str | None = None,
   line_range: tuple[int, int] | None = None,
 ):
-  """Replay motion from CSV file and output to npz file.
+  """Convert a CSV motion to a same-stem NPZ and, optionally, an MP4 video.
 
   Args:
+    robot: Robot model: g1 or g1_23dof.
     input_file: Path to the input CSV file.
-    output_name: Path to the output npz file.
     input_fps: Frame rate of the CSV file.
     output_fps: Desired output frame rate.
     device: Device to use.
-    render: Whether to render the simulation and save a video.
+    save_video: Whether to render and save one MP4 video for the motion.
+    video_dir: Video output directory; defaults to the robot's NPZ output directory.
+      The video filename is always the CSV stem followed by .mp4.
     line_range: Range of lines to process from the CSV file.
   """
+  if device.startswith("cuda") and not torch.cuda.is_available():
+    print("[WARNING]: CUDA is not available. Falling back to CPU. This may be slow.")
+    device = "cpu"
+
   sim_cfg = SimulationCfg()
   sim_cfg.mujoco.timestep = 1.0 / output_fps
   if robot == "g1":    # 29 Dof
@@ -403,39 +411,62 @@ def main(
 
   scene.initialize(sim.mj_model, sim.model, sim.data)
 
-  renderer = None
-  if render:
-    viewer_cfg = ViewerConfig(
-      height=480,
-      width=640,
-      origin_type=ViewerConfig.OriginType.ASSET_ROOT,
-      distance=2.0,
-      elevation=-5.0,
-      azimuth=20,
-    )
-    renderer = OffscreenRenderer(
-      model=sim.mj_model,
-      cfg=viewer_cfg,
-      scene=scene,
-    )
-    renderer.initialize()
-  os.makedirs(output_dir, exist_ok=True)
-  if not output_name.endswith(".npz"):
-    output_name += ".npz"
-  output_path = os.path.join(output_dir, output_name)
+  motion_name = Path(input_file).stem
+  output_path = Path(output_dir) / f"{motion_name}.npz"
+  output_path.parent.mkdir(parents=True, exist_ok=True)
 
-  run_sim(
-    sim=sim,
-    scene=scene,
-    joint_names=joint_names,
-    input_fps=input_fps,
-    input_file=input_file,
-    output_fps=output_fps,
-    output_path=output_path,
-    render=render,
-    line_range=line_range,
-    renderer=renderer,
-  )
+  with ExitStack() as stack:
+    renderer = None
+    video_writer = None
+    if save_video:
+      import mediapy as media
+
+      video_output_dir = (
+        Path(video_dir).expanduser() if video_dir is not None else output_path.parent
+      )
+      video_output_dir.mkdir(parents=True, exist_ok=True)
+      video_path = video_output_dir / f"{motion_name}.mp4"
+      viewer_cfg = ViewerConfig(
+        height=480,
+        width=640,
+        origin_type=ViewerConfig.OriginType.ASSET_ROOT,
+        entity_name="robot",
+        distance=2.0,
+        elevation=-5.0,
+        azimuth=20,
+      )
+      renderer = OffscreenRenderer(
+        model=sim.mj_model,
+        cfg=viewer_cfg,
+        scene=scene,
+      )
+      stack.callback(renderer.close)
+      renderer.initialize()
+      video_writer = stack.enter_context(
+        media.VideoWriter(
+          str(video_path),
+          shape=(viewer_cfg.height, viewer_cfg.width),
+          fps=output_fps,
+          codec="h264",
+        )
+      )
+      print(f"Saving video to {video_path}")
+
+    run_sim(
+      sim=sim,
+      scene=scene,
+      joint_names=joint_names,
+      input_fps=input_fps,
+      input_file=input_file,
+      output_fps=output_fps,
+      output_path=output_path,
+      line_range=line_range,
+      renderer=renderer,
+      video_writer=video_writer,
+    )
+
+  if save_video:
+    print(f"Video saved to {video_path}")
 
 
 if __name__ == "__main__":

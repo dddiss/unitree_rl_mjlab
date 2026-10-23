@@ -11,7 +11,6 @@ from mjlab.utils.actuator import (
   ElectricActuator,
   reflected_inertia_from_two_stage_planetary,
 )
-from mjlab.utils.os import update_assets
 from mjlab.utils.spec_config import CollisionCfg
 
 ##
@@ -24,16 +23,8 @@ G1_XML: Path = (
 assert G1_XML.exists()
 
 
-def get_assets(meshdir: str) -> dict[str, bytes]:
-  assets: dict[str, bytes] = {}
-  update_assets(assets, G1_XML.parent / "assets", meshdir)
-  return assets
-
-
 def get_spec() -> mujoco.MjSpec:
-  spec = mujoco.MjSpec.from_file(str(G1_XML))
-  spec.assets = get_assets(spec.meshdir)
-  return spec
+  return mujoco.MjSpec.from_file(str(G1_XML))
 
 
 ##
@@ -143,6 +134,7 @@ G1_ACTUATOR_5020 = BuiltinPositionActuatorCfg(
   damping=DAMPING_5020,
   effort_limit=ACTUATOR_5020.effort_limit,
   armature=ACTUATOR_5020.reflected_inertia,
+  frictionloss=0.0,
 )
 G1_ACTUATOR_7520_14 = BuiltinPositionActuatorCfg(
   target_names_expr=(".*_hip_pitch_joint", ".*_hip_yaw_joint", "waist_yaw_joint"),
@@ -150,6 +142,7 @@ G1_ACTUATOR_7520_14 = BuiltinPositionActuatorCfg(
   damping=DAMPING_7520_14,
   effort_limit=ACTUATOR_7520_14.effort_limit,
   armature=ACTUATOR_7520_14.reflected_inertia,
+  frictionloss=0.0,
 )
 G1_ACTUATOR_7520_22 = BuiltinPositionActuatorCfg(
   target_names_expr=(".*_hip_roll_joint", ".*_knee_joint"),
@@ -157,6 +150,7 @@ G1_ACTUATOR_7520_22 = BuiltinPositionActuatorCfg(
   damping=DAMPING_7520_22,
   effort_limit=ACTUATOR_7520_22.effort_limit,
   armature=ACTUATOR_7520_22.reflected_inertia,
+  frictionloss=0.0,
 )
 G1_ACTUATOR_4010 = BuiltinPositionActuatorCfg(
   target_names_expr=(".*_wrist_pitch_joint", ".*_wrist_yaw_joint"),
@@ -164,6 +158,7 @@ G1_ACTUATOR_4010 = BuiltinPositionActuatorCfg(
   damping=DAMPING_4010,
   effort_limit=ACTUATOR_4010.effort_limit,
   armature=ACTUATOR_4010.reflected_inertia,
+  frictionloss=0.0,
 )
 
 # Waist pitch/roll and ankles are 4-bar linkages with 2 5020 actuators.
@@ -177,6 +172,7 @@ G1_ACTUATOR_WAIST = BuiltinPositionActuatorCfg(
   damping=DAMPING_5020 * 2,
   effort_limit=ACTUATOR_5020.effort_limit * 2,
   armature=ACTUATOR_5020.reflected_inertia * 2,
+  frictionloss=0.0,
 )
 G1_ACTUATOR_ANKLE = BuiltinPositionActuatorCfg(
   target_names_expr=(".*_ankle_pitch_joint", ".*_ankle_roll_joint"),
@@ -184,6 +180,7 @@ G1_ACTUATOR_ANKLE = BuiltinPositionActuatorCfg(
   damping=DAMPING_5020 * 2,
   effort_limit=ACTUATOR_5020.effort_limit * 2,
   armature=ACTUATOR_5020.reflected_inertia * 2,
+  frictionloss=0.0,
 )
 
 ##
@@ -228,8 +225,10 @@ KNEES_BENT_KEYFRAME = EntityCfg.InitialStateCfg(
 # are given condim=3.
 FULL_COLLISION = CollisionCfg(
   geom_names_expr=(".*_collision",),
+  contype=1,
+  conaffinity=1,
   condim={r"^(left|right)_foot[1-7]_collision$": 3, ".*_collision": 1},
-  priority={r"^(left|right)_foot[1-7]_collision$": 1},
+  priority={r"^(left|right)_foot[1-7]_collision$": 1, ".*_collision": 0},
   friction={r"^(left|right)_foot[1-7]_collision$": (0.6,)},
 )
 
@@ -238,7 +237,7 @@ FULL_COLLISION_WITHOUT_SELF = CollisionCfg(
   contype=0,
   conaffinity=1,
   condim={r"^(left|right)_foot[1-7]_collision$": 3, ".*_collision": 1},
-  priority={r"^(left|right)_foot[1-7]_collision$": 1},
+  priority={r"^(left|right)_foot[1-7]_collision$": 1, ".*_collision": 0},
   friction={r"^(left|right)_foot[1-7]_collision$": (0.6,)},
 )
 
@@ -277,7 +276,7 @@ def get_g1_robot_cfg() -> EntityCfg:
   the config is shared across multiple places.
   """
   return EntityCfg(
-    init_state=HOME_KEYFRAME,
+    init_state=KNEES_BENT_KEYFRAME,
     collisions=(FULL_COLLISION,),
     spec_fn=get_spec,
     articulation=G1_ARTICULATION,

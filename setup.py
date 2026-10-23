@@ -4,8 +4,9 @@ from setuptools import setup, find_packages
 
 # Minimum dependencies required prior to installation
 INSTALL_REQUIRES = [
-    "mjlab==1.2.0",
-    "mujoco-warp==3.5.0",
+    "mjlab==1.6.0",
+    "mujoco==3.11.0",
+    "mujoco-warp==3.11.0",
 ]
 
 # Installation operation
