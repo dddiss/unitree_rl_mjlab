@@ -7,6 +7,8 @@ INSTALL_REQUIRES = [
     "mjlab==1.6.0",
     "mujoco==3.11.0",
     "mujoco-warp==3.11.0",
+    "torch==2.9.0",
+    "warp-lang==1.14.0",
 ]
 
 # Installation operation
