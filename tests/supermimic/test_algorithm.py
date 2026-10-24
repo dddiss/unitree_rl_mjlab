@@ -1,0 +1,173 @@
+import torch
+from supermimic.mdp.state import flatten_state,unflatten_state
+from supermimic.mdp.rotations import mat_to_6d,so3_exp
+from supermimic.rl.algorithm import SuperMimicAlgorithm
+from supermimic.rl.buffer import ReplayBuffer
+from supermimic.config.g1.rl_cfg import SuperMimicConfig
+
+
+def small_config(**kwargs):
+  values=dict(num_envs=2,buffer_steps=16,wm_window=2,wm_batch=4,wm_batches=1,pi_batch=4,
+              horizon=3,hist=2,goal_frames=2,critic_epochs=1,critic_minibatches=2,
+              wm_hidden=(24,24),policy_hidden=(24,24),critic_hidden=(24,),amp='none',compile=False,logger='csv')
+  values.update(kwargs)
+  return SuperMimicConfig(**values)
+
+
+def filled_buffer(mdp,cfg):
+  m=mdp.motion
+  xi=torch.zeros(2,33);xi[:,0]=.7
+  b=ReplayBuffer(cfg.buffer_steps,2,xi,m.clip_end,m.clip_id,cfg.horizon)
+  transitions=[]
+  for step in range(8):
+    f=torch.full((2,),step+1,dtype=torch.long)
+    make=lambda frame:flatten_state((*mdp.reference_root(frame),m.joint_pos[frame],m.joint_vel[frame]))
+    tr=dict(s=make(f-1),s1=make(f),a=torch.zeros(2,29),a_prev=torch.zeros(2,29),f=f,
+            r=torch.ones(2)*.1,ep_step=torch.full((2,),step),terminated=torch.zeros(2,dtype=torch.bool),
+            truncated=torch.zeros(2,dtype=torch.bool))
+    b.add(tr);transitions.append(tr)
+  return b,transitions
+
+
+def test_updates_and_freezing(mdp):
+  torch.set_num_threads(2)
+  cfg=small_config()
+  alg=SuperMimicAlgorithm(mdp,cfg,'cpu')
+  buffer,transitions=filled_buffer(mdp,cfg)
+  for tr in transitions:alg.observe(tr,buffer.xi)
+  wm_before=[p.detach().clone() for p in alg.wm.parameters()]
+  metrics=alg.world_model_update(buffer)
+  assert all(torch.isfinite(torch.tensor(v)) for v in metrics.values())
+  assert any(not torch.equal(a,b) for a,b in zip(wm_before,alg.wm.parameters()))
+  wm_before=[p.detach().clone() for p in alg.wm.parameters()]
+  pi_before=[p.detach().clone() for p in alg.policy.parameters()]
+  v_before=[p.detach().clone() for p in alg.critic.parameters()]
+  metrics=alg.policy_update(buffer)
+  assert metrics['policy_skipped']==0 and metrics['pi_gradnorm']>0
+  assert all(torch.equal(a,b) for a,b in zip(wm_before,alg.wm.parameters()))
+  assert any(not torch.equal(a,b) for a,b in zip(pi_before,alg.policy.parameters()))
+  assert any(not torch.equal(a,b) for a,b in zip(v_before,alg.critic.parameters()))
+  assert all(p.requires_grad for p in alg.wm.parameters())
+
+
+def test_missing_imagination_start(mdp):
+  cfg=small_config(horizon=100)
+  b,_=filled_buffer(mdp,cfg)
+  alg=SuperMimicAlgorithm(mdp,cfg,'cpu')
+  assert alg.policy_update(b)=={'policy_skipped':1.0}
+
+
+def test_policy_uses_proprioception_and_relative_goal_dimensions(mdp):
+  cfg=small_config(hist=10,goal_frames=10)
+  alg=SuperMimicAlgorithm(mdp,cfg,'cpu')
+  assert alg.policy.obs_norm.mean.shape==(93,)
+  assert alg.policy.dec[0].in_features==962  # 93 * 10 history + 32 latent.
+  assert alg.policy.enc[0].in_features==640
+  assert alg.wm.in_dim==133
+  assert alg.critic.net[0].in_features==824
+  f=torch.tensor([1,4])
+  state=(*mdp.reference_root(f),mdp.motion.joint_pos[f],mdp.motion.joint_vel[f])
+  obs=mdp.obs(state,torch.zeros(2,29),torch.zeros(2,33),f).requires_grad_()
+  goal=mdp.goal(state,f,cfg.goal_frames).requires_grad_()
+  action=alg.policy(obs[:,None].expand(-1,cfg.hist,-1),goal)
+  assert action.shape==(2,29) and torch.isfinite(action).all()
+  action.sum().backward()
+  assert torch.isfinite(obs.grad).all()
+  assert (obs.grad.abs().sum(-1)>0).all()
+  assert torch.isfinite(goal.grad).all()
+  assert (goal.grad.reshape(2,10,64)[:,:,58:].abs().sum((1,2))>0).all()
+
+
+def test_imagination_reencodes_goal_from_predicted_state_with_gradients(mdp):
+  cfg=small_config(goal_frames=10)
+  alg=SuperMimicAlgorithm(mdp,cfg,'cpu')
+  f=torch.tensor([4,mdp.motion.clip_end[-1]])
+  state=(*mdp.reference_root(f-1),mdp.motion.joint_pos[f-1],mdp.motion.joint_vel[f-1])
+  xi=torch.zeros(2,33)
+  obs=mdp.obs(state,torch.zeros(2,29),xi,f)
+  history=obs[:,None].expand(-1,cfg.hist,-1)
+  def controlled_dynamics(s,a,xi_n):
+    # Distinct next rotations plus a differentiable action-to-rotation path.
+    dr=so3_exp(a[:,:3]+a.new_tensor([.2,-.15,.3]))
+    return (s[0],s[1]@dr,*s[2:])
+  alg.wm.step=controlled_dynamics
+  next_state,action,_,next_f,goal=alg._imagine_step(state,history,f,xi,mdp.goal(state,f))
+  assert next_f.tolist()==[5,int(mdp.motion.clip_end[-1])]
+  torch.testing.assert_close(goal,mdp.goal(next_state,next_f))
+  assert not torch.allclose(goal,mdp.goal(state,next_f))
+  action.retain_grad()
+  # Use only goal orientation, so this tests the goal path rather than rewards.
+  orientation=goal.reshape(2,10,64)[:,:,58:]
+  (orientation*torch.arange(1.,7.)).sum().backward()
+  assert torch.isfinite(action.grad).all()
+  assert (action.grad[:,:3].abs().sum(-1)>0).all()
+
+
+def test_imagination_uses_noisy_policy_goals_and_clean_critic_goals(mdp):
+  cfg=small_config(pi_batch=3,goal_frames=3)
+  alg=SuperMimicAlgorithm(mdp,cfg,'cpu')
+  m=mdp.motion
+  # Ensure each imagined state has a different, non-identity robot rotation.
+  alg.wm.out_norm.mean[3:6]=torch.tensor([.1,-.06,.08])
+  # The first two rows reach different clips' last frames on step 3; row 3
+  # stays in the middle of its clip and must keep the ordinary goal convention.
+  f=torch.tensor([48,55,7])
+  xi=torch.zeros(3,33);xi[:,0]=.75
+  make=lambda frame:flatten_state((*mdp.reference_root(frame),m.joint_pos[frame],m.joint_vel[frame]))
+  hist_f=f[:,None]+torch.tensor([-1,0])
+  start=dict(s=make(f-1),a_prev=torch.zeros(3,29),f=f,xi=xi)
+  history=dict(s=make(hist_f-1),a_prev=torch.zeros(3,2,29),f=hist_f,xi=xi[:,None].expand(-1,2,-1))
+  class FixedStarts:
+    def sample_starts(self,batch,hist):
+      assert batch==3 and hist==2
+      return start,history
+  inputs=[];imagined=[];policy_goals=[]
+  original_imagine=alg._imag_step
+  def capture_imagine(*args):
+    result=original_imagine(*args)
+    imagined.append((tuple(t.detach().clone() for t in result[0]),result[3].clone()))
+    return result
+  alg._imag_step=capture_imagine
+  hook=alg.critic.register_forward_pre_hook(lambda module,args:inputs.append(args[0].detach().clone()))
+  policy_hook=alg.policy.goal_norm.register_forward_pre_hook(
+    lambda module,args:policy_goals.append(args[0].detach().clone()))
+  try:
+    metrics=alg.policy_update(FixedStarts())
+  finally:
+    hook.remove()
+    policy_hook.remove()
+  assert metrics['policy_skipped']==0
+  assert all(torch.isfinite(torch.tensor(v)) for v in metrics.values())
+  # First critic call is the actor bootstrap; second is the H+1 states used
+  # for critic lambda-returns. Both must receive the same final encoded goal.
+  assert inputs[1].shape[:2]==(cfg.horizon+1,3)
+  torch.testing.assert_close(inputs[0],inputs[1][-1])
+  goal_dim=64*cfg.goal_frames
+  final_goals=inputs[0][:,-goal_dim:].reshape(3,cfg.goal_frames,64)
+  ends=m.clip_end
+  torch.testing.assert_close(final_goals[:2,:,:29],m.joint_pos[ends,None].expand(-1,cfg.goal_frames,-1))
+  torch.testing.assert_close(final_goals[:2],final_goals[:2,:1].expand(-1,cfg.goal_frames,-1))
+  assert not torch.allclose(final_goals[:2,:,58:],mat_to_6d(torch.eye(3)).expand(2,cfg.goal_frames,6))
+  # Every lambda-return state uses its OWN robot rotation, including the final
+  # bootstrap state. Reusing the last pre-step goal would fail this comparison.
+  all_states=[(unflatten_state(start['s']),f),*imagined]
+  assert len(policy_goals)==cfg.horizon
+  for step,(state,target) in enumerate(all_states):
+    targets=torch.minimum(target[:,None]+torch.arange(cfg.goal_frames),m.clip_end[m.clip_id[target]][:,None])
+    _,reference_r,_,_=mdp.reference_root(targets)
+    expected=torch.cat((m.joint_pos[targets],m.joint_vel[targets],
+                        mat_to_6d(state[1].transpose(-1,-2)[:,None]@reference_r)),-1)
+    torch.testing.assert_close(inputs[1][step,:,-goal_dim:],expected.flatten(1))
+    if step<cfg.horizon:
+      # Noise is present BEFORE the policy's RunningNorm, on orientation only.
+      difference=policy_goals[step].reshape(3,cfg.goal_frames,64)-expected
+      torch.testing.assert_close(difference[...,:58],torch.zeros_like(difference[...,:58]),rtol=0,atol=0)
+      assert difference[...,58:].abs().max()<=.05+1e-6
+      assert (difference[...,58:].abs().sum(-1)>0).all()
+  # Critic normalization and minibatches also receive the clean trajectory.
+  torch.testing.assert_close(alg.critic.norm.mean,inputs[1].flatten(0,1).mean(0))
+  clean_rows=inputs[1][:-1].flatten(0,1)
+  for batch in inputs[2:]:
+    assert (batch[:,None]==clean_rows[None]).all(-1).any(-1).all()
+  assert imagined[-1][1].tolist()==[50,57,10]
+  assert not torch.allclose(inputs[1][-2,:2,-goal_dim:],inputs[1][-1,:2,-goal_dim:])

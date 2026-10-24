@@ -252,3 +252,15 @@ cd deploy/robots/g1/build
 - [mujoco_warp](https://github.com/google-deepmind/mujoco_warp.git): 提供 GPU 加速渲染与仿真接口。
 - [mujoco](https://github.com/google-deepmind/mujoco.git): 提供强大仿真功能。
 
+
+## SuperMimic（G1 29DoF）
+
+新增独立的世界模型训练流程，使用本项目的 mjlab 环境和多 NPZ 动作库。原有 PPO 入口保持原用途。
+
+```bash
+python scripts/train_supermimic.py --motion-file src/assets/motions/g1 --log-dir logs/supermimic/g1
+python scripts/evaluate_supermimic.py --motion-file src/assets/motions/g1 --checkpoint-file logs/supermimic/g1/last.pt
+python scripts/play_supermimic.py --motion-file src/assets/motions/g1 --checkpoint-file logs/supermimic/g1/last.pt --viewer viser
+```
+
+短程检查、恢复训练、逐动作 MP4、文件分工和验证状态见 [SuperMimic 文档](doc/supermimic.md)。当前已完成 CPU 算法/数学测试，Linux NVIDIA GPU 集成与性能验收待进行；本轮不包含 ONNX 或实机部署适配。

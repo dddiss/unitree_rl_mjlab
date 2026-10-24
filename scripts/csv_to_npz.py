@@ -320,6 +320,7 @@ def main(
   save_video: bool = False,
   video_dir: str | None = None,
   line_range: tuple[int, int] | None = None,
+  output_dir: str | None = None,
 ):
   """Convert a CSV motion to a same-stem NPZ and, optionally, an MP4 video.
 
@@ -333,6 +334,7 @@ def main(
     video_dir: Video output directory; defaults to the robot's NPZ output directory.
       The video filename is always the CSV stem followed by .mp4.
     line_range: Range of lines to process from the CSV file.
+    output_dir: NPZ output directory; defaults to src/assets/motions/<robot>.
   """
   if device.startswith("cuda") and not torch.cuda.is_available():
     print("[WARNING]: CUDA is not available. Falling back to CPU. This may be slow.")
@@ -373,7 +375,7 @@ def main(
       "right_wrist_pitch_joint",
       "right_wrist_yaw_joint",
     ]
-    output_dir = "./src/assets/motions/g1"
+    default_output_dir = "./src/assets/motions/g1"
   elif robot == "g1_23dof":
     scene = Scene(unitree_g1_23dof_flat_tracking_env_cfg().scene, device=device)
     joint_names=[    # 23 Dof
@@ -401,7 +403,7 @@ def main(
       "right_elbow_joint",
       "right_wrist_roll_joint",
     ]
-    output_dir = "./src/assets/motions/g1_23dof"
+    default_output_dir = "./src/assets/motions/g1_23dof"
   else:
     raise ValueError(f"Unsupported robot: {robot}")
 
@@ -412,7 +414,7 @@ def main(
   scene.initialize(sim.mj_model, sim.model, sim.data)
 
   motion_name = Path(input_file).stem
-  output_path = Path(output_dir) / f"{motion_name}.npz"
+  output_path = Path(output_dir or default_output_dir).expanduser() / f"{motion_name}.npz"
   output_path.parent.mkdir(parents=True, exist_ok=True)
 
   with ExitStack() as stack:

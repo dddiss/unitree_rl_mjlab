@@ -256,3 +256,15 @@ This project would not be possible without the contributions of the following re
 - [rsl_rl](https://github.com/leggedrobotics/rsl_rl.git): reinforcement learning algorithm implementation
 - [mujoco_warp](https://github.com/google-deepmind/mujoco_warp.git): GPU-accelerated rendering and simulation interface
 - [mujoco](https://github.com/google-deepmind/mujoco.git): high-fidelity rigid-body physics engine
+
+## SuperMimic (G1 29DoF)
+
+An independent world-model training path uses this project's mjlab environment and multi-NPZ motion library. Existing PPO entry points retain their original purpose.
+
+```bash
+python scripts/train_supermimic.py --motion-file src/assets/motions/g1 --log-dir logs/supermimic/g1
+python scripts/evaluate_supermimic.py --motion-file src/assets/motions/g1 --checkpoint-file logs/supermimic/g1/last.pt
+python scripts/play_supermimic.py --motion-file src/assets/motions/g1 --checkpoint-file logs/supermimic/g1/last.pt --viewer viser
+```
+
+See the [SuperMimic guide](doc/supermimic.md) for smoke tests, resuming, per-motion MP4 output, architecture and validation status. CPU algorithm/math tests have passed; Linux NVIDIA GPU integration and performance validation remain pending. ONNX and real-robot deployment are outside this implementation.
