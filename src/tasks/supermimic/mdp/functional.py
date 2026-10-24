@@ -140,13 +140,18 @@ class FunctionalMDP:
              * (1 - torch.sigmoid((tilt - self.cfg.term_tilt) / 0.04)))
     return 1 - alive
 
-  def critic_features(self, state, f, normalized_xi):
+  def critic_features(self, state, f, normalized_xi, a_prev):
+    """Privileged state/errors and the action that produced this state.
+
+    Root-relative orientation is already present in the first goal frame, so
+    it is not repeated here. The previous action is a single 29D vector.
+    """
     p, r, _, _, q, _ = state
-    rp, rr, _, _ = self.reference_root(f)
+    rp, _, _, _ = self.reference_root(f)
     bp = self.kin.forward(*state)[0]
     ref_bp, _ = self.aligned_reference(state, f)
     ht = yaw_mat(r).transpose(-1, -2)
     return torch.cat((invariant_features(state), self.motion.joint_pos[f] - q,
                       (ht.unsqueeze(-3) @ (ref_bp - bp).unsqueeze(-1)).squeeze(-1).flatten(-2),
                       (ht @ (rp - p).unsqueeze(-1)).squeeze(-1),
-                      mat_to_6d(r.transpose(-1, -2) @ rr), normalized_xi), -1)
+                      a_prev, normalized_xi), -1)

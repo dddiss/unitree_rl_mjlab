@@ -191,7 +191,7 @@ def test_terminal_summary_follows_log_intervals_and_preserves_csv_wandb(
     logger="wandb", wandb_mode="offline"), tmp_path)
   monkeypatch.setattr(runner, "controller", lambda: torch.zeros(2, 29))
   monkeypatch.setattr(runner.algorithm, "observe", lambda *args: None)
-  monkeypatch.setattr(runner.algorithm, "world_model_update", lambda _: {
+  monkeypatch.setattr(runner.algorithm, "world_model_update", lambda _, **kwargs: {
     "wm_loss": .125, "wm_err_last": .25})
   monkeypatch.setattr(runner.algorithm, "policy_update", lambda _: {
     "pi_loss": -1.5, "v_loss": 2.5, "pi_gradnorm": .75,

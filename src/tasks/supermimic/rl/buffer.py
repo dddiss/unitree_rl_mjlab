@@ -20,6 +20,7 @@ class ReplayBuffer:
                                dtype=dtype, device=self.device) for k, (n, dtype) in FIELDS.items()}
     self.eligible = torch.zeros(capacity, num_envs, dtype=torch.bool, device=self.device)
     self.ptr = self.size = 0
+    self._window_choices = {}
 
   @torch.no_grad()
   def add(self, transition):
@@ -29,16 +30,48 @@ class ReplayBuffer:
     self.eligible[self.ptr] = self.clip_end[self.clip_id[f]] - f + 1 >= self.horizon
     self.ptr = (self.ptr + 1) % self.capacity
     self.size = min(self.size + 1, self.capacity)
+    self._window_choices.clear()
 
   def _row(self, age):
     return (self.ptr - self.size + age) % self.capacity
 
-  def sample_windows(self, batch, length):
+  def _strict_window_choices(self, length):
+    """Return chronological (start age, environment) pairs within one episode."""
+    if length not in self._window_choices:
+      rows = self._row(torch.arange(self.size, device=self.device))
+      steps = self.data["ep_step"][rows]
+      done = self.data["terminated"][rows] | self.data["truncated"][rows]
+      # A boundary sits between two transitions. The last transition in a
+      # window may end the episode, but none of its earlier transitions may.
+      boundaries = done[:-1] | (steps[1:] != steps[:-1] + 1)
+      prefix = torch.cat((torch.zeros(1, self.num_envs, dtype=torch.long,
+                                     device=self.device),
+                          boundaries.cumsum(0)), dim=0)
+      count = self.size - length + 1
+      valid = prefix[length - 1:] == prefix[:count]
+      self._window_choices[length] = valid.nonzero(as_tuple=False)
+    return self._window_choices[length]
+
+  def sample_windows(self, batch, length, *, strict=False):
+    """Sample WM windows, optionally requiring all steps in one episode.
+
+    Warmup uses the original masked windows. Strict sampling returns None if
+    no complete window is available; it never loops over rejected samples.
+    """
     if self.size < length:
+      if strict:
+        return None
       raise ValueError("Not enough collected steps for a world-model window")
-    ages = torch.randint(self.size - length + 1, (batch,), device=self.device)[:, None]
+    if strict:
+      choices = self._strict_window_choices(length)
+      if choices.numel() == 0:
+        return None
+      selected = choices[torch.randint(len(choices), (batch,), device=self.device)]
+      ages, envs = selected[:, :1], selected[:, 1:]
+    else:
+      ages = torch.randint(self.size - length + 1, (batch,), device=self.device)[:, None]
+      envs = torch.randint(self.num_envs, (batch,), device=self.device)[:, None]
     rows = self._row(ages + torch.arange(length, device=self.device))
-    envs = torch.randint(self.num_envs, (batch,), device=self.device)[:, None]
     out = {k: self.data[k][rows, envs] for k in ("s", "s1", "a", "terminated", "truncated")}
     done = out["terminated"] | out["truncated"]
     out["mask"] = torch.cat((torch.ones(batch, 1, device=self.device),

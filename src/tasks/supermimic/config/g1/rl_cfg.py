@@ -22,9 +22,9 @@ class SuperMimicConfig:
   action_noise: float = 0.1
   critic_epochs: int = 5
   critic_minibatches: int = 4
-  enable_warmup: bool = True
-  warmup_steps: int = 64
-  wm_only_iters: int = 500
+  enable_warmup: bool = True  # Controls only the WM-only phase, not replay filling.
+  warmup_steps: int = 64  # Initial replay fill for both fresh and resumed runs.
+  wm_only_iters: int = 500  # Masked windows here; full same-episode windows afterward.
   lr_decay_iters: int = 250_000
   ckpt_every: int = 2000
   log_every: int = 50

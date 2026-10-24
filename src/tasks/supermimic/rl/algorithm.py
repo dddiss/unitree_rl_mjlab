@@ -33,7 +33,7 @@ class SuperMimicAlgorithm:
     goal_dim = GOAL_FRAME_DIM * cfg.goal_frames
     self.wm = WorldModel(cfg.wm_hidden).to(device)
     self.policy = Policy(OBS_DIM, goal_dim, cfg.hist, hidden=cfg.policy_hidden).to(device)
-    self.critic = Critic(INV_DIM + 29 + 14 * 3 + 3 + 6 + 33 + goal_dim, cfg.critic_hidden).to(device)
+    self.critic = Critic(INV_DIM + 29 + 14 * 3 + 3 + 29 + 33 + goal_dim, cfg.critic_hidden).to(device)
     self.opt_wm = torch.optim.Adam(self.wm.parameters(), lr=cfg.lr)
     self.opt_pi = torch.optim.Adam(self.policy.parameters(), lr=cfg.lr, betas=(0.9, 0.95))
     self.opt_v = torch.optim.Adam(self.critic.parameters(), lr=cfg.lr)
@@ -68,9 +68,12 @@ class SuperMimicAlgorithm:
       predictions.append(state)
     return tuple(torch.stack([s[i] for s in predictions], 1) for i in range(6))
 
-  def world_model_update(self, buffer):
+  def world_model_update(self, buffer, *, strict=False):
+    """Fit one batch; skip if strict sampling has no complete same-episode window."""
     c = self.cfg
-    w = buffer.sample_windows(c.wm_batch, c.wm_window)
+    w = buffer.sample_windows(c.wm_batch, c.wm_window, strict=strict)
+    if w is None:
+      return None
     predicted = self._world_rollout(w["s"], w["a"], w["xi"])
     scale = torch.maximum(self.wm.out_norm.std(), self.error_floor)
     error = (self.wm.state_error(predicted, unflatten_state(w["s1"])) / scale).square().mean(-1)
@@ -84,8 +87,8 @@ class SuperMimicAlgorithm:
     last = (error[:, -1] * w["mask"][:, -1]).sum() / w["mask"][:, -1].sum().clamp_min(1)
     return {"wm_loss": float(loss.detach() / c.wm_window), "wm_err_last": float(last.detach())}
 
-  def critic_input(self, state, f, xi_n, goal):
-    return torch.cat((self.mdp.critic_features(state, f, xi_n), goal), -1)
+  def critic_input(self, state, f, xi_n, goal, a_prev):
+    return torch.cat((self.mdp.critic_features(state, f, xi_n, a_prev), goal), -1)
 
   def reward_term(self, state, f, action, a_prev):
     return self.mdp.reward(state, f, action, a_prev), self.mdp.soft_termination(state, f)
@@ -140,7 +143,8 @@ class SuperMimicAlgorithm:
       prior_alive = torch.cat((torch.ones_like(alive[:1]), alive[:-1]), 0)
       discount = c.gamma ** torch.arange(c.horizon, device=self.device)[:, None]
       objective = (discount * prior_alive * r).sum(0)
-      objective += c.gamma ** c.horizon * alive[-1] * self.critic(self._critic_input(state, f, xi_n, goal))
+      objective += c.gamma ** c.horizon * alive[-1] * self.critic(
+        self._critic_input(state, f, xi_n, goal, a_prev))
       loss = -objective.mean()
       self.opt_pi.zero_grad(set_to_none=True)
       loss.backward()
@@ -153,8 +157,11 @@ class SuperMimicAlgorithm:
     with torch.no_grad():
       critic_states = tuple(flat([s[i].detach() for s in states]) for i in range(6))
       critic_xi = xi_n.unsqueeze(0).expand(c.horizon + 1, -1, -1).flatten(0, 1)
+      # s[0] uses replay a_prev; s[t+1] uses imagined a[t], including bootstrap.
+      critic_previous = flat([a.detach() for a in (*previous_actions, a_prev)])
       x = self._critic_input(critic_states, flat(frames), critic_xi,
-                             flat([g.detach() for g in goals])).reshape(c.horizon + 1, batch_size, -1)
+                             flat([g.detach() for g in goals]), critic_previous)
+      x = x.reshape(c.horizon + 1, batch_size, -1)
       self.critic.norm.update(x)
       v = self.critic(x)
       ret, targets = v[-1], []

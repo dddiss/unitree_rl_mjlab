@@ -1,6 +1,7 @@
 """Batch routing tests; simulation/data conversion stays in csv_to_npz.py."""
 
 import importlib.util
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -16,42 +17,44 @@ spec.loader.exec_module(batch)
 
 @pytest.fixture
 def converter(tmp_path, monkeypatch):
-  """Run real subprocesses with a lightweight converter to test CLI forwarding."""
-  script = tmp_path / "fake_converter.py"
-  script.write_text('''
-import argparse
-import json
-from pathlib import Path
+  """Exercise directory routing without initializing GPU/GUI dependencies."""
+  class Converter:
+    def __init__(self, robot, output_fps, device):
+      self.config = dict(robot=robot, output_fps=output_fps, device=device)
+      with (tmp_path / "init.jsonl").open("a") as log:
+        log.write(json.dumps(self.config) + "\n")
 
-p = argparse.ArgumentParser()
-for name in ("robot", "input-file", "input-fps", "output-fps", "output-dir", "device", "save-video"):
-    p.add_argument("--" + name, required=True)
-p.add_argument("--video-dir")
-p.add_argument("--line-range", nargs=2, type=int)
-a = p.parse_args()
-source = Path(a.input_file)
-with open("calls.jsonl", "a") as calls:
-    calls.write(json.dumps(vars(a)) + "\\n")
-if source.stem == "broken":
-    raise SystemExit(1)
-if source.stem == "missing_output":
-    raise SystemExit(0)
-out = Path(a.output_dir) / (source.stem + ".npz")
-out.parent.mkdir(parents=True, exist_ok=True)
-out.write_text("converted")
-if a.save_video == "True":
-    video = Path(a.video_dir) / (source.stem + ".mp4")
-    video.parent.mkdir(parents=True, exist_ok=True)
-    video.write_text("video")
-''')
-  monkeypatch.setattr(batch, "CONVERTER", script)
+    def __enter__(self):
+      return self
+
+    def __exit__(self, *args):
+      with (tmp_path / "closed.txt").open("a") as log:
+        log.write("closed\n")
+
+    def convert(self, **kwargs):
+      with (tmp_path / "calls.jsonl").open("a") as log:
+        log.write(json.dumps(self.config | kwargs, default=str) + "\n")
+      source = kwargs["input_file"]
+      if source.stem == "broken":
+        raise ValueError("bad CSV")
+      if source.stem == "interrupt":
+        raise KeyboardInterrupt()
+      if source.stem == "missing_output":
+        return
+      output = kwargs["output_dir"] / (source.stem + ".npz")
+      output.parent.mkdir(parents=True, exist_ok=True)
+      output.write_text("converted")
+      if kwargs["save_video"]:
+        video = kwargs["video_dir"] / (source.stem + ".mp4")
+        video.parent.mkdir(parents=True, exist_ok=True)
+        video.write_text("video")
+
+  monkeypatch.setattr(batch, "_create_converter", Converter)
   monkeypatch.setattr(batch, "PROJECT_ROOT", tmp_path)
   return tmp_path
 
 
 def test_recursive_paths_and_parameters(converter):
-  import json
-
   source = converter / "input motions"
   for name in ("a/dance.csv", "b/dance.CSV", "root.csv", "ignored.txt"):
     path = source / name
@@ -69,6 +72,8 @@ def test_recursive_paths_and_parameters(converter):
     "a/dance.mp4", "b/dance.mp4", "root.mp4"]
   calls = [json.loads(line) for line in (converter / "calls.jsonl").read_text().splitlines()]
   assert len(calls) == 3
+  assert len((converter / "init.jsonl").read_text().splitlines()) == 1
+  assert (converter / "closed.txt").read_text() == "closed\n"
   for call in calls:
     assert call["robot"] == "g1" and call["device"] == "cpu"
     assert float(call["input_fps"]) == 60 and float(call["output_fps"]) == 50
@@ -95,6 +100,7 @@ def test_skip_overwrite_and_missing_video(converter):
   args = ["--robot", "g1", "--input-dir", str(source), "--output-dir", str(output)]
   assert batch.main(args) == 0
   assert not (converter / "calls.jsonl").exists()
+  assert not (converter / "init.jsonl").exists()
   assert npz.read_text() == "existing"
   # With video requested, a missing MP4 requires regenerating this motion.
   assert batch.main([*args, "--save-video"]) == 0
@@ -116,6 +122,17 @@ def test_failure_continues_and_returns_nonzero(converter, capsys):
   assert not (output / "broken.npz").exists()
   text = capsys.readouterr().out
   assert "1 converted, 0 skipped, 2 failed" in text
+  assert len((converter / "init.jsonl").read_text().splitlines()) == 1
+  assert (converter / "closed.txt").read_text() == "closed\n"
+
+
+def test_interrupt_closes_shared_converter(converter):
+  source = converter / "input"
+  source.mkdir()
+  (source / "interrupt.csv").touch()
+  with pytest.raises(KeyboardInterrupt):
+    batch.main(["--robot", "g1", "--input-dir", str(source)])
+  assert (converter / "closed.txt").read_text() == "closed\n"
 
 
 def test_empty_input_reports_error_without_starting_converter(converter):

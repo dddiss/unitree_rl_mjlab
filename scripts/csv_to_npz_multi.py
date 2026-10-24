@@ -5,18 +5,26 @@ Example (run in the project's installed Python environment):
     --output-dir ./motions_npz --recursive
 
 Recursive conversion preserves subdirectories, including for MP4 files. Existing
-complete outputs are skipped unless --overwrite is set. Each CSV runs in a fresh
-process so simulation/rendering resources are released before the next motion.
+complete outputs are skipped unless --overwrite is set. The robot, simulator and
+optional renderer are initialized once and reused for every CSV.
 """
 
 import argparse
+from contextlib import ExitStack
 from pathlib import Path
-import subprocess
-import sys
+import traceback
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-CONVERTER = Path(__file__).with_name("csv_to_npz.py")
+
+
+def _create_converter(robot: str, output_fps: float, device: str):
+  # Keep --help and runs that skip every file free of simulation imports.
+  if __package__:
+    from .csv_to_npz import MotionConverter
+  else:
+    from csv_to_npz import MotionConverter
+  return MotionConverter(robot, output_fps=output_fps, device=device)
 
 
 def _boolean(value: str) -> bool:
@@ -54,34 +62,35 @@ def convert_directory(
 
   converted = skipped = 0
   failed = []
-  for index, (source, relative) in enumerate(zip(files, relative_outputs), 1):
-    output = output_dir / relative
-    video = video_dir / relative.with_suffix(".mp4")
-    if not overwrite and output.is_file() and (not save_video or video.is_file()):
-      print(f"[{index}/{len(files)}] Skipping existing output: {relative}", flush=True)
-      skipped += 1
-      continue
-    print(f"[{index}/{len(files)}] Converting {source.relative_to(input_dir)}", flush=True)
-    command = [
-      sys.executable, str(CONVERTER),
-      "--robot", robot,
-      "--input-file", str(source),
-      "--input-fps", str(input_fps),
-      "--output-fps", str(output_fps),
-      "--output-dir", str(output.parent),
-      "--device", device,
-      "--save-video", str(save_video),
-    ]
-    if save_video:
-      command.extend(("--video-dir", str(video.parent)))
-    if line_range is not None:
-      command.extend(("--line-range", *(str(value) for value in line_range)))
-    result = subprocess.run(command, cwd=PROJECT_ROOT, check=False)
-    if result.returncode != 0 or not output.is_file() or (save_video and not video.is_file()):
-      failed.append(source)
-      print(f"[FAILED] {source} (exit code {result.returncode}); continuing.", flush=True)
-    else:
-      converted += 1
+  with ExitStack() as stack:
+    converter = None
+    for index, (source, relative) in enumerate(zip(files, relative_outputs), 1):
+      output = output_dir / relative
+      video = video_dir / relative.with_suffix(".mp4")
+      if not overwrite and output.is_file() and (not save_video or video.is_file()):
+        print(f"[{index}/{len(files)}] Skipping existing output: {relative}", flush=True)
+        skipped += 1
+        continue
+      if converter is None:
+        converter = stack.enter_context(_create_converter(robot, output_fps, device))
+      print(f"[{index}/{len(files)}] Converting {source.relative_to(input_dir)}", flush=True)
+      try:
+        converter.convert(
+          input_file=source,
+          input_fps=input_fps,
+          output_dir=output.parent,
+          line_range=tuple(line_range) if line_range is not None else None,
+          save_video=save_video,
+          video_dir=video.parent if save_video else None,
+        )
+        if not output.is_file() or (save_video and not video.is_file()):
+          raise RuntimeError("Conversion did not produce all requested output files")
+      except Exception as error:
+        traceback.print_exc()
+        failed.append(source)
+        print(f"[FAILED] {source}: {error}; continuing.", flush=True)
+      else:
+        converted += 1
 
   print(f"\nFinished: {converted} converted, {skipped} skipped, {len(failed)} failed.")
   print(f"NPZ directory: {output_dir}")

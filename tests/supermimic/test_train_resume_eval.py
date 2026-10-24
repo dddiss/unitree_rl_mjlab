@@ -5,6 +5,7 @@ import pytest
 from supermimic.mdp.state import flatten_state,read_state
 from supermimic.mdp.rotations import mat_to_6d,mat_to_quat,so3_exp
 from supermimic.mdp.sampling import ReturnBasedSampler
+from supermimic.mdp.motion_lib import MotionLibrary
 from supermimic.mdp.logging_metrics import TRACKING_METRICS
 from supermimic.rl.runner import SuperMimicRunner,PolicyController
 from supermimic.rl.evaluation import evaluate,load_policy
@@ -93,9 +94,9 @@ def _track_updates(runner,monkeypatch):
   calls=[]
   for name in ('world_model_update','policy_update'):
     original=getattr(runner.algorithm,name)
-    def update(buffer,name=name,original=original):
+    def update(buffer,name=name,original=original,**kwargs):
       calls.append((name,runner.iteration,runner.env_steps))
-      return original(buffer)
+      return original(buffer,**kwargs)
     monkeypatch.setattr(runner.algorithm,name,update)
   return calls
 
@@ -109,7 +110,7 @@ def _track_collection(runner,monkeypatch):
   return calls
 
 
-def test_disabled_warmup_waits_for_window_then_updates_world_model_before_policy(mdp,tmp_path,monkeypatch):
+def test_disabled_warmup_still_fills_replay_then_updates_world_model_before_policy(mdp,tmp_path,monkeypatch):
   torch.set_num_threads(2)
   cfg=small_config(enable_warmup=False,iterations=4,wm_window=8,wm_batches=2,log_every=1)
   assert cfg.warmup_steps==64 and cfg.wm_only_iters==500
@@ -120,12 +121,19 @@ def test_disabled_warmup_waits_for_window_then_updates_world_model_before_policy
           for name in ('wm','policy','critic')}
   updates=_track_updates(runner,monkeypatch)
   collected=_track_collection(runner,monkeypatch)
+  modes=[];sample_windows=runner.buffer.sample_windows
+  def sample(batch,length,*,strict=False):
+    modes.append(strict)
+    return sample_windows(batch,length,strict=strict)
+  monkeypatch.setattr(runner.buffer,'sample_windows',sample)
   runner.learn()
-  assert collected==[(2,2,2),(3,5,5),(2,7,7),(3,10,10)]
-  assert updates==[('world_model_update',3,10)]*cfg.wm_batches+[('policy_update',3,10)]
+  assert collected==[(64,64,16),(2,66,16),(3,69,16),(2,71,16),(3,74,16)]
+  assert updates==[call for i,step in enumerate((66,69,71,74))
+                   for call in [('world_model_update',i,step)]*cfg.wm_batches+[('policy_update',i,step)]]
+  assert modes==[True]*(cfg.iterations*cfg.wm_batches)
   for name,parameters in before.items():
     assert any(not torch.equal(old,new) for old,new in zip(parameters,getattr(runner.algorithm,name).parameters())),name
-  assert runner.iteration==4 and runner.env_steps==10 and runner.step_acc==0
+  assert runner.iteration==4 and runner.env_steps==74 and runner.step_acc==0
 
 
 def test_enabled_warmup_keeps_prefill_and_world_model_only_phase(mdp,tmp_path,monkeypatch):
@@ -134,17 +142,23 @@ def test_enabled_warmup_keeps_prefill_and_world_model_only_phase(mdp,tmp_path,mo
   runner=SuperMimicRunner(TensorEnv(mdp),cfg,tmp_path/'warmup')
   updates=_track_updates(runner,monkeypatch)
   collected=_track_collection(runner,monkeypatch)
+  modes=[];sample_windows=runner.buffer.sample_windows
+  def sample(batch,length,*,strict=False):
+    modes.append(strict)
+    return sample_windows(batch,length,strict=strict)
+  monkeypatch.setattr(runner.buffer,'sample_windows',sample)
   runner.learn()
   assert [count for count,_,_ in collected]==[64,2,3]
   assert updates==[('world_model_update',0,66),('world_model_update',1,69),('policy_update',1,69)]
+  assert modes==[False,True]
   assert runner.env_steps==69
 
 
-def test_disabled_warmup_resume_preserves_collection_remainder_without_prefill(mdp,tmp_path,monkeypatch):
+def test_disabled_warmup_resume_refills_replay_and_preserves_collection_remainder(mdp,tmp_path,monkeypatch):
   cfg=small_config(enable_warmup=False,iterations=1,wm_window=8)
   runner=SuperMimicRunner(TensorEnv(mdp),cfg,tmp_path/'run')
   runner.learn()
-  assert runner.env_steps==2 and runner.step_acc==.5
+  assert runner.env_steps==66 and runner.step_acc==.5
   cfg.iterations=3
   resumed=SuperMimicRunner(TensorEnv(mdp),cfg,tmp_path/'resume')
   resumed.load(tmp_path/'run/last.pt')
@@ -152,10 +166,11 @@ def test_disabled_warmup_resume_preserves_collection_remainder_without_prefill(m
   updates=_track_updates(resumed,monkeypatch)
   collected=_track_collection(resumed,monkeypatch)
   resumed.learn()
-  assert collected==[(3,5,3),(2,7,5)]
-  assert updates==[]
+  assert collected==[(64,130,16),(3,133,16),(2,135,16)]
+  assert updates==[('world_model_update',1,133),('policy_update',1,133),
+                   ('world_model_update',2,135),('policy_update',2,135)]
   assert resumed.iteration==3 and resumed.step_acc==.5
-  assert all(not optimizer.state for optimizer in
+  assert all(optimizer.state for optimizer in
              (resumed.algorithm.opt_wm,resumed.algorithm.opt_pi,resumed.algorithm.opt_v))
 
 
@@ -194,7 +209,7 @@ def test_disabled_warmup_updates_world_model_without_legal_policy_starts(mdp,tmp
     recorded.append((key,value));original(key,value)
   monkeypatch.setattr(runner,'_record',record)
   runner.learn()
-  assert updates==[('world_model_update',0,2),('policy_update',0,2)]
+  assert updates==[('world_model_update',0,66),('policy_update',0,66)]
   assert ('policy_skipped',1.0) in recorded
   assert not runner.buffer.eligible.any()
   assert any(not torch.equal(old,new) for old,new in zip(before['wm'],runner.algorithm.wm.parameters()))
@@ -202,6 +217,81 @@ def test_disabled_warmup_updates_world_model_without_legal_policy_starts(mdp,tmp
     assert all(torch.equal(old,new) for old,new in zip(before[name],getattr(runner.algorithm,name).parameters()))
   assert runner.algorithm.opt_wm.state
   assert not runner.algorithm.opt_pi.state and not runner.algorithm.opt_v.state
+
+
+@pytest.mark.parametrize('enable_warmup',[True,False])
+def test_short_episodes_allow_masked_warmup_but_skip_strict_updates(
+  mdp,tmp_path,monkeypatch,enable_warmup,
+):
+  cfg=small_config(enable_warmup=enable_warmup,iterations=2,wm_only_iters=1,wm_window=8)
+  env=TensorEnv(mdp)
+  step=env.step
+  def short_step(action):
+    result=step(action)
+    env.last_transition['terminated'] |= env.last_transition['ep_step']>=2
+    return result
+  monkeypatch.setattr(env,'step',short_step)
+  runner=SuperMimicRunner(env,cfg,tmp_path/'short_episodes')
+  with torch.no_grad():runner.algorithm.wm.net[-1].bias[0]=1
+  modes=[];sample_windows=runner.buffer.sample_windows
+  def sample(batch,length,*,strict=False):
+    modes.append(strict)
+    windows=sample_windows(batch,length,strict=strict)
+    if strict:
+      assert windows is None
+    else:
+      assert windows is not None and (windows['mask'].sum(-1)<=3).all()
+    return windows
+  monkeypatch.setattr(runner.buffer,'sample_windows',sample)
+  monkeypatch.setattr(runner.algorithm,'policy_update',
+                      lambda _:pytest.fail('No strict WM window: policy/Critic must wait'))
+  runner.learn()
+  assert modes==([False,True] if enable_warmup else [True,True])
+  assert bool(runner.algorithm.opt_wm.state)==enable_warmup
+  assert not runner.algorithm.opt_pi.state and not runner.algorithm.opt_v.state
+  assert runner.env_steps==69
+
+
+def test_collection_updates_every_visited_source_bin_and_preserves_partial_episodes(
+  mdp,tmp_path,monkeypatch,
+):
+  # Smaller bins exercise several boundaries without constructing long clips.
+  mdp.motion=MotionLibrary(mdp.motion.motion_files,bin_duration_s=.04)
+  cfg=small_config(gamma=.5,action_noise=0)
+  env=TensorEnv(mdp)
+  env.command.sampler=ReturnBasedSampler(mdp.motion,gamma=cfg.gamma)
+  runner=SuperMimicRunner(env,cfg,tmp_path/'bins')
+  env.command.request_frames(mdp.motion.clip_start.clone())
+  env.reset()
+  monkeypatch.setattr(runner,'controller',lambda:torch.zeros(2,29))
+  step=env.step
+  def rewards_and_failure(action):
+    result=step(action)
+    tr=env.last_transition
+    tr['r']=(tr['ep_step']+1).float()*.1
+    tr['terminated'][0]=tr['ep_step'][0]>=4
+    return result
+  monkeypatch.setattr(env,'step',rewards_and_failure)
+  runner.collect(5)
+  first_rewards=torch.arange(1,6)*.1
+  first_values=torch.stack([(first_rewards[t:]*cfg.gamma**torch.arange(5-t)).sum()
+                             for t in (0,2,4)])
+  first_bins=mdp.motion.frame_bin[torch.tensor([0,2,4])]
+  torch.testing.assert_close(env.command.sampler.bin_return[first_bins],.2*first_values)
+  assert torch.count_nonzero(env.command.sampler.bin_return)==3
+  assert runner.episode_bins.steps.tolist()==[0,5]
+  # Row 1 now finishes its different clip. It gets the original mean-reward
+  # bootstrap, while row 0 starts a new episode without changing its old bins.
+  runner.collect(1)
+  rewards=torch.arange(1,7)*.1
+  second_values=torch.stack([
+    (rewards[t:]*cfg.gamma**torch.arange(6-t)).sum()
+    +cfg.gamma**(6-t)*rewards.mean()/(1-cfg.gamma) for t in (0,2,4)])
+  second_bins=mdp.motion.frame_bin[mdp.motion.clip_start[1]+torch.tensor([0,2,4])]
+  torch.testing.assert_close(env.command.sampler.bin_return[second_bins],.2*second_values)
+  torch.testing.assert_close(env.command.sampler.bin_return[first_bins],.2*first_values)
+  assert runner.episode_bins.steps.tolist()==[1,0]
+  assert torch.count_nonzero(env.command.sampler.bin_return)==6
 
 
 def test_evaluation_scores_each_clip_once(mdp):

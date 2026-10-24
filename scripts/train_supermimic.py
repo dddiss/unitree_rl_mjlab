@@ -27,8 +27,8 @@ def main():
   parser.add_argument("--amp", choices=("none", "bf16"))
   parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=None)
   parser.add_argument("--enable-warmup", action=argparse.BooleanOptionalAction, default=None,
-                      help="Enable initial replay filling and WM-only warmup (default: enabled; "
-                           "on resume, use the saved setting unless overridden)")
+                      help="Enable the WM-only phase (default: enabled); initial replay filling "
+                           "always runs. On resume, use the saved setting unless overridden.")
   parser.add_argument("--logger", choices=("wandb", "csv"),
                       help="wandb writes CSV and W&B; csv writes only CSV (default: wandb)")
   parser.add_argument("--wandb-project", help="W&B project (default: unitree-supermimic)")

@@ -1,12 +1,16 @@
 # G1 SuperMimic 使用说明
 
-当前 SuperMimic 使用本项目的 G1 29DoF 机器人与 mjlab，通过独立入口进行训练和评估。以下命令均在 `unitree_rl_mjlab` 项目根目录、已安装项目依赖的 Python 环境中执行。
+当前 SuperMimic 使用本项目的 G1 29DoF 机器人与 mjlab，通过独立入口进行训练、评估和播放。以下命令均在 `unitree_rl_mjlab` 项目根目录、已安装项目依赖的 Python 环境中执行。
+
+使用顺序：准备动作 CSV → 转成 50 Hz NPZ → 训练或恢复 → 评估 → 查看器播放或导出策略视频。已有 LAFAN 格式 CSV 可从第 2.3 节开始；已有兼容 NPZ 可从第 2.4 节开始。
 
 ## 1. 项目结构
 
 ```text
 unitree_rl_mjlab/
 ├── scripts/
+│   ├── convert_soma_csv_to_lafan.py  # SOMA/Bones G1 CSV → LAFAN 格式 CSV
+│   ├── filter_and_copy_soma_csv.py   # 按 SONIC 关键词规则筛选并复制 CSV
 │   ├── csv_to_npz.py                 # 单个 CSV 转换，供批量脚本复用
 │   ├── csv_to_npz_multi.py           # 批量 CSV → NPZ，可同时输出 MP4
 │   ├── train_supermimic.py           # SuperMimic 训练与恢复入口
@@ -14,7 +18,9 @@ unitree_rl_mjlab/
 │   └── play_supermimic.py            # 查看器播放与策略 MP4 导出入口
 ├── src/assets/
 │   ├── robots/unitree_g1/            # G1 模型、执行器和动作缩放
-│   └── motions/g1/                   # CSV 与转换后的 NPZ 动作
+│   └── motions/
+│       ├── g1/                       # LAFAN 格式 CSV 动作
+│       └── g1_npz/                   # 本文示例的 NPZ 输出根目录，可含子目录
 ├── src/tasks/supermimic/
 │   ├── env.py                       # 物理步进、transition 捕获与局部 reset
 │   ├── tracking_env_cfg.py           # 通用环境、奖励、终止和随机化配置
@@ -54,22 +60,89 @@ unitree_rl_mjlab/
     └── evaluation/                  # 评估输出（默认位置）
 ```
 
-算法和网络默认参数定义在 `src/tasks/supermimic/config/g1/rl_cfg.py`；机器人与评估环境配置定义在同目录的 `env_cfgs.py`。现有 PPO 入口 `scripts/train.py` 不用于 SuperMimic 训练。
+算法和网络默认参数定义在 `src/tasks/supermimic/config/g1/rl_cfg.py`；机器人与评估环境配置定义在同目录的 `env_cfgs.py`。SuperMimic 的播放入口为 `scripts/play_supermimic.py`；原有 PPO tracking 使用 `scripts/train.py` 和 `scripts/play.py`，两套入口的 checkpoint 格式不同。
 
-## 2. 批量转换动作
+## 2. 动作准备与加载
 
-将一个目录下的 G1 29DoF CSV 转换成同名 NPZ：
+### 2.1 SOMA/Bones-SEED G1 CSV 转为 LAFAN 格式
+
+输入是每个动作一份带表头的 CSV，包含 `root_translateX/Y/Z`、`root_rotateX/Y/Z` 和 29 个 `*_joint_dof` 列。位置单位为厘米，根欧拉角和关节角单位为度。这与部署用的 `joint_pos.csv`、`body_pos.csv` 等拆分文件不同，不能将后者直接作为此脚本输入。
+
+```bash
+python scripts/convert_soma_csv_to_lafan.py \
+  --input /path/to/soma/g1/csv \
+  --output data/bones_lafan \
+  --fps-source 120 \
+  --fps 30 \
+  --num-workers 16
+```
+
+请按原始数据设置 `--fps-source`。上例每隔 4 帧取一帧，将 120 Hz 转为 30 Hz；脚本支持保持帧率或整数倍降采样，不支持直接按此方式将 120 Hz 转为 50 Hz。后续由 NPZ 转换脚本插值到 50 Hz。
+
+输出为无表头的 36 列 CSV，每行依次为：
+
+```text
+根位置 x、y、z（米）
++ 根四元数 qx、qy、qz、qw
++ 29 个关节角度（弧度，LAFAN G1 顺序）
+```
+
+关节按列名读取并重排，即使输入列顺序不同也保持相同输出顺序。该步骤只转换单位、旋转表示和帧率，不重新进行动作重定向或 FK，也不输出速度。
+
+目录会自动递归扫描，保留所有相对子目录和动作文件名；例如 `session_a/walk.csv` 仍输出到 `session_a/walk.csv`。默认跳过已有输出，添加 `--overwrite` 可重新转换。输入、输出目录需相互独立，不能相同或互相嵌套。
+
+### 2.2 按动作名称筛选 CSV（可选）
+
+```bash
+python scripts/filter_and_copy_soma_csv.py \
+  --source data/bones_lafan \
+  --dest data/bones_lafan_filtered \
+  --workers 16
+```
+
+默认沿用 SONIC 的 Bones 关键词规则，例如排除名称包含 `chair`、`bike`、`climb`、`stair`、`handstand`、`box_jump` 的动作。匹配对象是文件名及其直接父目录名称，不区分大小写；只按名称筛选，不读取动作内容，也不检查碰撞或物理可行性。
+
+| 参数 | 用途 |
+|---|---|
+| `--source` / `--dest` | 输入和筛选后的 CSV 根目录，需相互独立、不嵌套 |
+| `--workers 16` | 并行复制数量 |
+| `--dry-run --verbose` | 预览通过和排除的文件，不写入输出 |
+| `--filter-keywords chair bike` | 用指定关键词替换默认排除列表；不跟关键词可关闭排除规则 |
+| `--add-keywords crawl` | 在默认或指定的排除列表中追加关键词 |
+| `--filter-file keep.txt` | 每行一个保留关键词，仍优先应用排除规则 |
+| `--overwrite` | 覆盖已有输出；默认跳过 |
+
+筛选脚本也递归处理并保留完整相对路径，复制后的 CSV 内容不变，原始文件保留。更改筛选规则时建议使用新的目标目录：脚本不会删除旧目录中先前已复制的文件。也可以先筛选原始 SOMA CSV，再转换通过筛选的文件。
+
+### 2.3 LAFAN 格式 CSV 批量转为 NPZ
+
+将一个目录下的 G1 29DoF CSV 转换成同名 NPZ。以下示例将参考 CSV 和生成的 NPZ 分目录存放，已有其他输出目录也可继续使用：
 
 ```bash
 python scripts/csv_to_npz_multi.py \
   --robot g1 \
   --input-dir src/assets/motions/g1 \
-  --output-dir src/assets/motions/g1 \
+  --output-dir src/assets/motions/g1_npz \
   --input-fps 30 \
-  --output-fps 50
+  --output-fps 50 \
+  --recursive
 ```
 
 例如 `dance1_subject2.csv` 输出为 `dance1_subject2.npz`。请将 `--input-dir` 替换成自己的 CSV 目录，并按实际录制帧率设置 `--input-fps`。当前 SuperMimic 控制频率为 50 Hz，训练动作应使用 `--output-fps 50`。
+
+对于前两步得到的 SOMA/Bones 数据，可输出到同一个 NPZ 根目录的独立子目录：
+
+```bash
+python scripts/csv_to_npz_multi.py \
+  --robot g1 \
+  --input-dir data/bones_lafan_filtered \
+  --output-dir src/assets/motions/g1_npz/bones_seed \
+  --input-fps 30 \
+  --output-fps 50 \
+  --recursive
+```
+
+CSV 文件本身不记录帧率，因此这里的 `--input-fps` 必须与上一阶段的 `--fps` 一致。若跳过筛选，改用 `data/bones_lafan` 作为输入目录。
 
 同时为每个动作输出一份同名 MP4：
 
@@ -77,9 +150,10 @@ python scripts/csv_to_npz_multi.py \
 python scripts/csv_to_npz_multi.py \
   --robot g1 \
   --input-dir src/assets/motions/g1 \
-  --output-dir src/assets/motions/g1 \
+  --output-dir src/assets/motions/g1_npz \
   --input-fps 30 \
   --output-fps 50 \
+  --recursive \
   --save-video True \
   --video-dir videos/reference_motions
 ```
@@ -99,15 +173,23 @@ python scripts/csv_to_npz_multi.py \
 
 脚本按文件顺序逐个转换，某个文件失败后仍继续处理其余文件，最后汇总成功、跳过和失败数量；存在失败文件时返回非零退出码。开启视频后，如果只有 NPZ、缺少 MP4，该动作会重新转换。
 
-训练和评估的 `--motion-file` 接受单个 NPZ 或目录。目录按文件名排序读取顶层 `*.npz`，**不递归读取子目录**。使用 `--recursive` 转换后，应将 `--motion-file` 指向实际包含所需 NPZ 的目录；若希望一次训练全部动作，需要把这组 NPZ 放在同一目录中。恢复和评估时保持与 checkpoint 对应的动作集合及顺序一致。
+### 2.4 训练、评估与播放如何加载动作
 
-## 3. 训练与恢复
+三种入口的 `--motion-file` 都接受单个 NPZ 或目录。指定目录时会自动递归读取全部子目录中的 `*.npz`，按路径排序确定动作顺序，无需额外传入 `--recursive`。注意：`--recursive` 是 CSV 批量转换脚本的开关，不能传给训练、评估或播放入口。
 
-### 开始训练
+本示例统一使用 `--motion-file src/assets/motions/g1_npz`，它会同时加载根目录与 `bones_seed/` 等子目录中的动作。只想用某个子目录训练时，可直接指定那个子目录。
+
+恢复、评估和播放会核对 checkpoint 的动作清单，需保持动作集合、顺序和帧数一致。多动作 checkpoint 只播放其中一个动作时，仍加载原来的整套动作库，通过 `--clip` 选择，不能把 `--motion-file` 改成单个动作来绕过清单检查。
+
+当前动作显示名取文件名、不包含子目录。不同目录中的同名文件可以加载，但 `--clip` 按名称选择时只匹配第一个，评估轨迹和视频也使用该名称保存。准备数据时应保证文件名在整套动作库中唯一，避免选择歧义及导出覆盖。
+
+## 3. 训练、恢复与日志
+
+### 3.1 开始训练
 
 ```bash
 python scripts/train_supermimic.py \
-  --motion-file src/assets/motions/g1 \
+  --motion-file src/assets/motions/g1_npz \
   --log-dir logs/supermimic \
   --run-name g1 \
   --device cuda:0
@@ -117,7 +199,7 @@ python scripts/train_supermimic.py \
 
 `rl_cfg.py` 中的 `log_dir="logs/supermimic"` 指定日志根目录，`run_name="g1"` 指定基础实验名称。每次启动生成一次 `YYYYMMDD_HHMMSS_微秒` 时间戳，最终目录为 `log_dir/run_name_时间戳`，W&B 显示名称与这个带时间戳的目录名完全一致。可通过 `--log-dir` 和 `--run-name` 分别覆盖；旧参数 `--wandb-name` 保留为 `--run-name` 的别名。`run_name` 必须为单个文件夹名称。
 
-例如，实际保存目录为 `logs/supermimic/g1_20261024_180000_123456/`，W&B 名称就是 `g1_20261024_180000_123456`。下文恢复和评估命令中的这个示例目录需要替换为你的实际目录。
+例如，实际保存目录为 `logs/supermimic/g1_20261024_180000_123456/`，W&B 名称就是 `g1_20261024_180000_123456`。下文恢复、评估和播放命令中的这个示例目录需要替换为你的实际目录。
 
 | 参数 | 默认值 | 用途 |
 |---|---:|---|
@@ -140,7 +222,7 @@ python scripts/train_supermimic.py \
 
 ```bash
 python scripts/train_supermimic.py \
-  --motion-file src/assets/motions/g1 \
+  --motion-file src/assets/motions/g1_npz \
   --log-dir logs/supermimic \
   --run-name g1_1024 \
   --num-envs 1024 \
@@ -148,7 +230,47 @@ python scripts/train_supermimic.py \
   --pi-batch 1024
 ```
 
-### 日志与 W&B
+### 3.2 预热开关
+
+初始经验池填充始终执行，默认先采集 64 个环境步；`--warmup-steps` 可调整填充步数，并至少满足 `wm_window`。`--enable-warmup` 只控制前 500 次迭代的 WM 专属预热，长度由 `--wm-only-iters` 调整。
+
+预热期间允许抽到跨 episode 的 8 步缓存窗口，保留原来的终止掩码：终止那一步参与损失，后面的跨回合数据不参与该窗口的自回归损失。预热结束后，必须采到同一 episode 内完整的 8 条 transition，允许第 8 条终止或截断；没有合法窗口时继续采集，跳过当轮 WM、策略和 Critic 更新。
+
+关闭预热：
+
+```bash
+python scripts/train_supermimic.py \
+  --motion-file src/assets/motions/g1_npz \
+  --log-dir logs/supermimic \
+  --run-name g1_no_warmup \
+  --no-enable-warmup
+```
+
+关闭后，仍先填充默认 64 步，然后按默认的 2/3 步交替采集，直接使用严格的同回合 WM 窗口。满足条件时先更新 WM，再尝试更新策略和 Critic。没有满足想象长度要求的起点时，仍只跳过策略和 Critic 更新。
+
+回报采样会在 episode 结束时更新沿途所有经过的 bin：首个 bin 从初始化帧 `k` 计算回报，后续 bin 从首次进入该 bin 的帧计算剩余折扣回报。同批多个 episode 经过同一 bin 时，先平均再更新一次 EMA。失败不自举；超时或动作结束仍用整个 episode 的平均奖励估计剩余回报。`reset k → 目标 k+1` 的时序不变。
+
+### 3.3 恢复训练
+
+```bash
+python scripts/train_supermimic.py \
+  --motion-file src/assets/motions/g1_npz \
+  --log-dir logs/supermimic \
+  --resume logs/supermimic/g1_20261024_180000_123456/last.pt \
+  --iterations 400000
+```
+
+`--iterations 400000` 表示训练到总计 400000 次迭代，而不是额外增加 400000 次。
+
+恢复时读取 checkpoint 中的训练配置、网络、优化器、归一化统计、bin 采样统计和训练进度。经验池与物理仿真现场不保存，因此无论预热开关是否开启，都先重新填充 `max(warmup_steps, wm_window)` 步。已经完成的 WM 专属预热迭代不会重新开始，是否使用严格窗口由恢复后的迭代数和预热开关决定。
+
+当前 Critic 已移除独立重复的 6 维根相对朝向，并加入 29 维上一动作（无历史）；未来参考目标中的朝向保留，默认 Critic 输入为 847 维。此前 824 维 Critic 的 checkpoint 不能直接完整恢复训练；Actor 结构未变，仍可用于评估和播放。
+
+恢复时可覆盖总迭代数、环境数量、缓存容量、日志/保存周期、初始填充步数、预热开关、编译/精度配置，以及第 3.4 节中的全部 W&B/日志选项；其余算法与网络配置应保持 checkpoint 原值。省略参数时沿用 checkpoint 的设置，旧 checkpoint 没有的新日志选项使用当前默认值。
+
+每次启动训练（包括恢复）都生成新的带时间戳的实验目录和独立 W&B run，CSV 写入新目录，训练迭代从断点继续，并记录恢复来源 checkpoint 和起始迭代。配置和 checkpoint 保留日志根目录及基础名称，不保存自动追加的后缀，因此恢复时不会叠加旧时间戳。旧 checkpoint 的非空 `wandb_name` 会映射为基础 `run_name`；旧 `log_dir` 按保存值作为新日志根目录，命令行仍可覆盖。
+
+### 3.4 日志、W&B 与终端输出
 
 | 参数 | 默认值 | 用途 |
 |---|---|---|
@@ -163,13 +285,13 @@ python scripts/train_supermimic.py \
 
 ```bash
 python scripts/train_supermimic.py \
-  --motion-file src/assets/motions/g1 \
+  --motion-file src/assets/motions/g1_npz \
   --log-dir logs/supermimic \
   --run-name g1_local \
   --logger csv
 ```
 
-CSV 和 W&B 每 `--log-every` 次迭代记录同一组聚合结果，W&B 横轴使用 `iteration`。在线初始化失败会明确报错，可改用 `--logger csv` 或 `--wandb-mode offline`。本轮只记录标量和运行配置，不自动上传 checkpoint、视频或梯度直方图。
+CSV 和 W&B 每 `--log-every` 次迭代记录同一组聚合结果，W&B 横轴使用 `iteration`。在线初始化失败会明确报错，可改用 `--logger csv` 或 `--wandb-mode offline`。当前只记录标量和运行配置，不自动上传 checkpoint、视频或梯度直方图。
 
 `train_log.csv` 保留原有 17 列：`iteration`、`wall_h`、`sim_steps`、`env_steps`、`lr`、`wm_loss`、`wm_err_last`、`pi_loss`、`v_loss`、`pi_gradnorm`、`imag_survival`、`imag_reward`、`policy_skipped`、`sim_reward`、`episode_length`、`episode_return`、`failure_fraction`。其中 `episode_return` 仍是按实际步数和最大单步奖励归一化后的回报，`episode_length` 的单位为控制步；新增原始回报单独记录。
 
@@ -193,47 +315,22 @@ W&B 将网络损失统一归入 `Loss/`：`Loss/wm_loss`、`Loss/wm_err_last`（
 
 首次日志的跟踪、奖励和回合统计包含经验池预填充期间的真实采集；`Performance/` 指标从预填充结束后的训练主循环开始统计，不包含预填充耗时和步数。
 
-### 预热开关
+终端同样按 `--log-every` 打印，默认每 50 次迭代输出一次 mjlab 风格的摘要；训练正常结束时若还有未满一个区间的记录，也会输出剩余区间。终端包括：
 
-默认开启 `--enable-warmup`：先采集 64 步填充经验池，前 500 次迭代只更新世界模型，之后再进行策略和 Critic 更新。可通过 `--warmup-steps` 和 `--wm-only-iters` 调整。
+- 当前迭代、吞吐、区间耗时、平均每迭代耗时，以及采集、WM、策略和 Critic 更新阶段的平均耗时。
+- `Loss/wm_loss`、`Loss/wm_err_last`、`Loss/pi_loss`、`Loss/v_loss` 和 `Training/lr`。
+- 紧接学习率下方的 `Episode/length_steps`，沿用 CSV 的 `episode_length` 统计，单位为控制步。
+- 各项 `Reward/` 和 `Termination/*_fraction`，以及累计 transition 数、总运行时间和预计剩余时间。
 
-关闭预热：
-
-```bash
-python scripts/train_supermimic.py \
-  --motion-file src/assets/motions/g1 \
-  --log-dir logs/supermimic \
-  --run-name g1_no_warmup \
-  --no-enable-warmup
-```
-
-关闭后，从开始就按默认的 2/3 步交替采集；缓存满足 WM 窗口长度时先更新 WM，再尝试更新策略和 Critic。没有满足想象长度要求的起点时，跳过策略和 Critic 更新。
-
-### 恢复训练
-
-```bash
-python scripts/train_supermimic.py \
-  --motion-file src/assets/motions/g1 \
-  --log-dir logs/supermimic \
-  --resume logs/supermimic/g1_20261024_180000_123456/last.pt \
-  --iterations 400000
-```
-
-`--iterations 400000` 表示训练到总计 400000 次迭代，而不是额外增加 400000 次。
-
-恢复时读取 checkpoint 中的训练配置、网络、优化器、归一化统计、bin 采样统计和训练进度。经验池与物理仿真现场不保存，需要重新采集：开启预热时先填充至少 `max(warmup_steps, wm_window)` 步；关闭预热时按普通采集节奏逐步补充。已经完成的 WM 专属预热迭代不会重新开始。
-
-恢复时可覆盖总迭代数、环境数量、缓存容量、日志/保存周期、初始填充步数、预热开关、编译/精度配置，以及上表中的全部 W&B/日志选项；其余算法与网络配置应保持 checkpoint 原值。省略参数时沿用 checkpoint 的设置，旧 checkpoint 没有的新日志选项使用当前默认值。
-
-每次启动训练（包括恢复）都生成新的带时间戳的实验目录和独立 W&B run，CSV 写入新目录，训练迭代从断点继续，并记录恢复来源 checkpoint 和起始迭代。配置和 checkpoint 保留日志根目录及基础名称，不保存自动追加的后缀，因此恢复时不会叠加旧时间戳。旧 checkpoint 的非空 `wandb_name` 会映射为基础 `run_name`；旧 `log_dir` 按保存值作为新日志根目录，命令行仍可覆盖。
+尚未产生有效统计的项目显示 `--`，WM 专属预热期间不估算 ETA。终端使用同一份聚合结果，但只展示上述项目；CSV/W&B 仍保留更完整的指标，包括策略梯度、想象奖励与存活率等。
 
 ## 4. 评估
 
-### 评估单个 checkpoint
+### 4.1 评估单个 checkpoint
 
 ```bash
 python scripts/evaluate_supermimic.py \
-  --motion-file src/assets/motions/g1 \
+  --motion-file src/assets/motions/g1_npz \
   --checkpoint-file logs/supermimic/g1_20261024_180000_123456/last.pt \
   --output-dir logs/supermimic/g1_20261024_180000_123456/evaluation \
   --device cuda:0
@@ -250,23 +347,102 @@ python scripts/evaluate_supermimic.py \
 
 省略 `--output-dir` 时，单 checkpoint 评估输出到该 checkpoint 所在目录的 `evaluation/`。若需要同时保存各动作的机器人状态轨迹，在命令后添加 `--record`；轨迹保存为输出目录下 `<checkpoint名称>/<动作名称>.npz`，包含 `states`、`clip_start` 和 `fps`。这不是 MP4，也不是训练输入参考动作的七字段 NPZ 格式。
 
-### 评估一个运行目录中的 checkpoint
+### 4.2 评估一个运行目录中的 checkpoint
 
 ```bash
 python scripts/evaluate_supermimic.py \
-  --motion-file src/assets/motions/g1 \
+  --motion-file src/assets/motions/g1_npz \
   --run-dir logs/supermimic/g1_20261024_180000_123456
 ```
 
 读取该运行目录的 `checkpoints/ckpt_*.pt`，跳过输出目录中已有对应 JSON 的 checkpoint；默认输出到运行目录的 `evaluation/`。
 
-### 持续评估新 checkpoint
+### 4.3 持续评估新 checkpoint
 
 ```bash
 python scripts/evaluate_supermimic.py \
-  --motion-file src/assets/motions/g1 \
+  --motion-file src/assets/motions/g1_npz \
   --run-dir logs/supermimic/g1_20261024_180000_123456 \
   --watch
 ```
 
 `--watch` 必须配合 `--run-dir`，每轮处理完现有 checkpoint 后等待 30 秒，再扫描新增文件。使用 `Ctrl+C` 结束。`--checkpoint-file` 与 `--run-dir` 二选一，`--record` 和 `--output-dir` 可用于上述各评估方式。
+
+## 5. 播放与视频导出
+
+播放入口为 `scripts/play_supermimic.py`。它读取本地 SuperMimic checkpoint，使用评估环境和确定性策略，关闭训练时的观测/动作噪声及随机扰动。下列运行目录需要替换为你的实际 checkpoint 目录，动作目录需要与该 checkpoint 匹配。
+
+### 5.1 使用 Viser 或 Native 查看器
+
+```bash
+python scripts/play_supermimic.py \
+  --motion-file src/assets/motions/g1_npz \
+  --checkpoint-file logs/supermimic/g1_20261024_180000_123456/last.pt \
+  --viewer viser \
+  --clip dance1_subject2 \
+  --device cuda:0
+```
+
+Viser 启动后，在浏览器打开终端提示的地址。改为 `--viewer native` 可使用本地 MuJoCo 查看器，需有可用的图形显示环境。
+
+| 参数 | 用途 |
+|---|---|
+| `--motion-file` | 必填，原训练动作库的单个 NPZ 或根目录；目录自动递归加载 |
+| `--checkpoint-file` | 必填，本地 SuperMimic checkpoint，例如 `last.pt` 或 `checkpoints/ckpt_002000.pt` |
+| `--clip dance1_subject2` | 动作文件名，不带 `.npz`；只选择初始播放动作，不减少动作库加载范围 |
+| `--viewer viser` | 浏览器查看器，可暂停后切换动作和初始化帧 |
+| `--viewer native` | 本地 MuJoCo 查看器 |
+| `--viewer auto` | 默认值；macOS 或检测到 `DISPLAY`/`WAYLAND_DISPLAY` 时使用 Native，否则使用 Viser |
+| `--video-dir` | 改为导出 MP4，详见第 5.3 节；此时不打开查看器 |
+| `--device` | 仿真设备，默认 `cuda:0` |
+
+不指定 `--clip` 时，查看器从加载顺序中的第一个动作开始。若 checkpoint 使用多个动作，保留完整的 `--motion-file` 目录，用 `--clip` 选择其中一个。
+
+### 5.2 在 Viser 中切换动作、选择帧与重置
+
+同一次播放可以切换已加载的全部动作，不需要重新启动命令：
+
+1. 点击 **Pause / 暂停**；运行过程中 Motion、Frame 和 Start Here 控件禁用。
+2. 在 **Commands → Motion** 面板的动作下拉框中选择动作。
+3. 将 **Frame** 设为希望初始化的帧 `k`，从头开始时设为 `0`。
+4. 点击 **Start Here / 从这里开始**，应用动作和帧选择。
+5. 点击 **Play / 继续**，恢复策略执行。
+
+只修改下拉框或 Frame 不会立即改变机器人状态，需要点击 Start Here。下拉列表显示的是本次启动加载的动作，运行过程中新增 NPZ 文件不会自动加入列表。
+
+Frame 使用动作内从零开始的初始化帧索引 `k`。机器人重置到参考第 `k` 帧，首次控制目标为 `k+1`，奖励和终止判断使用该次控制的目标帧。参考机器人仍显示当前目标，保留现有的 `k → k+1` 时序。若手动选择动作末帧，目标钳制在该末帧，不会越界到下一个动作。
+
+查看器的 **Reset / 重置环境** 会从当前动作的首帧重新开始；播放中失败或动作结束后，同样从当前动作首帧重新播放，不会自动切到下一个动作。要从中间帧开始，应使用 Frame 和 Start Here，而不是普通 Reset。
+
+### 5.3 导出策略执行 MP4
+
+只导出一个动作：
+
+```bash
+python scripts/play_supermimic.py \
+  --motion-file src/assets/motions/g1_npz \
+  --checkpoint-file logs/supermimic/g1_20261024_180000_123456/last.pt \
+  --clip dance1_subject2 \
+  --video-dir videos/supermimic/g1_20261024_180000_123456 \
+  --device cuda:0
+```
+
+输出文件为 `videos/supermimic/g1_20261024_180000_123456/dance1_subject2.mp4`。不指定 `--clip` 时，依次为整个动作库导出视频：
+
+```bash
+python scripts/play_supermimic.py \
+  --motion-file src/assets/motions/g1_npz \
+  --checkpoint-file logs/supermimic/g1_20261024_180000_123456/last.pt \
+  --video-dir videos/supermimic/g1_20261024_180000_123456 \
+  --device cuda:0
+```
+
+每个动作从首帧初始化，录制一次，直到动作结束或策略失败，不循环拼接；提前失败的视频会相应缩短。视频使用 MP4/H.264，帧率为当前控制频率 50 Hz，文件名为 `<动作名称>.mp4`。已有同名视频会被重新写入，可按 checkpoint 或实验名使用不同输出目录。
+
+添加 `--video-dir` 后进入离屏录制模式，即使同时设置 `--viewer` 也不会启动查看器。视频写入使用 `mediapy` 和 FFmpeg，运行环境需提供可用的离屏渲染与视频编码支持。
+
+| 输出方式 | 内容 |
+|---|---|
+| `csv_to_npz_multi.py --save-video` | 数据转换时的参考动作视频，不加载策略 |
+| `play_supermimic.py --video-dir` | checkpoint 策略实际控制机器人的执行视频 |
+| `evaluate_supermimic.py --record` | 机器人状态轨迹 NPZ，用于数据分析，不是视频 |

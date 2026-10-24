@@ -31,7 +31,7 @@ class StepwiseAlgorithm(SuperMimicAlgorithm):
       history = self.mdp.add_noise(self.mdp.obs(
         unflatten_state(hist["s"]), hist["a_prev"], hist["xi"], hist["f"]))
     goal = self.mdp.goal(state, f, c.goal_frames)
-    states, frames, goals = [state], [f], [goal]
+    states, frames, goals, previous_actions = [state], [f], [goal], [a_prev]
     rewards, probabilities = [], []
     with frozen(self.wm, self.critic):
       for _ in range(c.horizon):
@@ -43,13 +43,14 @@ class StepwiseAlgorithm(SuperMimicAlgorithm):
         states.append(state)
         frames.append(f)
         goals.append(goal)
+        previous_actions.append(a_prev)
       r, d = torch.stack(rewards), torch.stack(probabilities)
       alive = (1 - d).cumprod(0)
       prior_alive = torch.cat((torch.ones_like(alive[:1]), alive[:-1]), 0)
       discount = c.gamma ** torch.arange(c.horizon, device=self.device)[:, None]
       objective = (discount * prior_alive * r).sum(0)
       objective += c.gamma ** c.horizon * alive[-1] * self.critic(
-        self.critic_input(state, f, xi_n, goal))
+        self.critic_input(state, f, xi_n, goal, a_prev))
       loss = -objective.mean()
       self.opt_pi.zero_grad(set_to_none=True)
       loss.backward()
@@ -60,8 +61,8 @@ class StepwiseAlgorithm(SuperMimicAlgorithm):
       self.opt_pi.step()
     with torch.no_grad():
       x = torch.stack([
-        self.critic_input(tuple(t.detach() for t in s), ft, xi_n, g.detach())
-        for s, ft, g in zip(states, frames, goals)
+        self.critic_input(tuple(t.detach() for t in s), ft, xi_n, g.detach(), a.detach())
+        for s, ft, g, a in zip(states, frames, goals, previous_actions)
       ])
       self.critic.norm.update(x)
       v = self.critic(x)
@@ -154,9 +155,10 @@ def test_batched_update_matches_original_stepwise_update(mdp):
     assert all(t.requires_grad for t in state)
     return reward_term(state, f, action, a_prev)
 
-  def capture_critic(state, f, xi_n, goal):
+  def capture_critic(state, f, xi_n, goal, a_prev):
     critic_calls.append((len(f), torch.is_grad_enabled()))
-    return critic_input(state, f, xi_n, goal)
+    assert a_prev.requires_grad == torch.is_grad_enabled()
+    return critic_input(state, f, xi_n, goal, a_prev)
 
   def retain_model_output(module, args, output):
     output.retain_grad()

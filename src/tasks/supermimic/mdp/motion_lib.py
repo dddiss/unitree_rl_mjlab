@@ -49,7 +49,7 @@ class MotionReference(NamedTuple):
 class MotionLibrary:
   """Load one NPZ, an ordered list of NPZ files, or a directory of NPZ files.
 
-  Directory discovery is sorted and nonrecursive. Explicit lists keep their
+  Directory discovery is recursive and sorted by path. Explicit lists keep their
   order. ``motion_files`` stores resolved paths, so this tuple also defines the
   clip-ID manifest to save alongside future training checkpoints.
 
@@ -235,7 +235,7 @@ def _resolve_motion_files(
     if not str(files).strip():
       raise ValueError("motion_files cannot be an empty path")
     path = Path(files).expanduser()
-    paths = sorted(path.glob("*.npz")) if path.is_dir() else [path]
+    paths = sorted(path.rglob("*.npz")) if path.is_dir() else [path]
   else:
     paths = list(files)
   if not paths:

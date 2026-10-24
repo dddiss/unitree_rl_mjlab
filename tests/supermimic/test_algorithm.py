@@ -61,6 +61,49 @@ def test_missing_imagination_start(mdp):
   assert alg.policy_update(b)=={'policy_skipped':1.0}
 
 
+def test_world_model_skips_unavailable_strict_window_without_update(mdp):
+  alg=SuperMimicAlgorithm(mdp,small_config(),'cpu')
+  before={name:value.clone() for name,value in alg.wm.state_dict().items()}
+  rng=torch.get_rng_state().clone()
+  class NoStrictWindow:
+    def sample_windows(self,batch,length,*,strict=False):
+      assert strict and batch==alg.cfg.wm_batch and length==alg.cfg.wm_window
+      return None
+  assert alg.world_model_update(NoStrictWindow(),strict=True) is None
+  assert torch.equal(torch.get_rng_state(),rng)
+  assert not alg.opt_wm.state
+  assert all(torch.equal(value,before[name]) for name,value in alg.wm.state_dict().items())
+
+
+def test_terminal_bootstrap_backpropagates_through_previous_action(mdp,monkeypatch):
+  """Isolate the new action input: state/goal paths cannot explain this gradient."""
+  cfg=small_config()
+  alg=SuperMimicAlgorithm(mdp,cfg,'cpu')
+  buffer,_=filled_buffer(mdp,cfg)
+  with torch.no_grad():
+    # A critic depending ONLY on the first previous-action component.
+    for parameter in alg.critic.net.parameters():
+      parameter.zero_()
+    alg.critic.net[0].weight[0,145]=1
+    alg.critic.net[-1].weight[0,0]=1
+  monkeypatch.setattr(alg,'_reward_term',lambda state,f,a,a_prev:(
+    torch.zeros(len(f)),torch.zeros(len(f))))
+  bootstrap_previous=[]
+  original=alg._critic_input
+  def capture(state,f,xi_n,goal,a_prev):
+    if torch.is_grad_enabled():
+      a_prev.retain_grad()
+      bootstrap_previous.append(a_prev)
+    return original(state,f,xi_n,goal,a_prev)
+  alg._critic_input=capture
+  result=alg.policy_update(buffer)
+  assert result['pi_gradnorm']>0
+  assert len(bootstrap_previous)==1
+  gradient=bootstrap_previous[0].grad
+  assert torch.isfinite(gradient).all() and (gradient[:,0].abs()>0).all()
+  torch.testing.assert_close(gradient[:,1:],torch.zeros_like(gradient[:,1:]))
+
+
 def test_policy_uses_proprioception_and_relative_goal_dimensions(mdp):
   cfg=small_config(hist=10,goal_frames=10)
   alg=SuperMimicAlgorithm(mdp,cfg,'cpu')
@@ -68,7 +111,7 @@ def test_policy_uses_proprioception_and_relative_goal_dimensions(mdp):
   assert alg.policy.dec[0].in_features==962  # 93 * 10 history + 32 latent.
   assert alg.policy.enc[0].in_features==640
   assert alg.wm.in_dim==133
-  assert alg.critic.net[0].in_features==824
+  assert alg.critic.net[0].in_features==847
   f=torch.tensor([1,4])
   state=(*mdp.reference_root(f),mdp.motion.joint_pos[f],mdp.motion.joint_vel[f])
   obs=mdp.obs(state,torch.zeros(2,29),torch.zeros(2,33),f).requires_grad_()
@@ -119,17 +162,18 @@ def test_imagination_uses_noisy_policy_goals_and_clean_critic_goals(mdp):
   xi=torch.zeros(3,33);xi[:,0]=.75
   make=lambda frame:flatten_state((*mdp.reference_root(frame),m.joint_pos[frame],m.joint_vel[frame]))
   hist_f=f[:,None]+torch.tensor([-1,0])
-  start=dict(s=make(f-1),a_prev=torch.zeros(3,29),f=f,xi=xi)
+  start=dict(s=make(f-1),a_prev=torch.linspace(-.2,.3,3*29).reshape(3,29),f=f,xi=xi)
   history=dict(s=make(hist_f-1),a_prev=torch.zeros(3,2,29),f=hist_f,xi=xi[:,None].expand(-1,2,-1))
   class FixedStarts:
     def sample_starts(self,batch,hist):
       assert batch==3 and hist==2
       return start,history
-  inputs=[];imagined=[];policy_goals=[]
+  inputs=[];imagined=[];policy_goals=[];imagined_actions=[]
   original_imagine=alg._imag_step
   def capture_imagine(*args):
     result=original_imagine(*args)
     imagined.append((tuple(t.detach().clone() for t in result[0]),result[3].clone()))
+    imagined_actions.append(result[1].detach().clone())
     return result
   alg._imag_step=capture_imagine
   hook=alg.critic.register_forward_pre_hook(lambda module,args:inputs.append(args[0].detach().clone()))
@@ -146,6 +190,10 @@ def test_imagination_uses_noisy_policy_goals_and_clean_critic_goals(mdp):
   # for critic lambda-returns. Both must receive the same final encoded goal.
   assert inputs[1].shape[:2]==(cfg.horizon+1,3)
   torch.testing.assert_close(inputs[0],inputs[1][-1])
+  # The first critic state receives replay a_prev; every subsequent state
+  # receives exactly the action producing it, not a history or the next action.
+  expected_previous=torch.stack([start['a_prev'],*imagined_actions])
+  torch.testing.assert_close(inputs[1][...,145:174],expected_previous)
   goal_dim=64*cfg.goal_frames
   final_goals=inputs[0][:,-goal_dim:].reshape(3,cfg.goal_frames,64)
   ends=m.clip_end
@@ -211,8 +259,9 @@ def test_compiled_imagination_heads_match_values_and_gradients(mdp, robot, helpe
   else:
     xi_n = torch.linspace(-.5, .5, batch * 33, device=device).reshape(batch, 33).requires_grad_()
     goal = mdp.goal(state, f, alg.cfg.goal_frames).detach().requires_grad_()
-    inputs = (state, f, xi_n, goal)
-    leaves = (*state, xi_n, goal)
+    previous = (joints * -.2 + .1).detach().requires_grad_()
+    inputs = (state, f, xi_n, goal, previous)
+    leaves = (*state, xi_n, goal, previous)
   function = getattr(alg, helper)
   # No silent graph-break fallback: both production helpers must capture whole.
   compiled = torch.compile(function, fullgraph=True,
@@ -231,7 +280,9 @@ def test_compiled_imagination_heads_match_values_and_gradients(mdp, robot, helpe
     for ref, got in zip(expected_grad, actual_grad):
       assert torch.isfinite(got).all()
       torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-5)
-    assert actual_grad[-1].abs().sum() > 0  # Previous action or clean critic goal.
+    assert actual_grad[-1].abs().sum() > 0  # Previous action in both helpers.
+    if helper == 'critic_input':
+      assert actual_grad[-2].abs().sum() > 0  # Clean goal retains its own path.
     # The same critic helper is also used without gradients for lambda-return data.
     with torch.no_grad():
       no_grad_output = compiled(*inputs)

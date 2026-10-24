@@ -1,6 +1,41 @@
+from pathlib import Path
+
+import pytest
 import torch
+from supermimic.mdp.motion_lib import MotionLibrary, _resolve_motion_files
 from supermimic.mdp.sampling import ReturnBasedSampler
 from supermimic.mdp.rotations import mat_to_6d,mat_to_quat,so3_exp
+
+
+@pytest.mark.parametrize('as_string', [False, True])
+def test_directory_loads_root_and_nested_motions_in_path_order(mdp, tmp_path, as_string):
+  original = mdp.motion
+  nested = tmp_path / 'nested'
+  deep = nested / 'deeper'
+  deep.mkdir(parents=True)
+  root_clip = tmp_path / 'z_root.npz'
+  nested_clip = nested / 'a.npz'
+  deep_clip = deep / 'motion1.npz'
+  Path(original.motion_files[0]).rename(root_clip)
+  Path(original.motion_files[1]).rename(deep_clip)
+  nested_clip.write_bytes(deep_clip.read_bytes())
+  (deep / 'ignored.csv').write_text('not a motion archive')
+
+  motion = MotionLibrary(str(tmp_path) if as_string else tmp_path)
+  assert motion.motion_files == tuple(str(p.resolve()) for p in
+                                      (nested_clip, deep_clip, root_clip))
+  assert motion.motion_names == ('a', 'motion1', 'z_root')
+  assert motion.clip_len.tolist() == [7, 7, 51]
+  torch.testing.assert_close(motion.body_pos_w, torch.cat((
+    original.body_pos_w[51:], original.body_pos_w[51:], original.body_pos_w[:51],
+  )))
+
+
+def test_file_and_explicit_list_keep_the_requested_selection(mdp):
+  first, second = mdp.motion.motion_files
+  assert _resolve_motion_files(first) == (first,)
+  assert _resolve_motion_files(Path(second)) == (second,)
+  assert _resolve_motion_files([second, first]) == (second, first)
 
 
 def test_bins_and_goal_timing(mdp):

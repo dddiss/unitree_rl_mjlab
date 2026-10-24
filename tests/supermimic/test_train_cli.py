@@ -84,6 +84,7 @@ def test_warmup_cli_help():
                           capture_output=True, text=True, check=True)
   assert "--enable-warmup" in result.stdout
   assert "--no-enable-warmup" in result.stdout
+  assert "initial replay filling always runs" in " ".join(result.stdout.split())
   for option in ("--log-dir", "--run-name", "--logger", "--wandb-project", "--wandb-entity",
                  "--wandb-name", "--wandb-mode"):
     assert option in result.stdout

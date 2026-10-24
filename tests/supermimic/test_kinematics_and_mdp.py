@@ -111,6 +111,25 @@ def test_rotation_gradients():
     assert torch.isfinite(y).all() and torch.isfinite(x.grad).all()
 
 
+def test_critic_features_include_one_previous_action_and_no_duplicate_rotation(mdp):
+  f=torch.tensor([1,4])
+  state=(*mdp.reference_root(f),mdp.motion.joint_pos[f],mdp.motion.joint_vel[f])
+  xi=torch.linspace(-.3,.4,66).reshape(2,33)
+  previous=torch.linspace(-.2,.5,58).reshape(2,29).requires_grad_()
+  features=mdp.critic_features(state,f,xi,previous)
+  # 71 state + 29 joint error + 42 body error + 3 root position error,
+  # then 29 previous action and 33 context. Root rotation stays in goal only.
+  assert features.shape==(2,207)
+  torch.testing.assert_close(features[:,145:174],previous)
+  torch.testing.assert_close(features[:,174:],xi)
+  changed=mdp.critic_features(state,f,xi,previous+.25)
+  torch.testing.assert_close(changed[:,:145],features[:,:145])
+  torch.testing.assert_close(changed[:,174:],features[:,174:])
+  torch.testing.assert_close(changed[:,145:174]-features[:,145:174],torch.full_like(previous,.25))
+  features.sum().backward()
+  torch.testing.assert_close(previous.grad,torch.ones_like(previous))
+
+
 def test_goal_noise_only_changes_orientation_without_mutation_or_gradient_loss(mdp):
   # Include leading trajectory/batch axes and a non-default reference count.
   goal=torch.linspace(-2.,2.,2*3*4*64).reshape(2,3,4*64).requires_grad_()

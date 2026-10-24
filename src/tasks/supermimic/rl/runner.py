@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from ..mdp.state import read_state, OBS_DIM
+from ..mdp.sampling import EpisodeBinReturns
 from .algorithm import SuperMimicAlgorithm
 from .buffer import ReplayBuffer
 from .logging import TrainingLogger, format_terminal_summary
@@ -84,7 +85,7 @@ class SuperMimicRunner:
     self.step_acc = self.wall_offset = 0.0
     self._started = time.monotonic()
     self.episode_return = torch.zeros(env.num_envs, device=env.device)
-    self.discounted_return = torch.zeros_like(self.episode_return)
+    self.episode_bins = EpisodeBinReturns(self.motion, env.num_envs, cfg.gamma)
     self.stats = {}
     self.interval_metrics = IntervalMetrics(env.reward_manager.active_terms, env.termination_manager.active_terms,
                                            env.step_dt, env.device)
@@ -106,7 +107,9 @@ class SuperMimicRunner:
       self.buffer.add(tr)
       self.algorithm.observe(tr, self.env.context)
       self.episode_return += tr["r"]
-      self.discounted_return += self.cfg.gamma ** tr["ep_step"].float() * tr["r"]
+      # A transition targets f after starting at f-1. Attribute it to the
+      # corresponding reset/source bin, including the final valid transition.
+      self.episode_bins.add(self.motion.frame_bin[tr["f"] - 1], tr["r"])
       self.sim_steps += self.env.num_envs
       self.env_steps += 1
       self._record("sim_reward", float(tr["r"].mean() / self.env.functional_mdp.max_step_reward))
@@ -115,13 +118,13 @@ class SuperMimicRunner:
       if len(ids):
         steps = tr["ep_step"][ids] + 1
         self.interval_metrics.add_episodes(self.episode_return[ids], steps)
-        self.command.sampler.update(self.command.start_bin[ids], self.discounted_return[ids],
-                                    self.episode_return[ids], steps, tr["terminated"][ids])
+        bins, returns = self.episode_bins.finish(ids, tr["terminated"][ids])
+        self.command.sampler.update_returns(bins, returns)
         self._record("episode_length", float(steps.float().mean()))
         self._record("episode_return", float((self.episode_return[ids] / steps
                                                / self.env.functional_mdp.max_step_reward).mean()))
         self._record("failure_fraction", float(tr["terminated"][ids].float().mean()))
-        self.episode_return[ids] = self.discounted_return[ids] = 0
+        self.episode_return[ids] = 0
         self.env.reset(env_ids=ids)
 
   def _record(self, key, value):
@@ -162,7 +165,8 @@ class SuperMimicRunner:
     torch.set_rng_state(rng["torch"].cpu())
     if torch.cuda.is_available() and len(rng["cuda"]) == torch.cuda.device_count():
       torch.cuda.set_rng_state_all([state.cpu() for state in rng["cuda"]])
-    self.episode_return.zero_(); self.discounted_return.zero_()
+    self.episode_return.zero_()
+    self.episode_bins.reset()
     self.stats.clear()
     self.interval_metrics.clear()
     self._resume_checkpoint = str(Path(path).resolve())
@@ -183,9 +187,11 @@ class SuperMimicRunner:
 
   def _learn(self):
     c = self.cfg
-    # Replay is not checkpointed. Without warmup, refill through normal collection.
-    if c.enable_warmup and self.buffer.size < c.wm_window:
-      self.collect(max(c.warmup_steps, c.wm_window))
+    # Replay is not checkpointed. Initial filling is required with either
+    # warmup setting, including when resuming into an empty buffer.
+    prefill = max(c.warmup_steps, c.wm_window)
+    if self.buffer.size < min(prefill, self.buffer.capacity):
+      self.collect(prefill - self.buffer.size)
     # Throughput measures the main loop, excluding initial replay filling.
     self._reset_performance()
     for iteration in range(self.iteration, c.iterations):
@@ -196,13 +202,22 @@ class SuperMimicRunner:
       started = time.monotonic()
       self.collect(steps)
       self._phase_seconds[0] += time.monotonic() - started
+      wm_warmup = c.enable_warmup and iteration < c.wm_only_iters
       if self.buffer.size >= c.wm_window:
         started = time.monotonic()
+        wm_updated = False
         for _ in range(c.wm_batches):
-          for key, value in self.algorithm.world_model_update(self.buffer).items():
+          metrics = self.algorithm.world_model_update(self.buffer, strict=not wm_warmup)
+          if metrics is None:
+            # Keep collecting if no complete same-episode window exists yet.
+            break
+          wm_updated = True
+          for key, value in metrics.items():
             self._record(key, value)
         self._phase_seconds[1] += time.monotonic() - started
-        if not c.enable_warmup or iteration >= c.wm_only_iters:
+        if not wm_updated:
+          self._record("policy_skipped", 1.0)
+        elif not wm_warmup:
           started = time.monotonic()
           for key, value in self.algorithm.policy_update(self.buffer).items():
             self._record(key, value)
