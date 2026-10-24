@@ -64,6 +64,8 @@ class MotionCommand(CommandTerm):
     )
     # Global target frame for the action about to be executed.
     self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+    # Retain k separately: a target clamped at the clip end cannot recover it.
+    self._initialization_frames = torch.zeros_like(self.time_steps)
     self.start_bin = torch.zeros_like(self.time_steps)
     self._requested_frames = torch.full_like(self.time_steps, -1)
     self.body_pos_relative_w = torch.zeros(
@@ -288,6 +290,7 @@ class MotionCommand(CommandTerm):
     exact = requested >= 0
     frames = torch.where(exact, requested, frames)
     self._requested_frames[env_ids] = -1
+    self._initialization_frames[env_ids] = frames
     # Initialize the robot at k, but expose k+1 as the first control target.
     # Explicit playback requests may select the last frame, so clamp per clip.
     end = self.motion.clip_end[self.motion.clip_id[frames]]
@@ -538,6 +541,15 @@ class MotionCommand(CommandTerm):
           label=f"current_anchor_{batch}",
         )
 
+  def _get_gui_frame(self, env_idx: int) -> int:
+    """Local initialization frame k for restarting at the playback position."""
+    clip = self.motion_ids[env_idx]
+    frame = torch.minimum(
+      self._initialization_frames[env_idx] + self._env.episode_length_buf[env_idx],
+      self.motion.clip_end[clip],
+    )
+    return int(frame - self.motion.clip_start[clip])
+
   def create_gui(
     self,
     name: str,
@@ -546,23 +558,25 @@ class MotionCommand(CommandTerm):
     on_change: Callable[[], None] | None = None,
     request_action: Callable[[str, Any], None] | None = None,
   ) -> None:
-    """Select a clip/local frame and queue it for the viewer's full reset path."""
+    """Select an initialization frame k; its first control target is k+1."""
     labels = tuple(
       f"{index}: {motion_name}"
       for index, motion_name in enumerate(self.motion.motion_names)
     )
     lengths = self.motion.clip_len.cpu().tolist()
+    env_idx = get_env_idx()
+    clip = int(self.motion_ids[env_idx])
 
     with server.gui.add_folder(name.capitalize()):
       motion_selector = server.gui.add_dropdown(
-        "Motion", options=labels, initial_value=labels[0]
+        "Motion", options=labels, initial_value=labels[clip]
       )
       scrubber = server.gui.add_slider(
         "Frame",
         min=0,
-        max=lengths[0] - 1,
+        max=lengths[clip] - 1,
         step=1,
-        initial_value=0,
+        initial_value=self._get_gui_frame(env_idx),
       )
 
       @motion_selector.on_update
@@ -615,7 +629,7 @@ class MotionCommand(CommandTerm):
         selector.value = self._motion_labels[clip]
         scrubber.value = 0
         scrubber.max = int(self.motion.clip_len[clip]) - 1
-        scrubber.value = int(self.time_steps[idx] - self.motion.clip_start[clip])
+        scrubber.value = self._get_gui_frame(idx)
       self._set_scrubber_disabled(not paused)
 
 

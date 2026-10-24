@@ -114,6 +114,13 @@ class PlaybackEnv:
   def unwrapped(self):
     return self.env
 
+  def reset(self, *, seed=None, env_ids=None, options=None):
+    """Restart each selected environment at its current clip's first frame."""
+    cmd = self.env.command_manager.get_term("motion")
+    motion_ids = cmd.motion_ids if env_ids is None else cmd.motion_ids[env_ids]
+    cmd.request_frames(cmd.motion.clip_start[motion_ids], env_ids)
+    return self.env.reset(seed=seed, env_ids=env_ids, options=options)
+
   def step(self, action):
     obs, reward, term, truncated, info = self.env.step(action)
     done = term | truncated
