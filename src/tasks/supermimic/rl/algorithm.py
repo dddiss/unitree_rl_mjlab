@@ -42,8 +42,8 @@ class SuperMimicAlgorithm:
     compile_fn = torch.compile if cfg.compile and self.device.type == "cuda" else lambda f: f
     self._world_rollout = compile_fn(self._rollout)
     self._imag_step = compile_fn(self._imagine_step)
-    self._reward = compile_fn(mdp.reward)
-    self._soft_term = compile_fn(mdp.soft_termination)
+    self._reward_term = compile_fn(self.reward_term)
+    self._critic_input = compile_fn(self.critic_input)
 
   def set_lr(self, iteration):
     c = self.cfg
@@ -87,6 +87,9 @@ class SuperMimicAlgorithm:
   def critic_input(self, state, f, xi_n, goal):
     return torch.cat((self.mdp.critic_features(state, f, xi_n), goal), -1)
 
+  def reward_term(self, state, f, action, a_prev):
+    return self.mdp.reward(state, f, action, a_prev), self.mdp.soft_termination(state, f)
+
   def next_target(self, f):
     m = self.mdp.motion
     return torch.minimum(f + 1, m.clip_end[m.clip_id[f]])
@@ -116,20 +119,28 @@ class SuperMimicAlgorithm:
       history = self.mdp.add_noise(self.mdp.obs(unflatten_state(hist["s"]), hist["a_prev"], hist["xi"], hist["f"]))
     goal = self.mdp.goal(state, f, c.goal_frames)
     states, frames, goals = [state], [f], [goal]
-    rewards, probabilities = [], []
+    actions, previous_actions = [], []
+    batch_size = f.shape[0]
+
+    def flat(rows):
+      return torch.stack(rows).flatten(0, 1)
+
     with frozen(self.wm, self.critic):
       for _ in range(c.horizon):
         next_state, action, history, next_f, next_goal = self._imag_step(state, history, f, xi, goal)
-        rewards.append(self._reward(next_state, f, action, a_prev))
-        probabilities.append(self._soft_term(next_state, f))
+        actions.append(action); previous_actions.append(a_prev)
         state, f, goal, a_prev = next_state, next_f, next_goal, action
         states.append(state); frames.append(f); goals.append(goal)
-      r, d = torch.stack(rewards), torch.stack(probabilities)
+      # Time-major batch: post-action s[t+1] still compares with target f[t].
+      # Keep the rollout graph, including both actions in the action-rate cost.
+      reward_states = tuple(flat([s[i] for s in states[1:]]) for i in range(6))
+      r, d = self._reward_term(reward_states, flat(frames[:-1]), flat(actions), flat(previous_actions))
+      r, d = r.reshape(c.horizon, batch_size), d.reshape(c.horizon, batch_size)
       alive = (1 - d).cumprod(0)
       prior_alive = torch.cat((torch.ones_like(alive[:1]), alive[:-1]), 0)
       discount = c.gamma ** torch.arange(c.horizon, device=self.device)[:, None]
       objective = (discount * prior_alive * r).sum(0)
-      objective += c.gamma ** c.horizon * alive[-1] * self.critic(self.critic_input(state, f, xi_n, goal))
+      objective += c.gamma ** c.horizon * alive[-1] * self.critic(self._critic_input(state, f, xi_n, goal))
       loss = -objective.mean()
       self.opt_pi.zero_grad(set_to_none=True)
       loss.backward()
@@ -140,8 +151,10 @@ class SuperMimicAlgorithm:
       self.opt_pi.step()
     # All targets are detached; critic training must not retain the BPTT graph.
     with torch.no_grad():
-      x = torch.stack([self.critic_input(tuple(t.detach() for t in s), ft, xi_n, g.detach())
-                       for s, ft, g in zip(states, frames, goals)])
+      critic_states = tuple(flat([s[i].detach() for s in states]) for i in range(6))
+      critic_xi = xi_n.unsqueeze(0).expand(c.horizon + 1, -1, -1).flatten(0, 1)
+      x = self._critic_input(critic_states, flat(frames), critic_xi,
+                             flat([g.detach() for g in goals])).reshape(c.horizon + 1, batch_size, -1)
       self.critic.norm.update(x)
       v = self.critic(x)
       ret, targets = v[-1], []

@@ -1,4 +1,8 @@
+import pytest
 import torch
+from supermimic.mdp.functional import FunctionalMDP
+from supermimic.mdp.kinematics import G1Kinematics
+from supermimic.mdp.motion_lib import MotionLibrary
 from supermimic.mdp.state import flatten_state,unflatten_state
 from supermimic.mdp.rotations import mat_to_6d,so3_exp
 from supermimic.rl.algorithm import SuperMimicAlgorithm
@@ -171,3 +175,70 @@ def test_imagination_uses_noisy_policy_goals_and_clean_critic_goals(mdp):
     assert (batch[:,None]==clean_rows[None]).all(-1).any(-1).all()
   assert imagined[-1][1].tolist()==[50,57,10]
   assert not torch.allclose(inputs[1][-2,:2,-goal_dim:],inputs[1][-1,:2,-goal_dim:])
+
+
+@pytest.mark.parametrize('helper', ['reward_term', 'critic_input'])
+@pytest.mark.parametrize('device', [
+  'cpu',
+  pytest.param('cuda:0', marks=pytest.mark.skipif(
+    not torch.cuda.is_available(), reason='Requires NVIDIA GPU for Inductor compilation')),
+])
+def test_compiled_imagination_heads_match_values_and_gradients(mdp, robot, helper, device):
+  """CPU checks full-graph capture/AOT autograd; CUDA also checks generated kernels."""
+  torch.set_num_threads(2)
+  if device != 'cpu':
+    model, joints, bodies, _ = robot
+    root = model.body('pelvis').id
+    motion = MotionLibrary(mdp.motion.motion_files, device=device)
+    kin = G1Kinematics(model, joints, bodies, root, device=device)
+    mdp = FunctionalMDP(motion, kin, mdp.default_q.to(device),
+                        [b - 1 for b in bodies], root - 1)
+  alg = SuperMimicAlgorithm(mdp, small_config(), device)
+  # Time-major rows include both clip boundaries and a third continuing clip row.
+  f = torch.tensor([[48, 55, 7], [49, 56, 8], [50, 57, 9]], device=device).flatten()
+  p, r, v, w = mdp.reference_root(f)
+  batch = len(f)
+  offsets = torch.linspace(-.12, .16, batch * 3, device=device).reshape(batch, 3)
+  joints = torch.linspace(-.2, .3, batch * 29, device=device).reshape(batch, 29)
+  values = (p + offsets + p.new_tensor([0., 0., .25]), r @ so3_exp(offsets),
+            v + offsets, w - offsets, joints, joints * .7)
+  state = tuple(t.detach().requires_grad_() for t in values)
+  if helper == 'reward_term':
+    action = (joints * .3).detach().requires_grad_()
+    previous = (joints * -.2 + .1).detach().requires_grad_()
+    inputs = (state, f, action, previous)
+    leaves = (*state, action, previous)
+  else:
+    xi_n = torch.linspace(-.5, .5, batch * 33, device=device).reshape(batch, 33).requires_grad_()
+    goal = mdp.goal(state, f, alg.cfg.goal_frames).detach().requires_grad_()
+    inputs = (state, f, xi_n, goal)
+    leaves = (*state, xi_n, goal)
+  function = getattr(alg, helper)
+  # No silent graph-break fallback: both production helpers must capture whole.
+  compiled = torch.compile(function, fullgraph=True,
+                           backend='aot_eager' if device == 'cpu' else 'inductor')
+  try:
+    expected, actual = function(*inputs), compiled(*inputs)
+    if isinstance(expected, torch.Tensor):
+      expected, actual = (expected,), (actual,)
+    for ref, got in zip(expected, actual):
+      torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-5)
+    def loss(outputs):
+      return sum((t * torch.linspace(.2, 1., t.numel(), device=device).reshape(t.shape)).mean()
+                 for t in outputs)
+    expected_grad = torch.autograd.grad(loss(expected), leaves)
+    actual_grad = torch.autograd.grad(loss(actual), leaves)
+    for ref, got in zip(expected_grad, actual_grad):
+      assert torch.isfinite(got).all()
+      torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-5)
+    assert actual_grad[-1].abs().sum() > 0  # Previous action or clean critic goal.
+    # The same critic helper is also used without gradients for lambda-return data.
+    with torch.no_grad():
+      no_grad_output = compiled(*inputs)
+      if isinstance(no_grad_output, torch.Tensor):
+        no_grad_output = (no_grad_output,)
+      for ref, got in zip(expected, no_grad_output):
+        assert not got.requires_grad
+        torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-5)
+  finally:
+    torch.compiler.reset()

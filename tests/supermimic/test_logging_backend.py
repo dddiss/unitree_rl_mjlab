@@ -15,12 +15,24 @@ from supermimic.rl import logging as logging_module
 from supermimic.rl.logging import TrainingLogger
 
 
+EXPECTED_WANDB_NAMES = {
+  "wm_loss": "Loss/wm_loss", "wm_err_last": "Loss/wm_err_last",
+  "pi_loss": "Loss/pi_loss", "v_loss": "Loss/v_loss",
+  "lr": "Training/lr", "pi_gradnorm": "Training/pi_gradnorm",
+  "policy_skipped": "Training/policy_skipped", "sim_steps": "Training/sim_steps",
+  "env_steps": "Training/env_steps", "wall_h": "Performance/wall_h",
+  "imag_reward": "Imagination/reward", "imag_survival": "Imagination/survival",
+  "sim_reward": "Reward/total_normalized", "episode_length": "Episode/length_steps",
+  "episode_return": "Episode/return_normalized", "failure_fraction": "Episode/failure_fraction",
+}
+
+
 @dataclass
 class Config:
   logger: str = "wandb"
   wandb_project: str = "unitree-supermimic"
   wandb_entity: str | None = None
-  wandb_name: str | None = None
+  run_name: str = "g1"
   wandb_mode: str = "offline"
   seed: int = 123
 
@@ -139,6 +151,40 @@ def test_wandb_matches_csv_and_omits_missing_metrics(tmp_path, sdk):
                                 x_disable_stats=True, x_disable_meta=True)
 
 
+def test_wandb_groups_metrics_without_changing_csv_or_input(tmp_path, sdk):
+  row = {
+    "iteration": 50, "wm_loss": np.float64(.125), "wm_err_last": .25,
+    "pi_loss": -1.5, "v_loss": 2.5, "pi_gradnorm": .75,
+    "imag_reward": .8, "imag_survival": .9, "lr": .0002, "policy_skipped": 0.,
+    "sim_steps": 512000, "env_steps": 125, "wall_h": .01,
+    "sim_reward": .7, "episode_length": 40., "episode_return": .6, "failure_fraction": .5,
+    "Reward/motion_body_pos": .9, "Tracking/error_anchor_pos": .05,
+    "Termination/anchor_pos_fraction": .5, "Episode/return_raw": 3.,
+    "Sampling/entropy": .8, "Performance/collection_s": .065,
+  }
+  original = row.copy()
+  logger = TrainingLogger(tmp_path, Config(), list(row))
+  logger.log(row)
+  # Cover missing keys, None and blank values across all renamed categories.
+  missing = {"iteration": 100, **{
+    key: None if index % 3 == 0 else ""
+    for index, key in enumerate(EXPECTED_WANDB_NAMES) if index % 3 != 2}}
+  missing_original = missing.copy()
+  logger.log(missing)
+  logger.close()
+  assert row == original
+  assert isinstance(row["wm_loss"], np.float64)
+  assert missing == missing_original
+  expected = {EXPECTED_WANDB_NAMES.get(key, key): value for key, value in original.items()}
+  assert sdk.runs[0].rows == [expected, {"iteration": 100}]
+  assert not set(EXPECTED_WANDB_NAMES).intersection(sdk.runs[0].rows[0])
+  fields, rows = read_csv(tmp_path / "train_log.csv")
+  assert fields == list(original)
+  for key, value in original.items():
+    assert float(rows[0][key]) == value
+  assert rows[1] == {key: "100" if key == "iteration" else "" for key in fields}
+
+
 def test_each_invocation_gets_new_wandb_id_and_resume_metadata(tmp_path, sdk, monkeypatch):
   monkeypatch.setenv("WANDB_RUN_ID", "old-run-from-environment")
   first = TrainingLogger(tmp_path / "first", Config(), ["iteration"])
@@ -157,8 +203,20 @@ def test_each_invocation_gets_new_wandb_id_and_resume_metadata(tmp_path, sdk, mo
   assert initial["config"]["resume_checkpoint"] is None
   assert second["config"]["start_iteration"] == 120
   assert second["config"]["resume_checkpoint"] == str(tmp_path / "first/last.pt")
-  assert second["name"].startswith("resumed-")
+  assert initial["name"] == "first"
+  assert second["name"] == "resumed"
   assert sdk.runs[0].finishes == [0] and sdk.runs[1].finishes == [1]
+
+
+def test_wandb_uses_exact_resolved_directory_name_without_adding_timestamp(tmp_path, sdk):
+  cfg = Config(run_name="g1_exp01")
+  final_name = "g1_exp01_20261024_183045_123456"
+  logger = TrainingLogger(tmp_path / final_name, cfg, ["iteration"])
+  logger.close()
+  assert sdk.runs[0].kwargs["name"] == final_name
+  assert Path(sdk.runs[0].kwargs["dir"]).name == final_name
+  assert sdk.runs[0].kwargs["config"]["run_name"] == cfg.run_name
+  assert "wandb_name" not in sdk.runs[0].kwargs["config"]
 
 
 def test_sdk_calls_preserve_training_random_streams(tmp_path, sdk):

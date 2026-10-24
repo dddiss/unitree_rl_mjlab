@@ -30,8 +30,8 @@ def snapshot(values, *, reward=None, termination=None):
   }
 
 
-def metrics():
-  return IntervalMetrics(REWARDS, REASONS, step_dt=0.02, device="cpu")
+def metrics(step_dt=0.02):
+  return IntervalMetrics(REWARDS, REASONS, step_dt=step_dt, device="cpu")
 
 
 def test_episode_means_weight_each_completed_episode_not_each_batch():
@@ -45,27 +45,46 @@ def test_episode_means_weight_each_completed_episode_not_each_batch():
   assert row["Episode/return_raw"] != pytest.approx((4. + 20. / 3.) / 2.)
 
 
-def test_step_metrics_weight_transitions_and_reward_contributions_sum():
-  accumulated = metrics()
+@pytest.mark.parametrize("step_dt", [0.02, 0.01])
+def test_step_metrics_display_rewards_without_dt_and_preserve_snapshot(step_dt):
+  accumulated = metrics(step_dt)
   # Already weighted and dt-scaled contributions, including negative penalties.
   weights = (0.5, 0.5, 1., 1., 1., 1., -0.1, -2.)
   raw_batches = (torch.tensor([1., 2.]), torch.tensor([3., 4., 5.]))
   actual_total_rewards = []
   for raw in raw_batches:
-    contributions = {name: raw * weight * 0.02 for name, weight in zip(REWARDS, weights)}
+    contributions = {name: raw * weight * step_dt for name, weight in zip(REWARDS, weights)}
     actual_total_rewards.append(torch.stack(list(contributions.values())).sum(0))
     accumulated.add_step(snapshot(raw, reward=contributions))
+    # Log accumulation cannot change the weighted, dt-scaled training values.
+    for name, weight in zip(REWARDS, weights):
+      torch.testing.assert_close(contributions[name], raw * weight * step_dt)
   row = accumulated.values()
+  assert accumulated.values() == row  # Display conversion is not cumulative.
   for name in TRACKING_METRICS:
     assert row[f"Tracking/{name}"] == pytest.approx(3.)
+  for name, weight in zip(REWARDS, weights):
+    assert row[f"Reward/{name}"] == pytest.approx(3. * weight)
   assert sum(row[f"Reward/{name}"] for name in REWARDS) == pytest.approx(
-    torch.cat(actual_total_rewards).mean().item())
+    torch.cat(actual_total_rewards).mean().item() / step_dt)
   assert row["Reward/action_rate_l2"] < 0
   assert row["Reward/joint_limit"] < 0
   assert accumulated.sample_count == 5
 
 
-def test_no_completed_episodes_keeps_counts_zero_and_means_empty():
+def test_perfect_tracking_reward_displays_configured_weight():
+  accumulated = metrics()
+  weights = (0.5, 0.5, 1., 1., 1., 1.)
+  contributions = {name: torch.tensor([weight * 0.02])
+                   for name, weight in zip(REWARDS[:6], weights)}
+  contributions.update({name: torch.zeros(1) for name in REWARDS[6:]})
+  accumulated.add_step(snapshot([0.], reward=contributions))
+  row = accumulated.values()
+  for name, weight in zip(REWARDS[:6], weights):
+    assert row[f"Reward/{name}"] == pytest.approx(weight)
+
+
+def test_no_completed_episodes_keeps_fractions_empty_and_omits_counts():
   accumulated = metrics()
   accumulated.add_step(snapshot([1., 3.]))
   accumulated.add_episodes(torch.empty(0), torch.empty(0, dtype=torch.long))
@@ -73,7 +92,8 @@ def test_no_completed_episodes_keeps_counts_zero_and_means_empty():
   assert row["Episode/completed"] == 0
   assert row["Episode/return_raw"] == row["Episode/length_seconds"] == ""
   for name in REASONS:
-    assert row[f"Termination/{name}_count"] == 0
+    assert f"Termination/{name}_count" not in row
+    assert f"Termination/{name}_count" not in accumulated.fields
     assert row[f"Termination/{name}_fraction"] == ""
   assert row["Tracking/error_anchor_pos"] == 2.
 
@@ -90,7 +110,7 @@ def test_termination_causes_can_overlap_and_sum_above_one():
   accumulated.add_episodes(torch.tensor([1., 2.]), torch.tensor([10, 500]))
   row = accumulated.values()
   assert row["Episode/completed"] == 2
-  assert row["Termination/anchor_pos_count"] == 2
+  assert all(not key.endswith("_count") for key in row if key.startswith("Termination/"))
   assert row["Termination/anchor_pos_fraction"] == 1.
   assert row["Termination/anchor_ori_fraction"] == 0.5
   assert row["Termination/time_out_fraction"] == 0.5

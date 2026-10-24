@@ -1,5 +1,6 @@
 """Train the independent G1 SuperMimic learner using local NPZ motions."""
 import argparse
+from datetime import datetime
 from pathlib import Path
 import sys
 
@@ -9,7 +10,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 def main():
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("--motion-file", required=True, help="NPZ file or directory")
-  parser.add_argument("--log-dir", required=True)
+  parser.add_argument("--log-dir", help="Log root directory (default: rl_cfg.py log_dir)")
+  parser.add_argument("--run-name", "--wandb-name", dest="run_name",
+                      help="Base experiment name; a timestamp is appended for the directory and W&B "
+                           "(default: rl_cfg.py run_name)")
   parser.add_argument("--resume", help="Local full SuperMimic checkpoint")
   parser.add_argument("--device", default="cuda:0")
   integer_options = ("num-envs", "iterations", "buffer-steps", "horizon", "goal-frames", "hist",
@@ -29,7 +33,6 @@ def main():
                       help="wandb writes CSV and W&B; csv writes only CSV (default: wandb)")
   parser.add_argument("--wandb-project", help="W&B project (default: unitree-supermimic)")
   parser.add_argument("--wandb-entity", help="W&B account/team (default: current account)")
-  parser.add_argument("--wandb-name", help="W&B run name (default: run directory and start time)")
   parser.add_argument("--wandb-mode", choices=("online", "offline"),
                       help="W&B connection mode (default: online)")
   args = parser.parse_args()
@@ -39,14 +42,19 @@ def main():
   from dataclasses import asdict
   from src.tasks.supermimic.config import make_env
   from src.tasks.supermimic.config.g1.rl_cfg import (
-    SuperMimicConfig, unitree_g1_supermimic_runner_cfg,
+    SuperMimicConfig, migrate_legacy_run_name, unitree_g1_supermimic_runner_cfg,
   )
   from src.tasks.supermimic.rl.runner import SuperMimicRunner
   defaults = asdict(unitree_g1_supermimic_runner_cfg())
   if args.resume:
-    defaults.update(torch.load(args.resume, map_location="cpu", weights_only=False)["config"])
+    defaults.update(migrate_legacy_run_name(
+      torch.load(args.resume, map_location="cpu", weights_only=False)["config"]))
   defaults.update({key: value for key, value in vars(args).items() if key in defaults and value is not None})
   cfg = SuperMimicConfig(**defaults)
+  # Generate once; the directory and W&B share this exact name. Keep the base
+  # name in cfg/checkpoints so a resumed run receives only its new timestamp.
+  run_name = f"{cfg.run_name}_{datetime.now():%Y%m%d_%H%M%S_%f}"
+  log_dir = Path(cfg.log_dir) / run_name
   random.seed(cfg.seed); np.random.seed(cfg.seed); torch.manual_seed(cfg.seed)
   torch.backends.cuda.matmul.allow_tf32 = True
   torch.backends.cudnn.allow_tf32 = True
@@ -57,7 +65,7 @@ def main():
   runner = None
   exit_code = 1
   try:
-    runner = SuperMimicRunner(env, cfg, args.log_dir)
+    runner = SuperMimicRunner(env, cfg, log_dir)
     if args.resume:
       runner.load(args.resume)
     runner.learn()

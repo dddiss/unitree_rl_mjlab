@@ -289,6 +289,26 @@ def test_evaluation_loader_restores_new_policy_dimensions(mdp,tmp_path):
   torch.testing.assert_close(actual,expected)
 
 
+def test_legacy_run_name_loads_for_evaluation_and_resume(mdp,tmp_path):
+  cfg=small_config(run_name="original",log_dir=str(tmp_path/'run'))
+  runner=SuperMimicRunner(TensorEnv(mdp),cfg,cfg.log_dir)
+  checkpoint=tmp_path/'run/last.pt'
+  runner.save(checkpoint)
+  saved=torch.load(checkpoint,weights_only=False)
+  saved['config'].pop('run_name')
+  saved['config'].pop('log_dir')
+  saved['config']['wandb_name']='legacy-experiment'
+  torch.save(saved,checkpoint)
+  _,loaded_cfg,_=load_policy(checkpoint,TensorEnv(mdp))
+  assert loaded_cfg.run_name=='legacy-experiment'
+  resumed_cfg=small_config(run_name='resumed',log_dir=str(tmp_path/'resumed'))
+  resumed=SuperMimicRunner(TensorEnv(mdp),resumed_cfg,resumed_cfg.log_dir)
+  resumed.load(checkpoint)
+  assert resumed.cfg.run_name=='resumed' and resumed.log_dir==tmp_path/'resumed'
+  for name,value in runner.algorithm.policy.state_dict().items():
+    torch.testing.assert_close(resumed.algorithm.policy.state_dict()[name],value)
+
+
 def test_collection_adds_goal_noise_before_normalization(mdp,tmp_path):
   cfg=small_config(hist=10,goal_frames=10)
   env=TensorEnv(mdp)

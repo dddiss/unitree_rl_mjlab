@@ -28,10 +28,11 @@ class SuperMimicConfig:
   lr_decay_iters: int = 250_000
   ckpt_every: int = 2000
   log_every: int = 50
+  log_dir: str = "logs/supermimic"  # Root for timestamped experiment directories.
+  run_name: str = "g1"  # Base name; startup appends one timestamp for directory/W&B.
   logger: Literal["wandb", "csv"] = "wandb"
   wandb_project: str = "unitree-supermimic"
   wandb_entity: str | None = None
-  wandb_name: str | None = None
   wandb_mode: Literal["online", "offline"] = "online"
   seed: int = 0
   amp: str = "bf16"
@@ -56,6 +57,21 @@ class SuperMimicConfig:
       raise ValueError("logger must be wandb or csv")
     if self.wandb_mode not in ("online", "offline"):
       raise ValueError("wandb_mode must be online or offline")
+    if not self.log_dir:
+      raise ValueError("log_dir must not be empty")
+    if not self.run_name or not self.run_name.strip():
+      raise ValueError("run_name must not be empty")
+    if self.run_name in (".", "..") or "/" in self.run_name or "\\" in self.run_name:
+      raise ValueError("run_name must be a single directory name")
+
+
+def migrate_legacy_run_name(config: dict) -> dict:
+  """Read old checkpoint names without keeping a second naming option."""
+  config = dict(config)
+  legacy_name = config.pop("wandb_name", None)
+  if "run_name" not in config and legacy_name:
+    config["run_name"] = legacy_name
+  return config
 
 
 def unitree_g1_supermimic_runner_cfg() -> SuperMimicConfig:

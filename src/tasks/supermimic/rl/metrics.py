@@ -33,7 +33,7 @@ class IntervalMetrics:
     self.step_fields = tuple(f"Tracking/{key}" for key in TRACKING_METRICS) + tuple(
       f"Reward/{key}" for key in self.reward_names)
     self.fields = self.step_fields + tuple(
-      f"Termination/{key}_{kind}" for key in self.termination_names for kind in ("count", "fraction")
+      f"Termination/{key}_fraction" for key in self.termination_names
     ) + ("Episode/completed", "Episode/return_raw", "Episode/length_seconds")
     self.step_sums = torch.zeros(len(self.step_fields), dtype=torch.float64, device=device)
     self.reason_counts = torch.zeros(len(self.termination_names), dtype=torch.long, device=device)
@@ -61,8 +61,11 @@ class IntervalMetrics:
       self.step_sums.cpu().tolist(), self.reason_counts.cpu().tolist(), self.episode_sums.cpu().tolist())
     row = {key: value / self.sample_count if self.sample_count else ""
            for key, value in zip(self.step_fields, step_sums)}
+    # Undo dt scaling only for display; snapshots and training rewards retain it.
+    if self.sample_count:
+      for name in self.reward_names:
+        row[f"Reward/{name}"] /= self.step_dt
     for key, count in zip(self.termination_names, reason_counts):
-      row[f"Termination/{key}_count"] = count
       row[f"Termination/{key}_fraction"] = count / self.completed if self.completed else ""
     row["Episode/completed"] = self.completed
     row["Episode/return_raw"] = episode_sums[0] / self.completed if self.completed else ""

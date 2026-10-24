@@ -108,11 +108,16 @@ python scripts/csv_to_npz_multi.py \
 ```bash
 python scripts/train_supermimic.py \
   --motion-file src/assets/motions/g1 \
-  --log-dir logs/supermimic/g1 \
+  --log-dir logs/supermimic \
+  --run-name g1 \
   --device cuda:0
 ```
 
 训练默认同时记录本地 CSV 和在线 W&B，请先配置 W&B 登录；不需要在线记录时添加 `--logger csv`，或使用 `--wandb-mode offline` 离线记录。配置与动作清单仍保存在本地 JSON。`--motion-file` 也可以直接指定一个 NPZ。常用参数如下，未传入时采用 `config/g1/rl_cfg.py` 的默认值：
+
+`rl_cfg.py` 中的 `log_dir="logs/supermimic"` 指定日志根目录，`run_name="g1"` 指定基础实验名称。每次启动生成一次 `YYYYMMDD_HHMMSS_微秒` 时间戳，最终目录为 `log_dir/run_name_时间戳`，W&B 显示名称与这个带时间戳的目录名完全一致。可通过 `--log-dir` 和 `--run-name` 分别覆盖；旧参数 `--wandb-name` 保留为 `--run-name` 的别名。`run_name` 必须为单个文件夹名称。
+
+例如，实际保存目录为 `logs/supermimic/g1_20261024_180000_123456/`，W&B 名称就是 `g1_20261024_180000_123456`。下文恢复和评估命令中的这个示例目录需要替换为你的实际目录。
 
 | 参数 | 默认值 | 用途 |
 |---|---:|---|
@@ -136,7 +141,8 @@ python scripts/train_supermimic.py \
 ```bash
 python scripts/train_supermimic.py \
   --motion-file src/assets/motions/g1 \
-  --log-dir logs/supermimic/g1_1024 \
+  --log-dir logs/supermimic \
+  --run-name g1_1024 \
   --num-envs 1024 \
   --wm-batch 1024 \
   --pi-batch 1024
@@ -149,7 +155,8 @@ python scripts/train_supermimic.py \
 | `--logger` | `wandb` | `wandb` 同时写 CSV 和 W&B；`csv` 只写本地 CSV |
 | `--wandb-project` | `unitree-supermimic` | W&B 项目名 |
 | `--wandb-entity` | 当前账户默认设置 | W&B 账户或团队 |
-| `--wandb-name` | 运行目录名和启动时间 | 本次 W&B run 的显示名称 |
+| `--log-dir` | `logs/supermimic` | 日志根目录，可在 `rl_cfg.py` 中设置 |
+| `--run-name` | `g1` | 基础实验名称，追加一次时间戳后同时用于实验目录和 W&B 名称 |
 | `--wandb-mode` | `online` | `offline` 将 W&B 记录保存在本地，之后可同步 |
 
 例如，仅使用本地 CSV：
@@ -157,7 +164,8 @@ python scripts/train_supermimic.py \
 ```bash
 python scripts/train_supermimic.py \
   --motion-file src/assets/motions/g1 \
-  --log-dir logs/supermimic/g1_local \
+  --log-dir logs/supermimic \
+  --run-name g1_local \
   --logger csv
 ```
 
@@ -165,13 +173,15 @@ CSV 和 W&B 每 `--log-every` 次迭代记录同一组聚合结果，W&B 横轴�
 
 `train_log.csv` 保留原有 17 列：`iteration`、`wall_h`、`sim_steps`、`env_steps`、`lr`、`wm_loss`、`wm_err_last`、`pi_loss`、`v_loss`、`pi_gradnorm`、`imag_survival`、`imag_reward`、`policy_skipped`、`sim_reward`、`episode_length`、`episode_return`、`failure_fraction`。其中 `episode_return` 仍是按实际步数和最大单步奖励归一化后的回报，`episode_length` 的单位为控制步；新增原始回报单独记录。
 
+W&B 将网络损失统一归入 `Loss/`：`Loss/wm_loss`、`Loss/wm_err_last`（WM 窗口末步误差）、`Loss/pi_loss`、`Loss/v_loss`。CSV 仍使用上述原始列名，两端数值和区间平均方式相同；没有更新时留空，不上传对应 W&B 指标。
+
 | 新增指标 | 含义与统计口径 |
 |---|---|
 | `Tracking/error_anchor_pos`、`error_anchor_rot`、`error_anchor_lin_vel`、`error_anchor_ang_vel` | 锚点位置、姿态、线速度、角速度误差；按记录区间的环境控制步求平均 |
 | `Tracking/error_body_pos`、`error_body_rot`、`error_body_lin_vel`、`error_body_ang_vel` | 跟踪身体对应误差；先在身体间求平均，再按环境控制步平均 |
 | `Tracking/error_joint_pos`、`error_joint_vel` | 整条关节位置或速度误差向量的 L2 范数，非逐关节 RMSE |
-| `Reward/<奖励项>` | 当前 8 项奖励乘权重和控制时间步后的贡献，按环境控制步平均；各项之和等于原始平均单步奖励 |
-| `Termination/<原因>_count`、`<原因>_fraction` | `time_out`、`motion_end`、`anchor_pos`、`anchor_ori` 的结束次数，以及占区间内结束 episode 的比例 |
+| `Reward/<奖励项>` | 当前 8 项奖励贡献按环境控制步平均后除以 `step_dt`，跟踪奖励的显示上限为对应权重；各项之和乘以 `step_dt` 等于原始平均单步奖励，实际训练奖励不变 |
+| `Termination/<原因>_fraction` | `time_out`、`motion_end`、`anchor_pos`、`anchor_ori` 各原因占区间内结束 episode 的比例，不记录各原因的次数 |
 | `Episode/completed`、`return_raw`、`length_seconds` | 结束回合数、原始累计回报均值和实际回合时长均值；按结束的回合数加权 |
 | `Sampling/entropy`、`top1_prob`、`top1_bin` | 当前 bin 采样分布的归一化熵、最大概率、对应整数 bin ID |
 | `Performance/collection_s`、`wm_update_s`、`policy_critic_update_s` | 每迭代的数据采集、WM 更新、策略和 Critic 更新平均壁钟耗时，单位为秒 |
@@ -179,7 +189,7 @@ CSV 和 W&B 每 `--log-every` 次迭代记录同一组聚合结果，W&B 横轴�
 
 位置、姿态、线速度、角速度误差分别使用米、弧度、米/秒、弧度/秒。身体位置和姿态沿用当前参考对齐，锚点保留 `pelvis`。所有跟踪误差在动作执行后、目标帧推进前计算，与本步奖励使用同一个目标帧 `f`。
 
-同一回合可能同时触发多个终止原因，所以原因比例之和允许超过 100%。区间内没有结束回合时，次数记零，回合均值和终止比例留空。采样熵除以 `log(num_bins)`，只有一个 bin 时为 1；查询日志不更新采样器历史。性能计时不逐步强制 GPU 同步，反映整体执行开销，不代表单独的 GPU 内核耗时。
+同一回合可能同时触发多个终止原因，所以原因比例之和允许超过 100%。区间内没有结束回合时，`Episode/completed` 为零，回合均值和终止比例留空。采样熵除以 `log(num_bins)`，只有一个 bin 时为 1；查询日志不更新采样器历史。性能计时不逐步强制 GPU 同步，反映整体执行开销，不代表单独的 GPU 内核耗时。
 
 首次日志的跟踪、奖励和回合统计包含经验池预填充期间的真实采集；`Performance/` 指标从预填充结束后的训练主循环开始统计，不包含预填充耗时和步数。
 
@@ -192,7 +202,8 @@ CSV 和 W&B 每 `--log-every` 次迭代记录同一组聚合结果，W&B 横轴�
 ```bash
 python scripts/train_supermimic.py \
   --motion-file src/assets/motions/g1 \
-  --log-dir logs/supermimic/g1_no_warmup \
+  --log-dir logs/supermimic \
+  --run-name g1_no_warmup \
   --no-enable-warmup
 ```
 
@@ -203,8 +214,8 @@ python scripts/train_supermimic.py \
 ```bash
 python scripts/train_supermimic.py \
   --motion-file src/assets/motions/g1 \
-  --log-dir logs/supermimic/g1 \
-  --resume logs/supermimic/g1/last.pt \
+  --log-dir logs/supermimic \
+  --resume logs/supermimic/g1_20261024_180000_123456/last.pt \
   --iterations 400000
 ```
 
@@ -214,7 +225,7 @@ python scripts/train_supermimic.py \
 
 恢复时可覆盖总迭代数、环境数量、缓存容量、日志/保存周期、初始填充步数、预热开关、编译/精度配置，以及上表中的全部 W&B/日志选项；其余算法与网络配置应保持 checkpoint 原值。省略参数时沿用 checkpoint 的设置，旧 checkpoint 没有的新日志选项使用当前默认值。
 
-每次启动训练（包括恢复）都创建新的 W&B run，并记录恢复来源 checkpoint 和起始迭代；相同 `--wandb-name` 只影响显示名，不复用 run ID。训练迭代从断点继续，CSV 仍追加到指定 `--log-dir`。旧 CSV 会先扩展表头，历史行保留原值，新增指标列留空。
+每次启动训练（包括恢复）都生成新的带时间戳的实验目录和独立 W&B run，CSV 写入新目录，训练迭代从断点继续，并记录恢复来源 checkpoint 和起始迭代。配置和 checkpoint 保留日志根目录及基础名称，不保存自动追加的后缀，因此恢复时不会叠加旧时间戳。旧 checkpoint 的非空 `wandb_name` 会映射为基础 `run_name`；旧 `log_dir` 按保存值作为新日志根目录，命令行仍可覆盖。
 
 ## 4. 评估
 
@@ -223,8 +234,8 @@ python scripts/train_supermimic.py \
 ```bash
 python scripts/evaluate_supermimic.py \
   --motion-file src/assets/motions/g1 \
-  --checkpoint-file logs/supermimic/g1/last.pt \
-  --output-dir logs/supermimic/g1/evaluation \
+  --checkpoint-file logs/supermimic/g1_20261024_180000_123456/last.pt \
+  --output-dir logs/supermimic/g1_20261024_180000_123456/evaluation \
   --device cuda:0
 ```
 
@@ -244,7 +255,7 @@ python scripts/evaluate_supermimic.py \
 ```bash
 python scripts/evaluate_supermimic.py \
   --motion-file src/assets/motions/g1 \
-  --run-dir logs/supermimic/g1
+  --run-dir logs/supermimic/g1_20261024_180000_123456
 ```
 
 读取该运行目录的 `checkpoints/ckpt_*.pt`，跳过输出目录中已有对应 JSON 的 checkpoint；默认输出到运行目录的 `evaluation/`。
@@ -254,7 +265,7 @@ python scripts/evaluate_supermimic.py \
 ```bash
 python scripts/evaluate_supermimic.py \
   --motion-file src/assets/motions/g1 \
-  --run-dir logs/supermimic/g1 \
+  --run-dir logs/supermimic/g1_20261024_180000_123456 \
   --watch
 ```
 

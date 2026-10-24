@@ -11,7 +11,7 @@ import torch
 from ..mdp.state import read_state, OBS_DIM
 from .algorithm import SuperMimicAlgorithm
 from .buffer import ReplayBuffer
-from .logging import TrainingLogger
+from .logging import TrainingLogger, format_terminal_summary
 from .metrics import LEGACY_FIELDS, PERFORMANCE_FIELDS, SAMPLING_FIELDS, IntervalMetrics, sampling_metrics
 
 
@@ -147,7 +147,7 @@ class SuperMimicRunner:
     # Scheduling/logging and precision may change without reinterpreting weights.
     mutable = {"iterations", "num_envs", "ckpt_every", "log_every", "amp", "compile",
                "buffer_steps", "warmup_steps", "enable_warmup", "logger", "wandb_project",
-               "wandb_entity", "wandb_name", "wandb_mode"}
+               "wandb_entity", "wandb_mode", "log_dir", "run_name"}
     for key in current_cfg:
       if key not in mutable and current_cfg[key] != saved_cfg[key]:
         raise ValueError(f"Resume configuration changed {key}; use the checkpoint configuration")
@@ -234,8 +234,11 @@ class SuperMimicRunner:
     self._reset_performance(now)
     self._start_logging()
     self.logger.log(row)
-    print(f"iteration={self.iteration} wm={row['wm_loss']} pi={row['pi_loss']} "
-          f"sim_reward={row['sim_reward']} policy_skipped={row['policy_skipped']}", flush=True)
+    print(format_terminal_summary(
+      row, total_iterations=self.cfg.iterations, interval_iterations=iterations,
+      interval_seconds=elapsed,
+      wm_warmup=self.cfg.enable_warmup and self.iteration <= self.cfg.wm_only_iters,
+    ), flush=True)
     self.stats.clear()
     self.interval_metrics.clear()
 

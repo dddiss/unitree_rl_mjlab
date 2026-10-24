@@ -1,10 +1,10 @@
-"""CSV and optional W&B logging for the independent SuperMimic learner."""
+"""CSV, optional W&B and terminal logging for the SuperMimic learner."""
 from __future__ import annotations
 
 from contextlib import contextmanager
 import csv
 from dataclasses import asdict, is_dataclass
-from datetime import datetime
+import math
 from numbers import Real
 import os
 from pathlib import Path
@@ -14,6 +14,99 @@ import uuid
 
 import numpy as np
 import torch
+
+
+WANDB_METRIC_NAMES = {
+  "wm_loss": "Loss/wm_loss",
+  "wm_err_last": "Loss/wm_err_last",
+  "pi_loss": "Loss/pi_loss",
+  "v_loss": "Loss/v_loss",
+  "lr": "Training/lr",
+  "pi_gradnorm": "Training/pi_gradnorm",
+  "policy_skipped": "Training/policy_skipped",
+  "sim_steps": "Training/sim_steps",
+  "env_steps": "Training/env_steps",
+  "wall_h": "Performance/wall_h",
+  "imag_reward": "Imagination/reward",
+  "imag_survival": "Imagination/survival",
+  "sim_reward": "Reward/total_normalized",
+  "episode_length": "Episode/length_steps",
+  "episode_return": "Episode/return_normalized",
+  "failure_fraction": "Episode/failure_fraction",
+}
+
+
+def format_terminal_summary(
+  row: dict, *, total_iterations: int, interval_iterations: int,
+  interval_seconds: float, wm_warmup: bool = False,
+) -> str:
+  """Format existing scalar metrics without changing the CSV/W&B payload."""
+  def value(number, spec=".4f", suffix=""):
+    if number is None or number == "":
+      return "--"
+    return f"{number:{spec}}{suffix}"
+
+  def duration(seconds):
+    if seconds is None or not math.isfinite(seconds):
+      return "--"
+    days, remainder = divmod(max(0, int(seconds)), 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    clock = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{days}d {clock}" if days else clock
+
+  width = 80
+  iteration = row["iteration"]
+  first = iteration - interval_iterations + 1
+  window = f"iterations {first}–{iteration}" if interval_iterations else "no completed iterations"
+  lines = ["#" * width, f"Learning iteration {iteration}/{total_iterations}".center(width),
+           f"SuperMimic | {window}".center(width), "-" * width]
+
+  def add(label, formatted):
+    lines.append(f"{label + ':':>40} {formatted}")
+
+  speed = row.get("Performance/iterations_per_s")
+  add("Computation", value(row.get("Performance/transitions_per_s"), ",.0f", " transitions/s")
+      + " | " + value(speed, ".2f", " iterations/s"))
+  add("Interval time", value(interval_seconds, ".3f", " s"))
+  mean_seconds = interval_seconds / interval_iterations if interval_iterations else None
+  add("Mean iteration time", value(mean_seconds, ".3f", " s"))
+  for label, key in (
+    ("Collection time", "Performance/collection_s"),
+    ("WM update time", "Performance/wm_update_s"),
+    ("Policy+Critic update time", "Performance/policy_critic_update_s"),
+  ):
+    add(label, value(row.get(key), ".3f", " s/iteration"))
+
+  lines.append("-" * width)
+  for key in ("wm_loss", "wm_err_last", "pi_loss", "v_loss"):
+    add(WANDB_METRIC_NAMES[key], value(row.get(key), ".6f"))
+  add("Training/lr", value(row.get("lr"), ".3e"))
+  add("Episode/length_steps", value(row.get("episode_length"), ".2f", " steps"))
+
+  lines.append("-" * width)
+  for key, number in row.items():
+    if key.startswith("Reward/") and key != "Reward/total_normalized":
+      add(key, value(number))
+
+  lines.append("-" * width)
+  for key, number in row.items():
+    if key.startswith("Termination/") and key.endswith("_fraction"):
+      add(key, value(number, ".2%"))
+
+  lines.append("-" * width)
+  add("Total transitions", value(row.get("sim_steps"), ",.0f"))
+  wall_h = row.get("wall_h")
+  add("Total elapsed", duration(None if wall_h is None or wall_h == "" else wall_h * 3600))
+  remaining = max(0, total_iterations - iteration)
+  eta = None
+  if not remaining:
+    eta = 0
+  elif not wm_warmup and speed is not None and speed != "" and speed > 0:
+    eta = remaining / speed
+  add("ETA (estimated)", duration(eta))
+  lines.append("#" * width)
+  return "\n".join(lines)
 
 
 @contextmanager
@@ -100,9 +193,8 @@ class TrainingLogger:
           str(Path(resume_checkpoint).resolve()) if resume_checkpoint is not None else None
         )
         config["start_iteration"] = start_iteration
-        name = cfg.wandb_name or f"{self.log_dir.name}-{datetime.now():%Y%m%d-%H%M%S-%f}"
         self._run = wandb.init(
-          project=cfg.wandb_project, entity=cfg.wandb_entity, name=name,
+          project=cfg.wandb_project, entity=cfg.wandb_entity, name=self.log_dir.name,
           mode=cfg.wandb_mode, dir=str(self.log_dir), config=config,
           id=uuid.uuid4().hex, resume="never", reinit="create_new",
           save_code=False, sync_tensorboard=False,
@@ -127,7 +219,7 @@ class TrainingLogger:
       ) from exc
 
   def log(self, row: dict) -> None:
-    """Blank/missing metrics remain blank in CSV and are omitted from W&B."""
+    """Preserve CSV names; group W&B metrics and omit blank/missing values."""
     if self._closed:
       raise RuntimeError("TrainingLogger is closed")
     values = {}
@@ -141,7 +233,7 @@ class TrainingLogger:
       if not isinstance(value, Real):
         raise TypeError(f"{name}: training log values must be numeric scalars or blank")
       values[name] = value
-      payload[name] = value
+      payload[WANDB_METRIC_NAMES.get(name, name)] = value
     self._writer.writerow(values)
     self._file.flush()
     if self._run is not None:
