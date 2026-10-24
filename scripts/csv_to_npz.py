@@ -64,6 +64,8 @@ class MotionLoader:
     self.motion_base_rots_input = self.motion_base_rots_input[
       :, [3, 0, 1, 2]
     ]  # convert to wxyz
+    # CSV rounding can leave non-unit quaternions, distorting velocity transforms.
+    self.motion_base_rots_input = torch.nn.functional.normalize(self.motion_base_rots_input, dim=-1)
     self.motion_dof_poss_input = motion[:, 7:]
 
     self.input_frames = motion.shape[0]
@@ -86,6 +88,7 @@ class MotionLoader:
       self.motion_base_rots_input[index_1],
       blend,
     )
+    self.motion_base_rots = torch.nn.functional.normalize(self.motion_base_rots, dim=-1)
     self.motion_dof_poss = self._lerp(
       self.motion_dof_poss_input[index_0],
       self.motion_dof_poss_input[index_1],
