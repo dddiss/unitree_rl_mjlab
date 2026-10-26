@@ -21,6 +21,7 @@ class SuperMimicConfig:
   lam: float = 0.95
   action_noise: float = 0.1  # Gaussian std for environments with exploration noise.
   collect_det_frac: float = 0.25  # First round(frac * num_envs) collect without action noise.
+  bin_ema: float = 0.1  # New return-score weight: (1 - bin_ema) * old + bin_ema * new.
   critic_epochs: int = 5
   critic_minibatches: int = 4
   enable_warmup: bool = True  # Controls only the WM-only phase, not replay filling.
@@ -54,6 +55,8 @@ class SuperMimicConfig:
       raise ValueError("utd must be positive and gamma must lie in (0, 1)")
     if not 0 <= self.collect_det_frac <= 1:
       raise ValueError("collect_det_frac must lie in [0, 1]")
+    if not 0 <= self.bin_ema <= 1:
+      raise ValueError("bin_ema must lie in [0, 1]")
     if self.amp not in ("none", "bf16"):
       raise ValueError("amp must be none or bf16")
     if self.logger not in ("wandb", "csv"):

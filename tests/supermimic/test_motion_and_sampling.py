@@ -3,7 +3,6 @@ from pathlib import Path
 import pytest
 import torch
 from supermimic.mdp.motion_lib import MotionLibrary, _resolve_motion_files
-from supermimic.mdp.sampling import ReturnBasedSampler
 from supermimic.mdp.rotations import mat_to_6d,mat_to_quat,so3_exp
 
 
@@ -81,16 +80,3 @@ def test_goal_clamps_each_clip_and_keeps_robot_orientation_at_end(mdp):
   # Repeating a reference does not imply that the robot has reached its pose.
   identity=mat_to_6d(torch.eye(3)).expand(4,3,6)
   assert not torch.allclose(actual[terminal,:,58:],identity)
-
-
-def test_sampler_duplicate_bins_and_bootstrap(mdp):
-  sampler = ReturnBasedSampler(mdp.motion,gamma=.5,max_step_reward=.1)
-  sampler.update(torch.tensor([0,0,1,-1]),torch.tensor([1.,3.,1.,99.]),
-                 torch.tensor([1.,3.,2.,99.]),torch.tensor([1,1,2,1]),torch.tensor([True,True,False,False]))
-  # bin0 gets one mean update; bin1 boot = .5**2 * (2/2)/(1-.5) = .5
-  torch.testing.assert_close(sampler.bin_return,torch.tensor([.4,.3]))
-  p = sampler.probabilities()
-  assert p.sum().isclose(torch.tensor(1.)) and (p>0).all()
-  frames,bins = sampler.sample(200)
-  assert (frames>=mdp.motion.bin_start[bins]).all()
-  assert (frames<mdp.motion.bin_stop[bins]).all()

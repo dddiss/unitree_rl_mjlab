@@ -86,6 +86,7 @@ def test_warmup_cli_help():
   assert "--no-enable-warmup" in result.stdout
   assert "initial replay filling always runs" in " ".join(result.stdout.split())
   assert "--collect-det-frac" not in result.stdout
+  assert "--bin-ema" not in result.stdout
   for option in ("--log-dir", "--run-name", "--logger", "--wandb-project", "--wandb-entity",
                  "--wandb-name", "--wandb-mode"):
     assert option in result.stdout
@@ -178,6 +179,20 @@ def test_collection_fraction_always_comes_from_local_config(logging_cli, saved_f
   assert captured["cfg"].collect_det_frac == .4
   # Only the new collection fraction changes resume precedence.
   assert captured["cfg"].action_noise == (.15 if saved is None else .2)
+
+
+@pytest.mark.parametrize("saved_ema", [None, "legacy", .2, .7])
+def test_return_ema_comes_from_local_config_on_start_and_resume(logging_cli, saved_ema):
+  run, captured = logging_cli
+  saved = None
+  if saved_ema is not None:
+    saved = asdict(rl_cfg.SuperMimicConfig())
+    if saved_ema == "legacy":
+      saved.pop("bin_ema")
+    else:
+      saved["bin_ema"] = saved_ema
+  run(saved=saved, factory_settings={"bin_ema": .35})
+  assert captured["cfg"].bin_ema == .35
 
 
 @pytest.mark.parametrize("flags,saved_settings,expected", [

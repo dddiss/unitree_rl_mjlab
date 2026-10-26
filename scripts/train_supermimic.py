@@ -46,12 +46,12 @@ def main():
   )
   from src.tasks.supermimic.rl.runner import SuperMimicRunner
   defaults = asdict(unitree_g1_supermimic_runner_cfg())
-  collect_det_frac = defaults["collect_det_frac"]
+  local_settings = {name: defaults[name] for name in ("collect_det_frac", "bin_ema")}
   if args.resume:
     defaults.update(migrate_legacy_run_name(
       torch.load(args.resume, map_location="cpu", weights_only=False)["config"]))
-  # This collection setting is configured in rl_cfg.py, including on resume.
-  defaults["collect_det_frac"] = collect_det_frac
+  # These settings are configured in rl_cfg.py, including on resume.
+  defaults.update(local_settings)
   defaults.update({key: value for key, value in vars(args).items() if key in defaults and value is not None})
   cfg = SuperMimicConfig(**defaults)
   # Generate once; the directory and W&B share this exact name. Keep the base

@@ -77,6 +77,7 @@ class SuperMimicRunner:
     self.log_dir.mkdir(parents=True, exist_ok=True)
     self.algorithm = SuperMimicAlgorithm(env.functional_mdp, cfg, env.device)
     self.command = env.command_manager.get_term("motion")
+    self.command.sampler.bin_ema = cfg.bin_ema
     self.motion = self.command.motion
     self.buffer = ReplayBuffer(cfg.buffer_steps, env.num_envs, env.context,
                                self.motion.clip_end, self.motion.clip_id, cfg.horizon)
@@ -85,7 +86,12 @@ class SuperMimicRunner:
     self.step_acc = self.wall_offset = 0.0
     self._started = time.monotonic()
     self.episode_return = torch.zeros(env.num_envs, device=env.device)
-    self.episode_bins = EpisodeBinReturns(self.motion, env.num_envs, cfg.gamma)
+    max_episode_steps = (env.max_episode_length
+                         if "time_out" in env.termination_manager.active_terms else None)
+    self.episode_bins = EpisodeBinReturns(
+      self.motion, env.num_envs, cfg.gamma, env.functional_mdp.max_step_reward,
+      max_episode_steps=max_episode_steps,
+    )
     self.stats = {}
     self.interval_metrics = IntervalMetrics(env.reward_manager.active_terms, env.termination_manager.active_terms,
                                            env.step_dt, env.device)
@@ -111,9 +117,9 @@ class SuperMimicRunner:
       self.buffer.add(tr)
       self.algorithm.observe(tr, self.env.context)
       self.episode_return += tr["r"]
-      # A transition targets f after starting at f-1. Attribute it to the
-      # corresponding reset/source bin, including the final valid transition.
-      self.episode_bins.add(self.motion.frame_bin[tr["f"] - 1], tr["r"])
+      # The first target f identifies reset frame k=f-1. Subsequent targets
+      # contribute reward to that same starting bin, even across bin boundaries.
+      self.episode_bins.add(tr["f"], tr["r"])
       self.sim_steps += self.env.num_envs
       self.env_steps += 1
       self._record("sim_reward", float(tr["r"].mean() / self.env.functional_mdp.max_step_reward))
@@ -122,7 +128,7 @@ class SuperMimicRunner:
       if len(ids):
         steps = tr["ep_step"][ids] + 1
         self.interval_metrics.add_episodes(self.episode_return[ids], steps)
-        bins, returns = self.episode_bins.finish(ids, tr["terminated"][ids])
+        bins, returns = self.episode_bins.finish(ids)
         self.command.sampler.update_returns(bins, returns)
         self._record("episode_length", float(steps.float().mean()))
         self._record("episode_return", float((self.episode_return[ids] / steps
@@ -151,11 +157,11 @@ class SuperMimicRunner:
     ck = torch.load(path, map_location=self.env.device, weights_only=False)
     check_manifest(ck["motions"], motion_manifest(self.motion))
     saved_cfg, current_cfg = dict(ck["config"]), asdict(self.cfg)
-    # Scheduling, logging, precision and collection mix may change without
+    # Scheduling, logging, precision, collection mix and return EMA may change without
     # reinterpreting weights. Replay is refilled after loading.
     mutable = {"iterations", "num_envs", "ckpt_every", "log_every", "amp", "compile",
                "buffer_steps", "warmup_steps", "enable_warmup", "logger", "wandb_project",
-               "wandb_entity", "wandb_mode", "log_dir", "run_name", "collect_det_frac"}
+               "wandb_entity", "wandb_mode", "log_dir", "run_name", "collect_det_frac", "bin_ema"}
     for key in current_cfg:
       if key not in mutable and current_cfg[key] != saved_cfg[key]:
         raise ValueError(f"Resume configuration changed {key}; use the checkpoint configuration")

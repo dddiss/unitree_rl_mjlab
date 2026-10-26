@@ -14,7 +14,7 @@ from test_algorithm import small_config
 
 class TensorEnv:
   """Controlled transitions; only the physics is fake, runner/algorithm are real."""
-  device='cpu';num_envs=2;step_dt=.02
+  device='cpu';num_envs=2;step_dt=.02;max_episode_length=500
   def __init__(self,mdp):
     self.functional_mdp=mdp;self.context=torch.zeros(2,33);self.context[:,0]=.75
     self.scene=NS(env_origins=torch.tensor([[4.,5.,0.],[9.,2.,0.]]))
@@ -252,15 +252,17 @@ def test_short_episodes_allow_masked_warmup_but_skip_strict_updates(
   assert runner.env_steps==69
 
 
-def test_collection_updates_every_visited_source_bin_and_preserves_partial_episodes(
-  mdp,tmp_path,monkeypatch,
+@pytest.mark.parametrize('bin_ema', [.1, .35])
+def test_collection_updates_only_start_bins_and_preserves_partial_episodes(
+  mdp,tmp_path,monkeypatch,bin_ema,
 ):
   # Smaller bins exercise several boundaries without constructing long clips.
   mdp.motion=MotionLibrary(mdp.motion.motion_files,bin_duration_s=.04)
-  cfg=small_config(gamma=.5,action_noise=0)
+  cfg=small_config(gamma=.5,action_noise=0,bin_ema=bin_ema)
   env=TensorEnv(mdp)
   env.command.sampler=ReturnBasedSampler(mdp.motion,gamma=cfg.gamma)
   runner=SuperMimicRunner(env,cfg,tmp_path/'bins')
+  assert runner.command.sampler.bin_ema == cfg.bin_ema
   env.command.request_frames(mdp.motion.clip_start.clone())
   env.reset()
   monkeypatch.setattr(runner,'controller',lambda:torch.zeros(2,29))
@@ -274,24 +276,92 @@ def test_collection_updates_every_visited_source_bin_and_preserves_partial_episo
   monkeypatch.setattr(env,'step',rewards_and_failure)
   runner.collect(5)
   first_rewards=torch.arange(1,6)*.1
-  first_values=torch.stack([(first_rewards[t:]*cfg.gamma**torch.arange(5-t)).sum()
-                             for t in (0,2,4)])
-  first_bins=mdp.motion.frame_bin[torch.tensor([0,2,4])]
-  torch.testing.assert_close(env.command.sampler.bin_return[first_bins],.2*first_values)
-  assert torch.count_nonzero(env.command.sampler.bin_return)==3
+  first_return=(first_rewards*cfg.gamma**torch.arange(5)).sum()
+  first_score=first_return/(mdp.max_step_reward*(1-cfg.gamma**50)/(1-cfg.gamma))
+  first_bin=mdp.motion.frame_bin[0]
+  torch.testing.assert_close(env.command.sampler.bin_return[first_bin],cfg.bin_ema*first_score)
+  assert torch.count_nonzero(env.command.sampler.bin_return)==1
   assert runner.episode_bins.steps.tolist()==[0,5]
-  # Row 1 now finishes its different clip. It gets the original mean-reward
-  # bootstrap, while row 0 starts a new episode without changing its old bins.
+  # Row 1 finishes its clip without a bootstrap tail; row 0 starts a new episode.
   runner.collect(1)
   rewards=torch.arange(1,7)*.1
-  second_values=torch.stack([
-    (rewards[t:]*cfg.gamma**torch.arange(6-t)).sum()
-    +cfg.gamma**(6-t)*rewards.mean()/(1-cfg.gamma) for t in (0,2,4)])
-  second_bins=mdp.motion.frame_bin[mdp.motion.clip_start[1]+torch.tensor([0,2,4])]
-  torch.testing.assert_close(env.command.sampler.bin_return[second_bins],.2*second_values)
-  torch.testing.assert_close(env.command.sampler.bin_return[first_bins],.2*first_values)
+  second_return=(rewards*cfg.gamma**torch.arange(6)).sum()
+  second_score=second_return/(mdp.max_step_reward*(1-cfg.gamma**6)/(1-cfg.gamma))
+  second_bin=mdp.motion.frame_bin[mdp.motion.clip_start[1]]
+  torch.testing.assert_close(env.command.sampler.bin_return[second_bin],cfg.bin_ema*second_score)
+  torch.testing.assert_close(env.command.sampler.bin_return[first_bin],cfg.bin_ema*first_score)
   assert runner.episode_bins.steps.tolist()==[1,0]
-  assert torch.count_nonzero(env.command.sampler.bin_return)==6
+  assert torch.count_nonzero(env.command.sampler.bin_return)==2
+
+
+@pytest.mark.parametrize('timeout_enabled',[True,False])
+def test_sampling_horizon_respects_removal_of_timeout(mdp,tmp_path,monkeypatch,timeout_enabled):
+  env=TensorEnv(mdp)
+  env.max_episode_length=3
+  if not timeout_enabled:
+    env.termination_manager.active_terms=('motion_end','anchor_pos','anchor_ori')
+  cfg=small_config(gamma=.5,action_noise=0)
+  runner=SuperMimicRunner(env,cfg,tmp_path/'horizon')
+  monkeypatch.setattr(runner,'controller',lambda:torch.zeros(2,29))
+  original=env.step
+  def end_at_three(action):
+    result=original(action)
+    tr=env.last_transition
+    tr['r'].fill_(mdp.max_step_reward)
+    if int(tr['ep_step'][0])==2:
+      # Otherwise identical runs: a configured timeout vs an early failure.
+      tr['truncated' if timeout_enabled else 'terminated'].fill_(True)
+    return result
+  monkeypatch.setattr(env,'step',end_at_three)
+  runner.collect(3)
+  expected=cfg.bin_ema*(1-cfg.gamma**3)/(1-cfg.gamma**(3 if timeout_enabled else 50))
+  assert env.command.sampler.bin_return[0].item()==pytest.approx(expected)
+
+
+def test_resume_old_bin_statistics_keeps_networks_and_progress(mdp,tmp_path):
+  cfg=small_config()
+  original=SuperMimicRunner(TensorEnv(mdp),cfg,tmp_path/'old')
+  original.collect(3)
+  original.iteration=123
+  checkpoint=tmp_path/'legacy.pt'
+  original.save(checkpoint)
+  saved=torch.load(checkpoint,weights_only=False)
+  saved['sampler']={'bin_return':torch.full((mdp.motion.num_bins,),8.),
+                    'past_softmax':torch.tensor([.9,.1])}
+  torch.save(saved,checkpoint)
+  resumed=SuperMimicRunner(TensorEnv(mdp),cfg,tmp_path/'new')
+  with pytest.warns(UserWarning,match='resetting sampling statistics'):
+    resumed.load(checkpoint)
+  assert resumed.iteration==123 and resumed.env_steps==3 and resumed.buffer.size==0
+  assert torch.count_nonzero(resumed.command.sampler.bin_return)==0
+  torch.testing.assert_close(resumed.command.sampler.past_softmax,torch.ones(2)/2)
+  for name in ('wm','policy','critic'):
+    for key,value in getattr(original.algorithm,name).state_dict().items():
+      torch.testing.assert_close(value,getattr(resumed.algorithm,name).state_dict()[key])
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_resume_uses_configured_return_ema_and_preserves_sampling_scores(mdp,tmp_path,legacy):
+  original=SuperMimicRunner(TensorEnv(mdp),small_config(bin_ema=.2),tmp_path/'old')
+  original.command.sampler.update_returns(torch.tensor([0,1]),torch.tensor([.8,.4]))
+  original.command.sampler.probabilities(update_history=True)
+  original.iteration=123
+  checkpoint=tmp_path/'checkpoint.pt'
+  original.save(checkpoint)
+  saved=torch.load(checkpoint,weights_only=False)
+  assert saved['config']['bin_ema']==.2
+  if legacy:
+    saved['config'].pop('bin_ema')
+    torch.save(saved,checkpoint)
+  resumed=SuperMimicRunner(TensorEnv(mdp),small_config(bin_ema=.35),tmp_path/'new')
+  resumed.load(checkpoint)
+  assert resumed.command.sampler.bin_ema==.35 and resumed.iteration==123
+  torch.testing.assert_close(resumed.command.sampler.bin_return,original.command.sampler.bin_return)
+  before=resumed.command.sampler.bin_return.clone()
+  resumed.command.sampler.update_returns(torch.tensor([0]),torch.tensor([.9]))
+  torch.testing.assert_close(resumed.command.sampler.bin_return[0],.65*before[0]+.35*.9)
+  resumed.save(tmp_path/'resumed.pt')
+  assert torch.load(tmp_path/'resumed.pt',weights_only=False)['config']['bin_ema']==.35
 
 
 def test_evaluation_scores_each_clip_once(mdp):
