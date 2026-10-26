@@ -1,4 +1,5 @@
-"""Deterministic per-clip evaluation and MP4 recording on the mjlab backend."""
+"""Per-clip evaluation, optional noise diagnostics, and MP4 recording."""
+import math
 from pathlib import Path
 
 import numpy as np
@@ -22,15 +23,31 @@ def load_policy(checkpoint, env):
 
 
 @torch.no_grad()
-def evaluate(env, policy, cfg, record_dir=None):
+def evaluate(env, policy, cfg, record_dir=None, *, observation_noise=False,
+             action_noise=0.0, seed=None, action_clip=None):
+  """Score each clip once, with optional noise and frozen policy statistics.
+
+  Observation noise reuses the collection controller (proprioception and goal
+  orientation, before RunningNorm). Action noise is added before action_scale.
+  Clipping is opt-in and independent of noise so comparisons can hold it fixed.
+  The caller must still construct the fixed-physics evaluation environment.
+  """
+  if not math.isfinite(action_noise) or action_noise < 0:
+    raise ValueError("action_noise must be finite and nonnegative")
+  if action_clip is not None and (not math.isfinite(action_clip) or action_clip <= 0):
+    raise ValueError("action_clip must be finite and positive")
   cmd = env.command_manager.get_term("motion")
   motion = cmd.motion
   if env.num_envs != motion.num_clips:
     raise ValueError("Evaluation creates one environment per motion clip")
   ids = torch.arange(env.num_envs, device=env.device)
   cmd.request_frames(motion.clip_start.clone())
-  env.reset()
-  controller = PolicyController(env, policy, cfg)
+  env.reset(**({"seed": seed} if seed is not None else {}))
+  # Keep action draws independent of observation draws for the same seed.
+  action_generator = None
+  if seed is not None and action_noise > 0:
+    action_generator = torch.Generator(device=env.device).manual_seed(seed)
+  controller = PolicyController(env, policy, cfg, noise=observation_noise, update_norm=False)
   completed = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
   failed = torch.zeros_like(completed)
   returns = torch.zeros(env.num_envs, device=env.device)
@@ -38,7 +55,13 @@ def evaluate(env, policy, cfg, record_dir=None):
   trajectories = [[flatten_state(read_state(env))[i].cpu().numpy()] for i in range(env.num_envs)] if record_dir else None
   while not bool(completed.all()):
     active = ~completed
-    env.step(controller())
+    action = controller()
+    if action_noise > 0:
+      action = action + action_noise * torch.randn(
+        action.shape, device=action.device, dtype=action.dtype, generator=action_generator)
+    if action_clip is not None:
+      action = action.clamp(-action_clip, action_clip)
+    env.step(action)
     tr = env.last_transition
     returns += torch.where(active, tr["r"], 0.)
     steps += active.long()

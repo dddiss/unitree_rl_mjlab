@@ -336,7 +336,7 @@ python scripts/evaluate_supermimic.py \
   --device cuda:0
 ```
 
-评估为每个动作创建一个环境，从首帧初始化，运行到动作结束或失败，每个动作只计分一次。关闭训练时的观测/动作噪声和重置扰动，编码器偏差与质心偏移归零，机器人和地面摩擦设为 1.0，并取消训练时的 10 秒 episode 上限。
+评估为每个动作创建一个环境，从首帧初始化，运行到动作结束或失败，每个动作只计分一次。默认关闭训练时的观测/动作噪声和重置扰动，编码器偏差与质心偏移归零，机器人和地面摩擦设为 1.0，并取消训练时的 10 秒 episode 上限。可通过第 4.4 节的参数单独开启噪声对比。
 
 结果包括：
 
@@ -367,6 +367,43 @@ python scripts/evaluate_supermimic.py \
 ```
 
 `--watch` 必须配合 `--run-dir`，每轮处理完现有 checkpoint 后等待 30 秒，再扫描新增文件。使用 `Ctrl+C` 结束。`--checkpoint-file` 与 `--run-dir` 二选一，`--record` 和 `--output-dir` 可用于上述各评估方式。
+
+### 4.4 同一 checkpoint 的加噪对比评估
+
+对比确定性评估与带噪运行，使用同一个 checkpoint 依次运行四种模式、每种模式重复多个随机种子：
+
+```bash
+python scripts/evaluate_supermimic.py \
+  --motion-file src/assets/motions/g1_npz \
+  --checkpoint-file logs/supermimic/g1_20261024_180000_123456/checkpoints/ckpt_064000.pt \
+  --noise-mode all \
+  --seeds 0 1 2 \
+  --output-dir logs/supermimic/noise_comparison \
+  --device cuda:0
+```
+
+| `--noise-mode` | 观测噪声 | 动作探索噪声 |
+|---|---|---|
+| `none` | 关闭 | 关闭 |
+| `action` | 关闭 | 开启 |
+| `observation` | 开启 | 关闭 |
+| `both` | 开启 | 开启 |
+| `all` | 依次运行上述四组 | 依次运行上述四组 |
+
+观测噪声复用训练采集的定义：本体观测噪声，以及未来参考目标中 6D 朝向的 `U(-0.05, 0.05)` 噪声，均在 RunningNorm 之前添加；评估不更新归一化统计或网络参数。动作噪声逐控制步、逐维度采样高斯噪声，在 `action_scale` 缩放之前添加，标准差默认读取 checkpoint 中的 `action_noise`（通常为 0.1），可用 `--action-noise 0.1` 覆盖。
+
+各组仍从动作首帧初始化，目标为下一帧，保持相同的固定物理参数、无重置扰动和计分口径。因此这只是噪声对比，并非恢复完整训练环境。`--seeds` 控制每次重复的随机种子；进入对比模式后省略该参数则使用 `0 1 2`。仅评估某一组时，例如使用 `--noise-mode action --seeds 0 1 2`。
+
+默认保持原评估的**不裁剪动作**行为，避免引入第二个变量。若要同时验证训练采集的 `[-20, 20]` 限幅，可在上述命令中添加 `--action-clip 20`，限幅在加噪后进行，并统一应用于四组。更改噪声强度或裁剪设置时，使用新的 `--output-dir` 保存对比结果。
+
+对比输出与原有 `eval.csv` 分开，写入 `<输出目录>/noise_evaluation/<checkpoint名称>/`：
+
+- `eval.csv`：每种模式、每个种子的回报和失败动作列表，以及实际噪声/裁剪设置。
+- `summary.csv` / `summary.json`：各模式跨种子的回报、失败数量的均值与总体标准差；单个种子时标准差为 0。
+- `<模式>/seed_<种子>.json`：每个动作的回报、有效步数和失败情况。
+- 添加 `--record` 时，轨迹保存到 `<模式>/seed_<种子>/<动作名称>.npz`。
+
+四组、三个种子共运行 12 次全动作评估。汇总表只包含本次命令选择的模式和种子，重新执行不会在该表重复追加同一个种子。也支持 `--run-dir` / `--watch`；已存在且设置相同的逐次报告会复用，设置不同则要求换输出目录。未传入上述新增参数时，继续使用原有确定性评估流程及输出路径。
 
 ## 5. 播放与视频导出
 
