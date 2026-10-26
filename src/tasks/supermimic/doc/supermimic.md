@@ -218,6 +218,17 @@ python scripts/train_supermimic.py \
 | `--amp none` | 默认 `bf16` | 关闭网络 BF16 混合精度 |
 | `--no-compile` | 默认开启编译 | 关闭 `torch.compile` |
 
+动作探索的环境比例直接在 `src/tasks/supermimic/config/g1/rl_cfg.py` 中配置，不新增命令行参数：
+
+```python
+action_noise: float = 0.1      # 有探索噪声环境的高斯噪声标准差
+collect_det_frac: float = 0.25 # 固定一部分环境关闭动作探索噪声
+```
+
+前 `round(collect_det_frac × num_envs)` 个环境始终不添加动作探索噪声，reset 后分组不变。默认 4096 个环境中，编号 0～1023 不加动作噪声，其余 3072 个环境每步添加标准差 0.1 的独立高斯噪声。比例设为 `0.0` 恢复全部加噪，设为 `1.0` 则全部关闭动作探索噪声。观测噪声、物理随机化、动作缩放和加噪后的 `[-20, 20]` 裁剪保持原有设置；经验池和历史观测仍使用实际执行的动作。
+
+新训练与恢复训练都使用当前 `rl_cfg.py` 中的 `collect_det_frac`，实际取值会保存到本次配置和 checkpoint，旧 checkpoint 缺少该字段也可恢复。`action_noise` 的原有恢复规则保持不变：新训练采用本地配置，恢复训练沿用 checkpoint 中保存的强度。该分组同样作用于初始经验池填充和 WM 预热的数据采集；不改变想象训练及评估的噪声设置。
+
 例如，调整并行数量与 batch 大小：
 
 ```bash
@@ -266,7 +277,7 @@ python scripts/train_supermimic.py \
 
 当前 Critic 已移除独立重复的 6 维根相对朝向，并加入 29 维上一动作（无历史）；未来参考目标中的朝向保留，默认 Critic 输入为 847 维。此前 824 维 Critic 的 checkpoint 不能直接完整恢复训练；Actor 结构未变，仍可用于评估和播放。
 
-恢复时可覆盖总迭代数、环境数量、缓存容量、日志/保存周期、初始填充步数、预热开关、编译/精度配置，以及第 3.4 节中的全部 W&B/日志选项；其余算法与网络配置应保持 checkpoint 原值。省略参数时沿用 checkpoint 的设置，旧 checkpoint 没有的新日志选项使用当前默认值。
+恢复时可覆盖总迭代数、环境数量、缓存容量、日志/保存周期、初始填充步数、预热开关、编译/精度配置，以及第 3.4 节中的全部 W&B/日志选项；`collect_det_frac` 始终读取当前 `rl_cfg.py`。其余算法与网络配置应保持 checkpoint 原值。省略参数时沿用 checkpoint 的设置，旧 checkpoint 没有的新日志选项使用当前默认值。
 
 每次启动训练（包括恢复）都生成新的带时间戳的实验目录和独立 W&B run，CSV 写入新目录，训练迭代从断点继续，并记录恢复来源 checkpoint 和起始迭代。配置和 checkpoint 保留日志根目录及基础名称，不保存自动追加的后缀，因此恢复时不会叠加旧时间戳。旧 checkpoint 的非空 `wandb_name` 会映射为基础 `run_name`；旧 `log_dir` 按保存值作为新日志根目录，命令行仍可覆盖。
 

@@ -100,7 +100,11 @@ class SuperMimicRunner:
   def collect(self, count):
     for _ in range(count):
       action = self.controller()
-      action = (action + self.cfg.action_noise * torch.randn_like(action)).clamp(-20, 20)
+      noise = self.cfg.action_noise * torch.randn_like(action)
+      # Fixed environment IDs stay noise-free across resets. Keep the full draw
+      # so changing the fraction does not itself change RNG consumption.
+      noise[:round(self.cfg.collect_det_frac * self.env.num_envs)] = 0
+      action = (action + noise).clamp(-20, 20)
       self.env.step(action)
       tr = self.env.last_transition
       self.interval_metrics.add_step(self.env.last_step_metrics)
@@ -147,10 +151,11 @@ class SuperMimicRunner:
     ck = torch.load(path, map_location=self.env.device, weights_only=False)
     check_manifest(ck["motions"], motion_manifest(self.motion))
     saved_cfg, current_cfg = dict(ck["config"]), asdict(self.cfg)
-    # Scheduling/logging and precision may change without reinterpreting weights.
+    # Scheduling, logging, precision and collection mix may change without
+    # reinterpreting weights. Replay is refilled after loading.
     mutable = {"iterations", "num_envs", "ckpt_every", "log_every", "amp", "compile",
                "buffer_steps", "warmup_steps", "enable_warmup", "logger", "wandb_project",
-               "wandb_entity", "wandb_mode", "log_dir", "run_name"}
+               "wandb_entity", "wandb_mode", "log_dir", "run_name", "collect_det_frac"}
     for key in current_cfg:
       if key not in mutable and current_cfg[key] != saved_cfg[key]:
         raise ValueError(f"Resume configuration changed {key}; use the checkpoint configuration")

@@ -85,6 +85,7 @@ def test_warmup_cli_help():
   assert "--enable-warmup" in result.stdout
   assert "--no-enable-warmup" in result.stdout
   assert "initial replay filling always runs" in " ".join(result.stdout.split())
+  assert "--collect-det-frac" not in result.stdout
   for option in ("--log-dir", "--run-name", "--logger", "--wandb-project", "--wandb-entity",
                  "--wandb-name", "--wandb-mode"):
     assert option in result.stdout
@@ -160,6 +161,23 @@ def logging_cli(tmp_path, monkeypatch):
     return captured
 
   return run, captured
+
+
+@pytest.mark.parametrize("saved_fraction", [None, "legacy", 0., .75])
+def test_collection_fraction_always_comes_from_local_config(logging_cli, saved_fraction):
+  run, captured = logging_cli
+  saved = None
+  if saved_fraction is not None:
+    saved = asdict(rl_cfg.SuperMimicConfig())
+    saved["action_noise"] = .2
+    if saved_fraction == "legacy":
+      saved.pop("collect_det_frac")
+    else:
+      saved["collect_det_frac"] = saved_fraction
+  run(saved=saved, factory_settings={"collect_det_frac": .4, "action_noise": .15})
+  assert captured["cfg"].collect_det_frac == .4
+  # Only the new collection fraction changes resume precedence.
+  assert captured["cfg"].action_noise == (.15 if saved is None else .2)
 
 
 @pytest.mark.parametrize("flags,saved_settings,expected", [
