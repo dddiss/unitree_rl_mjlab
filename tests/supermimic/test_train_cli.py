@@ -195,6 +195,21 @@ def test_return_ema_comes_from_local_config_on_start_and_resume(logging_cli, sav
   assert captured["cfg"].bin_ema == .35
 
 
+@pytest.mark.parametrize("saved_cap", [None, "legacy", 0., 50.])
+@pytest.mark.parametrize("local_cap", [0., 20., 50.])
+def test_softmax_cap_comes_from_rl_config_on_start_and_resume(logging_cli, saved_cap, local_cap):
+  run, captured = logging_cli
+  saved = None
+  if saved_cap is not None:
+    saved = asdict(rl_cfg.SuperMimicConfig())
+    if saved_cap == "legacy":
+      saved.pop("softmax_cap")
+    else:
+      saved["softmax_cap"] = saved_cap
+  run(saved=saved, factory_settings={"softmax_cap": local_cap})
+  assert captured["cfg"].softmax_cap == local_cap
+
+
 @pytest.mark.parametrize("saved_bounds", [None, "legacy", (1., .1)])
 def test_actor_clipping_comes_from_rl_config_on_start_and_resume(logging_cli, saved_bounds):
   run, captured = logging_cli

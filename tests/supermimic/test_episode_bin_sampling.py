@@ -73,7 +73,7 @@ def test_multiple_episodes_normalize_separately_then_average_shared_start_bin(bi
   m = motion()
   episodes = EpisodeBinReturns(m, 2, gamma=.5)
   sampler = ReturnBasedSampler(m, gamma=.5, bin_ema=bin_ema)
-  sampler.bin_return[0] = .7
+  sampler.update_returns(torch.tensor([0]), torch.tensor([.7]))
   episodes.add(torch.tensor([1, 2]), torch.tensor([.05, .1]))
   episodes.add(torch.tensor([2, 3]), torch.tensor([.1, .05]))
   # Different start frames inside bin 0 have different potential horizons, 5 and 4.
@@ -140,13 +140,85 @@ def test_sampler_default_return_ema_matches_config_and_preserves_history_ema():
   sampler = ReturnBasedSampler(motion(), gamma=.99)
   assert sampler.bin_ema == SuperMimicConfig().bin_ema == .1
   sampler.update_returns(torch.tensor([0, 1]), torch.tensor([.8, .4]))
-  torch.testing.assert_close(sampler.bin_return[:2], torch.tensor([.08, .04]))
+  torch.testing.assert_close(sampler.bin_return[:2], torch.tensor([.8, .4]))
+  assert sampler.bin_initialized.tolist() == [True, True, False, False, False]
   expected = .5/5 + .4*torch.softmax(-25*sampler.bin_return, 0) + .1/5
   torch.testing.assert_close(sampler.probabilities(), expected)
   history = sampler.past_softmax.clone()
   soft = torch.softmax(-25*sampler.bin_return, 0)
   sampler.probabilities(update_history=True)
   torch.testing.assert_close(sampler.past_softmax, .999*history + .001*soft)
+
+
+@pytest.mark.parametrize('bin_ema', [0., .1, .35, 1.])
+def test_first_batch_mean_is_written_directly_then_later_updates_use_ema(bin_ema):
+  sampler = ReturnBasedSampler(motion(), bin_ema=bin_ema)
+  sampler.update_returns(torch.tensor([0, 0, 1]), torch.tensor([.6, 1., 0.]))
+  torch.testing.assert_close(sampler.bin_return, torch.tensor([.8, 0., 0., 0., 0.]))
+  # A previously observed zero score is initialized too; a new bin is not.
+  sampler.update_returns(torch.tensor([0, 0, 1, 2]), torch.tensor([.2, .6, .5, .9]))
+  torch.testing.assert_close(sampler.bin_return, torch.tensor([
+    (1-bin_ema)*.8 + bin_ema*.4, bin_ema*.5, .9, 0., 0.,
+  ]))
+  assert sampler.bin_initialized.tolist() == [True, True, True, False, False]
+
+
+def test_empty_update_keeps_scores_and_initialization_unchanged():
+  sampler = ReturnBasedSampler(motion())
+  before = {key: value.clone() for key, value in sampler.state_dict().items()}
+  sampler.update_returns(torch.empty(0, dtype=torch.long), torch.empty(0))
+  for key, value in before.items():
+    torch.testing.assert_close(sampler.state_dict()[key], value)
+
+
+def test_default_softmax_cap_matches_allmimic_recommended_and_redistributes_mass():
+  m = motion((5001,), bin_frames=50)  # 100 bins; cap of 50 means softmax <= 0.5.
+  sampler = ReturnBasedSampler(m)
+  assert sampler.softmax_cap == SuperMimicConfig().softmax_cap == 50.
+  sampler.bin_return.fill_(1.)
+  sampler.bin_return[0] = 0.
+  soft = torch.full((100,), .5/99)
+  soft[0] = .5
+  before = {key: value.clone() for key, value in sampler.state_dict().items()}
+  rng = torch.get_rng_state().clone()
+  expected = .5/100 + .4*soft + .1/100
+  torch.testing.assert_close(sampler.probabilities(), expected)
+  torch.testing.assert_close(sampler.probabilities().sum(), torch.tensor(1.))
+  for key, value in before.items():
+    torch.testing.assert_close(sampler.state_dict()[key], value)
+  torch.testing.assert_close(torch.get_rng_state(), rng)
+  # History keeps its existing EMA, now fed by the capped softmax distribution.
+  sampler.probabilities(update_history=True)
+  torch.testing.assert_close(sampler.past_softmax, .999*before['past_softmax'] + .001*soft)
+
+
+@pytest.mark.parametrize('cap', [1., 2., 50.])
+@pytest.mark.parametrize('lowest_score', [0., -10.])
+def test_capped_distribution_stays_normalized_with_multiple_difficult_bins(cap, lowest_score):
+  m = motion((8843,), bin_frames=1)
+  sampler = ReturnBasedSampler(m, softmax_cap=cap)
+  sampler.bin_return.fill_(1.)
+  sampler.bin_return[:3] = torch.tensor([lowest_score, .1, .2])
+  p = sampler.probabilities()
+  # Initial history remains uniform; the cap applies only to the 40% softmax part.
+  soft = (p - .6/m.num_bins) / .4
+  assert torch.isfinite(p).all() and (p >= 0).all()
+  assert soft.max().item() <= cap/m.num_bins + 1e-7
+  torch.testing.assert_close(p.sum(), torch.tensor(1.))
+
+
+@pytest.mark.parametrize('cap', [0., 100.])
+def test_disabled_or_nonbinding_cap_preserves_uncapped_distribution(cap):
+  sampler = ReturnBasedSampler(motion(), softmax_cap=cap)
+  sampler.bin_return.copy_(torch.tensor([0., .2, .3, .8, 1.]))
+  expected = .5/5 + .4*torch.softmax(-25*sampler.bin_return, 0) + .1/5
+  torch.testing.assert_close(sampler.probabilities(), expected)
+
+
+@pytest.mark.parametrize('cap', [-1., .5, float('nan'), float('inf')])
+def test_config_rejects_infeasible_softmax_cap(cap):
+  with pytest.raises(ValueError, match='softmax_cap'):
+    SuperMimicConfig(softmax_cap=cap)
 
 
 @pytest.mark.parametrize('bin_ema', [-.1, 1.1, float('nan'), float('inf')])
@@ -157,7 +229,7 @@ def test_config_rejects_invalid_return_ema(bin_ema):
 
 def test_normalized_sampler_checkpoint_round_trip():
   sampler = ReturnBasedSampler(motion())
-  sampler.update_returns(torch.tensor([0, 1]), torch.tensor([.8, .4]))
+  sampler.update_returns(torch.tensor([0, 1]), torch.tensor([.8, 0.]))
   sampler.probabilities(update_history=True)
   saved = {key: value.clone() for key, value in sampler.state_dict().items()}
   restored = ReturnBasedSampler(motion())
@@ -165,13 +237,27 @@ def test_normalized_sampler_checkpoint_round_trip():
   for key, value in saved.items():
     torch.testing.assert_close(restored.state_dict()[key], value)
   torch.testing.assert_close(restored.probabilities(), sampler.probabilities())
+  restored.update_returns(torch.tensor([1, 2]), torch.tensor([.5, .5]))
+  torch.testing.assert_close(restored.bin_return[1:3], torch.tensor([.05, .5]))
+
+
+def test_old_normalized_checkpoint_preserves_existing_scores_and_continues_ema():
+  sampler = ReturnBasedSampler(motion(), bin_ema=.2)
+  scores = torch.tensor([.8, .4, 0., 0., 0.])
+  sampler.load_state_dict({'normalized_bin_return': scores, 'past_softmax': torch.ones(5)/5})
+  torch.testing.assert_close(sampler.bin_return, scores)
+  assert sampler.bin_initialized.all()
+  sampler.update_returns(torch.tensor([0, 2]), torch.tensor([.6, .5]))
+  torch.testing.assert_close(sampler.bin_return[[0, 2]], torch.tensor([.76, .1]))
 
 
 def test_old_bootstrapped_checkpoint_resets_scores_and_history_explicitly():
   sampler = ReturnBasedSampler(motion())
   sampler.bin_return.fill_(.5)
+  sampler.bin_initialized.fill_(True)
   sampler.past_softmax.copy_(torch.tensor([.8, .05, .05, .05, .05]))
   with pytest.warns(UserWarning, match='resetting sampling statistics'):
     sampler.load_state_dict({'bin_return': torch.arange(5.), 'past_softmax': torch.ones(5)/5})
   torch.testing.assert_close(sampler.bin_return, torch.zeros(5))
+  assert not sampler.bin_initialized.any()
   torch.testing.assert_close(sampler.past_softmax, torch.ones(5)/5)

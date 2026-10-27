@@ -280,7 +280,7 @@ def test_collection_updates_only_start_bins_and_preserves_partial_episodes(
   first_return=(first_rewards*cfg.gamma**torch.arange(5)).sum()
   first_score=first_return/(mdp.max_step_reward*(1-cfg.gamma**50)/(1-cfg.gamma))
   first_bin=mdp.motion.frame_bin[0]
-  torch.testing.assert_close(env.command.sampler.bin_return[first_bin],cfg.bin_ema*first_score)
+  torch.testing.assert_close(env.command.sampler.bin_return[first_bin],first_score)
   assert torch.count_nonzero(env.command.sampler.bin_return)==1
   assert runner.episode_bins.steps.tolist()==[0,5]
   # Row 1 finishes its clip without a bootstrap tail; row 0 starts a new episode.
@@ -289,8 +289,8 @@ def test_collection_updates_only_start_bins_and_preserves_partial_episodes(
   second_return=(rewards*cfg.gamma**torch.arange(6)).sum()
   second_score=second_return/(mdp.max_step_reward*(1-cfg.gamma**6)/(1-cfg.gamma))
   second_bin=mdp.motion.frame_bin[mdp.motion.clip_start[1]]
-  torch.testing.assert_close(env.command.sampler.bin_return[second_bin],cfg.bin_ema*second_score)
-  torch.testing.assert_close(env.command.sampler.bin_return[first_bin],cfg.bin_ema*first_score)
+  torch.testing.assert_close(env.command.sampler.bin_return[second_bin],second_score)
+  torch.testing.assert_close(env.command.sampler.bin_return[first_bin],first_score)
   assert runner.episode_bins.steps.tolist()==[1,0]
   assert torch.count_nonzero(env.command.sampler.bin_return)==2
 
@@ -315,7 +315,7 @@ def test_sampling_horizon_respects_removal_of_timeout(mdp,tmp_path,monkeypatch,t
     return result
   monkeypatch.setattr(env,'step',end_at_three)
   runner.collect(3)
-  expected=cfg.bin_ema*(1-cfg.gamma**3)/(1-cfg.gamma**(3 if timeout_enabled else 50))
+  expected=(1-cfg.gamma**3)/(1-cfg.gamma**(3 if timeout_enabled else 50))
   assert env.command.sampler.bin_return[0].item()==pytest.approx(expected)
 
 
@@ -343,7 +343,7 @@ def test_resume_old_bin_statistics_keeps_networks_and_progress(mdp,tmp_path):
 
 @pytest.mark.parametrize('legacy', [False, True])
 def test_resume_uses_configured_return_ema_and_preserves_sampling_scores(mdp,tmp_path,legacy):
-  original=SuperMimicRunner(TensorEnv(mdp),small_config(bin_ema=.2),tmp_path/'old')
+  original=SuperMimicRunner(TensorEnv(mdp),small_config(bin_ema=.2,softmax_cap=0.),tmp_path/'old')
   original.command.sampler.update_returns(torch.tensor([0,1]),torch.tensor([.8,.4]))
   original.command.sampler.probabilities(update_history=True)
   original.iteration=123
@@ -351,18 +351,39 @@ def test_resume_uses_configured_return_ema_and_preserves_sampling_scores(mdp,tmp
   original.save(checkpoint)
   saved=torch.load(checkpoint,weights_only=False)
   assert saved['config']['bin_ema']==.2
+  assert saved['config']['softmax_cap']==0.
   if legacy:
     saved['config'].pop('bin_ema')
+    saved['config'].pop('softmax_cap')
+    saved['sampler'].pop('bin_initialized')
     torch.save(saved,checkpoint)
   resumed=SuperMimicRunner(TensorEnv(mdp),small_config(bin_ema=.35),tmp_path/'new')
   resumed.load(checkpoint)
   assert resumed.command.sampler.bin_ema==.35 and resumed.iteration==123
+  assert resumed.command.sampler.softmax_cap==resumed.cfg.softmax_cap==50.
+  assert resumed.command.sampler.bin_initialized.all()
   torch.testing.assert_close(resumed.command.sampler.bin_return,original.command.sampler.bin_return)
   before=resumed.command.sampler.bin_return.clone()
   resumed.command.sampler.update_returns(torch.tensor([0]),torch.tensor([.9]))
   torch.testing.assert_close(resumed.command.sampler.bin_return[0],.65*before[0]+.35*.9)
   resumed.save(tmp_path/'resumed.pt')
   assert torch.load(tmp_path/'resumed.pt',weights_only=False)['config']['bin_ema']==.35
+
+
+@pytest.mark.parametrize('cap', [0., 1., 50.])
+def test_runner_applies_configured_cap_to_actual_reset_distribution(mdp,tmp_path,cap):
+  mdp.motion=MotionLibrary(mdp.motion.motion_files,bin_duration_s=.02)
+  runner=SuperMimicRunner(TensorEnv(mdp),small_config(softmax_cap=cap),tmp_path/'cap')
+  sampler=runner.command.sampler
+  assert sampler.softmax_cap==cap
+  sampler.bin_return.fill_(1.)
+  sampler.bin_return[0]=0.
+  p=sampler.probabilities()
+  if cap:
+    assert p.max().item() <= .6/mdp.motion.num_bins + .4*cap/mdp.motion.num_bins + 1e-7
+  else:
+    assert p[0]>.4
+  torch.testing.assert_close(p.sum(),torch.tensor(1.))
 
 
 def test_evaluation_scores_each_clip_once(mdp):
