@@ -157,11 +157,12 @@ class SuperMimicRunner:
     ck = torch.load(path, map_location=self.env.device, weights_only=False)
     check_manifest(ck["motions"], motion_manifest(self.motion))
     saved_cfg, current_cfg = dict(ck["config"]), asdict(self.cfg)
-    # Scheduling, logging, precision, collection mix and return EMA may change without
+    # Scheduling, logging, precision, collection mix, return EMA and actor clipping may change without
     # reinterpreting weights. Replay is refilled after loading.
     mutable = {"iterations", "num_envs", "ckpt_every", "log_every", "amp", "compile",
                "buffer_steps", "warmup_steps", "enable_warmup", "logger", "wandb_project",
-               "wandb_entity", "wandb_mode", "log_dir", "run_name", "collect_det_frac", "bin_ema"}
+               "wandb_entity", "wandb_mode", "log_dir", "run_name", "collect_det_frac", "bin_ema",
+               "pi_clip", "pi_clip_value"}
     for key in current_cfg:
       if key not in mutable and current_cfg[key] != saved_cfg[key]:
         raise ValueError(f"Resume configuration changed {key}; use the checkpoint configuration")

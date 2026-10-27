@@ -27,7 +27,8 @@ class ReplayBuffer:
     for key in FIELDS:
       self.data[key][self.ptr].copy_(transition[key])
     f = transition["f"]
-    self.eligible[self.ptr] = self.clip_end[self.clip_id[f]] - f + 1 >= self.horizon
+    # f is the next target, so even the last frame has one valid transition.
+    self.eligible[self.ptr] = self.clip_end[self.clip_id[f]] - f + 1 >= 1
     self.ptr = (self.ptr + 1) % self.capacity
     self.size = min(self.size + 1, self.capacity)
     self._window_choices.clear()
@@ -80,7 +81,7 @@ class ReplayBuffer:
     return out
 
   def sample_starts(self, batch, history):
-    """Finite sampling from valid physical slots; None means no legal horizon."""
+    """Sample collected starts, including clips with fewer than horizon steps."""
     choices = self.eligible.nonzero(as_tuple=False)
     if choices.numel() == 0:
       return None

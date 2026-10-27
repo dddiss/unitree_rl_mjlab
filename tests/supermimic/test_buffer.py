@@ -22,14 +22,30 @@ def test_windows_and_histories_do_not_cross_reset(mdp):
     assert states[:,0].tolist()==([0,0,0,0,0] if row[0]==0 else [0,0,0,0,1])
 
 
-def test_ring_and_no_eligible_start(mdp):
+def test_ring_and_short_imagination_starts(mdp):
   m=mdp.motion
   b=ReplayBuffer(3,1,torch.zeros(1,33),m.clip_end,m.clip_id,32)
+  assert b.sample_starts(1,10) is None
   for step in range(6): b.add(transition([step+1],step))
   _,h=b.sample_starts(200,10)
   assert h['s'][...,0].min()>=3
-  for step in range(3): b.add(transition([55],step))
-  assert b.sample_starts(1,10) is None
+  for step in range(3): b.add(transition([57],0,True))
+  start,h=b.sample_starts(100,10)
+  # A one-step clip tail remains usable; histories stay inside each reset.
+  assert torch.all(start['f']==57)
+  assert torch.all(h['s']==0)
+
+
+def test_imagination_samples_short_and_long_clips_without_unwritten_slots(mdp):
+  m=mdp.motion
+  b=ReplayBuffer(20,3,torch.zeros(3,33),m.clip_end,m.clip_id,32)
+  b.add(transition([1,56,57],0))
+  torch.manual_seed(41)
+  start,_=b.sample_starts(600,2)
+  assert set(start['f'].tolist())=={1,56,57}
+  assert torch.all(start['s']==0)
+  counts=torch.stack([(start['f']==f).sum() for f in (1,56,57)])
+  assert torch.all((counts>150)&(counts<250))
 
 
 def test_strict_windows_allow_terminal_or_truncated_last_step(mdp):

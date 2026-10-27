@@ -195,6 +195,22 @@ def test_return_ema_comes_from_local_config_on_start_and_resume(logging_cli, sav
   assert captured["cfg"].bin_ema == .35
 
 
+@pytest.mark.parametrize("saved_bounds", [None, "legacy", (1., .1)])
+def test_actor_clipping_comes_from_rl_config_on_start_and_resume(logging_cli, saved_bounds):
+  run, captured = logging_cli
+  saved = None
+  if saved_bounds is not None:
+    saved = asdict(rl_cfg.SuperMimicConfig())
+    for field, value in zip(("pi_clip", "pi_clip_value"), (1., .1)):
+      if saved_bounds == "legacy":
+        saved.pop(field)
+      else:
+        saved[field] = value
+  run(saved=saved, factory_settings={"pi_clip": .025, "pi_clip_value": .002})
+  assert captured["cfg"].pi_clip == .025
+  assert captured["cfg"].pi_clip_value == .002
+
+
 @pytest.mark.parametrize("flags,saved_settings,expected", [
   ([], None, ("wandb", "unitree-supermimic", None, "g1", "online")),
   (["--logger", "csv"], None, ("csv", "unitree-supermimic", None, "g1", "online")),

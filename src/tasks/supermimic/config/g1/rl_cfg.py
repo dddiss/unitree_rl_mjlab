@@ -1,5 +1,6 @@
 """G1 defaults for the independent SuperMimic learner."""
 from dataclasses import dataclass
+import math
 from typing import Literal
 
 
@@ -16,6 +17,8 @@ class SuperMimicConfig:
   wm_batches: int = 10
   wm_batch: int = 2048
   pi_batch: int = 4096
+  pi_clip: float = 1.0 / 32  # Actor global gradient norm, after loss / horizon.
+  pi_clip_value: float = 0.1 / 32  # Actor per-element gradient bound.
   lr: float = 2e-4
   gamma: float = 0.99
   lam: float = 0.95
@@ -51,6 +54,9 @@ class SuperMimicConfig:
         raise ValueError(f"{name} must be positive")
     if self.buffer_steps < self.wm_window:
       raise ValueError("buffer_steps must cover wm_window")
+    for name in ("pi_clip", "pi_clip_value"):
+      if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
+        raise ValueError(f"{name} must be finite and positive")
     if self.utd <= 0 or not 0 < self.gamma < 1:
       raise ValueError("utd must be positive and gamma must lie in (0, 1)")
     if not 0 <= self.collect_det_frac <= 1:

@@ -197,9 +197,10 @@ def test_resume_can_switch_warmup_and_load_legacy_checkpoints(mdp,tmp_path,saved
     torch.testing.assert_close(resumed.algorithm.policy.state_dict()[name],value)
 
 
-def test_disabled_warmup_updates_world_model_without_legal_policy_starts(mdp,tmp_path,monkeypatch):
-  cfg=small_config(enable_warmup=False,iterations=1,horizon=100)
-  runner=SuperMimicRunner(TensorEnv(mdp),cfg,tmp_path/'no_starts')
+def test_disabled_warmup_updates_policy_with_short_motion_starts(mdp,tmp_path,monkeypatch):
+  # Both clips are shorter than H: this used to skip every policy update.
+  cfg=small_config(enable_warmup=False,iterations=1,horizon=52)
+  runner=SuperMimicRunner(TensorEnv(mdp),cfg,tmp_path/'short_starts')
   with torch.no_grad():runner.algorithm.wm.net[-1].bias[0]=1
   before={name:[p.detach().clone() for p in getattr(runner.algorithm,name).parameters()]
           for name in ('wm','policy','critic')}
@@ -210,13 +211,13 @@ def test_disabled_warmup_updates_world_model_without_legal_policy_starts(mdp,tmp
   monkeypatch.setattr(runner,'_record',record)
   runner.learn()
   assert updates==[('world_model_update',0,66),('policy_update',0,66)]
-  assert ('policy_skipped',1.0) in recorded
-  assert not runner.buffer.eligible.any()
+  assert ('policy_skipped',0.0) in recorded
+  assert runner.buffer.eligible.any()
   assert any(not torch.equal(old,new) for old,new in zip(before['wm'],runner.algorithm.wm.parameters()))
   for name in ('policy','critic'):
-    assert all(torch.equal(old,new) for old,new in zip(before[name],getattr(runner.algorithm,name).parameters()))
+    assert any(not torch.equal(old,new) for old,new in zip(before[name],getattr(runner.algorithm,name).parameters()))
   assert runner.algorithm.opt_wm.state
-  assert not runner.algorithm.opt_pi.state and not runner.algorithm.opt_v.state
+  assert runner.algorithm.opt_pi.state and runner.algorithm.opt_v.state
 
 
 @pytest.mark.parametrize('enable_warmup',[True,False])
@@ -467,6 +468,24 @@ def test_legacy_run_name_loads_for_evaluation_and_resume(mdp,tmp_path):
   assert resumed.cfg.run_name=='resumed' and resumed.log_dir==tmp_path/'resumed'
   for name,value in runner.algorithm.policy.state_dict().items():
     torch.testing.assert_close(resumed.algorithm.policy.state_dict()[name],value)
+
+
+@pytest.mark.parametrize('legacy',[False,True])
+def test_resume_keeps_current_actor_clipping(mdp,tmp_path,legacy):
+  cfg=small_config(pi_clip=1.,pi_clip_value=.1)
+  runner=SuperMimicRunner(TensorEnv(mdp),cfg,tmp_path/'saved')
+  checkpoint=tmp_path/'saved/last.pt'
+  runner.save(checkpoint)
+  if legacy:
+    saved=torch.load(checkpoint,weights_only=False)
+    saved['config'].pop('pi_clip')
+    saved['config'].pop('pi_clip_value')
+    torch.save(saved,checkpoint)
+  resumed=SuperMimicRunner(TensorEnv(mdp),small_config(),tmp_path/'resumed')
+  resumed.load(checkpoint)
+  assert resumed.algorithm.cfg.pi_clip==1/32
+  assert resumed.algorithm.cfg.pi_clip_value==.1/32
+  assert resumed.buffer.size==0
 
 
 def test_collection_adds_goal_noise_before_normalization(mdp,tmp_path):

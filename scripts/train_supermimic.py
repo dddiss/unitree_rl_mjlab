@@ -46,7 +46,7 @@ def main():
   )
   from src.tasks.supermimic.rl.runner import SuperMimicRunner
   defaults = asdict(unitree_g1_supermimic_runner_cfg())
-  local_settings = {name: defaults[name] for name in ("collect_det_frac", "bin_ema")}
+  local_settings = {name: defaults[name] for name in ("collect_det_frac", "bin_ema", "pi_clip", "pi_clip_value")}
   if args.resume:
     defaults.update(migrate_legacy_run_name(
       torch.load(args.resume, map_location="cpu", weights_only=False)["config"]))

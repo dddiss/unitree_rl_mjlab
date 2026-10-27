@@ -51,11 +51,11 @@ class StepwiseAlgorithm(SuperMimicAlgorithm):
       objective = (discount * prior_alive * r).sum(0)
       objective += c.gamma ** c.horizon * alive[-1] * self.critic(
         self.critic_input(state, f, xi_n, goal, a_prev))
-      loss = -objective.mean()
+      loss = -objective.mean() / c.horizon
       self.opt_pi.zero_grad(set_to_none=True)
       loss.backward()
-      norm = nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
-      nn.utils.clip_grad_value_(self.policy.parameters(), 0.1)
+      norm = nn.utils.clip_grad_norm_(self.policy.parameters(), c.pi_clip)
+      nn.utils.clip_grad_value_(self.policy.parameters(), c.pi_clip_value)
       if not torch.isfinite(loss) or not torch.isfinite(norm):
         raise FloatingPointError("Non-finite policy loss/gradient")
       self.opt_pi.step()

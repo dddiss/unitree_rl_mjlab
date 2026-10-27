@@ -124,13 +124,24 @@ class SuperMimicAlgorithm:
     states, frames, goals = [state], [f], [goal]
     actions, previous_actions = [], []
     batch_size = f.shape[0]
+    motion = self.mdp.motion
+    lengths = (motion.clip_end[motion.clip_id[f]] - f + 1).clamp(max=c.horizon)
+    valid = torch.arange(c.horizon, device=self.device)[:, None] < lengths[None]
 
     def flat(rows):
       return torch.stack(rows).flatten(0, 1)
 
     with frozen(self.wm, self.critic):
-      for _ in range(c.horizon):
-        next_state, action, history, next_f, next_goal = self._imag_step(state, history, f, xi, goal)
+      for t in range(c.horizon):
+        next_state, action, next_history, next_f, next_goal = self._imag_step(state, history, f, xi, goal)
+        # Keep fixed batch shapes, but hold every row at its own endpoint.
+        # Padded steps must not change the bootstrap state or previous action.
+        def advance(old, new):
+          return torch.where(valid[t].reshape((-1,) + (1,) * (new.ndim - 1)), new, old)
+        next_state = tuple(advance(old, new) for old, new in zip(state, next_state))
+        action = advance(a_prev, action)
+        history = advance(history, next_history)
+        next_f, next_goal = advance(f, next_f), advance(goal, next_goal)
         actions.append(action); previous_actions.append(a_prev)
         state, f, goal, a_prev = next_state, next_f, next_goal, action
         states.append(state); frames.append(f); goals.append(goal)
@@ -139,17 +150,22 @@ class SuperMimicAlgorithm:
       reward_states = tuple(flat([s[i] for s in states[1:]]) for i in range(6))
       r, d = self._reward_term(reward_states, flat(frames[:-1]), flat(actions), flat(previous_actions))
       r, d = r.reshape(c.horizon, batch_size), d.reshape(c.horizon, batch_size)
+      # Motion end is a truncation, not a failure: stop rewards there while
+      # retaining the last valid state's soft survival factor for bootstrapping.
+      r, d = torch.where(valid, r, 0.0), torch.where(valid, d, 0.0)
       alive = (1 - d).cumprod(0)
       prior_alive = torch.cat((torch.ones_like(alive[:1]), alive[:-1]), 0)
       discount = c.gamma ** torch.arange(c.horizon, device=self.device)[:, None]
       objective = (discount * prior_alive * r).sum(0)
-      objective += c.gamma ** c.horizon * alive[-1] * self.critic(
+      objective += c.gamma ** lengths * alive[-1] * self.critic(
         self._critic_input(state, f, xi_n, goal, a_prev))
-      loss = -objective.mean()
+      # Always divide by the configured horizon (32 by default), never by each
+      # row's shorter valid length. Scale the bootstrap together with rewards.
+      loss = -objective.mean() / c.horizon
       self.opt_pi.zero_grad(set_to_none=True)
       loss.backward()
-      norm = nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
-      nn.utils.clip_grad_value_(self.policy.parameters(), 0.1)
+      norm = nn.utils.clip_grad_norm_(self.policy.parameters(), c.pi_clip)
+      nn.utils.clip_grad_value_(self.policy.parameters(), c.pi_clip_value)
       if not torch.isfinite(loss) or not torch.isfinite(norm):
         raise FloatingPointError("Non-finite policy loss/gradient")
       self.opt_pi.step()
@@ -162,14 +178,18 @@ class SuperMimicAlgorithm:
       x = self._critic_input(critic_states, flat(frames), critic_xi,
                              flat([g.detach() for g in goals]), critic_previous)
       x = x.reshape(c.horizon + 1, batch_size, -1)
-      self.critic.norm.update(x)
+      state_valid = torch.arange(c.horizon + 1, device=self.device)[:, None] <= lengths[None]
+      self.critic.norm.update(x[state_valid])
       v = self.critic(x)
       ret, targets = v[-1], []
       for t in range(c.horizon - 1, -1, -1):
-        ret = r[t].detach() + c.gamma * (1 - d[t].detach()) * ((1 - c.lam) * v[t+1] + c.lam * ret)
+        next_return = r[t].detach() + c.gamma * (1 - d[t].detach()) * ((1 - c.lam) * v[t+1] + c.lam * ret)
+        # After motion end, carry V(s_L) back to the final valid transition;
+        # do not insert artificial rewards or discounts for padded steps.
+        ret = torch.where(valid[t], next_return, v[t])
         targets.append(ret)
-      y = torch.stack(targets[::-1]).flatten()
-      x = x[:-1].flatten(0, 1)
+      y = torch.stack(targets[::-1])[valid]
+      x = x[:-1][valid]
     losses = []
     for _ in range(c.critic_epochs):
       permutation = torch.randperm(len(y), device=self.device)
@@ -187,7 +207,7 @@ class SuperMimicAlgorithm:
     return {"policy_skipped": 0.0, "pi_loss": float(loss.detach()),
             "v_loss": float(torch.stack(losses).mean()), "pi_gradnorm": float(norm),
             "imag_survival": float(alive[-1].detach().mean()),
-            "imag_reward": float((prior_alive * r).detach().mean() / self.mdp.max_step_reward)}
+            "imag_reward": float((prior_alive * r).detach().sum() / valid.sum() / self.mdp.max_step_reward)}
 
   def state_dict(self):
     return {key: getattr(self, key).state_dict() for key in

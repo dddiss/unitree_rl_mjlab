@@ -55,8 +55,9 @@ def test_updates_and_freezing(mdp):
 
 
 def test_missing_imagination_start(mdp):
-  cfg=small_config(horizon=100)
-  b,_=filled_buffer(mdp,cfg)
+  cfg=small_config()
+  m=mdp.motion
+  b=ReplayBuffer(cfg.buffer_steps,2,torch.zeros(2,33),m.clip_end,m.clip_id,cfg.horizon)
   alg=SuperMimicAlgorithm(mdp,cfg,'cpu')
   assert alg.policy_update(b)=={'policy_skipped':1.0}
 
