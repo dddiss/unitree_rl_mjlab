@@ -17,10 +17,12 @@ def main():
   parser.add_argument("--device", default="cuda:0")
   args = parser.parse_args()
   from src.tasks.supermimic.config import make_env
-  from src.tasks.supermimic.rl.evaluation import load_policy, record_clips, PlaybackEnv
+  from src.tasks.supermimic.rl.evaluation import load_policy, read_checkpoint_config, record_clips, PlaybackEnv
   from src.tasks.supermimic.rl.runner import PolicyController
   from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
+  saved_cfg = read_checkpoint_config(args.checkpoint_file)
   env = make_env(args.motion_file, device=args.device, evaluation=True,
+                 depth_enabled=saved_cfg.depth_enabled,
                  render_mode="rgb_array" if args.video_dir else None)
   try:
     policy, cfg, _ = load_policy(args.checkpoint_file, env)

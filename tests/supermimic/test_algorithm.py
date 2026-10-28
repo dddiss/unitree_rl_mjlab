@@ -11,7 +11,7 @@ from supermimic.config.g1.rl_cfg import SuperMimicConfig
 
 
 def small_config(**kwargs):
-  values=dict(num_envs=2,buffer_steps=16,wm_window=2,wm_batch=4,wm_batches=1,pi_batch=4,
+  values=dict(depth_enabled=False,num_envs=2,buffer_steps=16,wm_window=2,wm_batch=4,wm_batches=1,pi_batch=4,
               horizon=3,hist=2,goal_frames=2,critic_epochs=1,critic_minibatches=2,
               wm_hidden=(24,24),policy_hidden=(24,24),critic_hidden=(24,),amp='none',compile=False,logger='csv')
   values.update(kwargs)
@@ -39,6 +39,10 @@ def test_updates_and_freezing(mdp):
   alg=SuperMimicAlgorithm(mdp,cfg,'cpu')
   buffer,transitions=filled_buffer(mdp,cfg)
   for tr in transitions:alg.observe(tr,buffer.xi)
+  # Constant-speed fixture can already be predicted exactly by the learned
+  # delta mean. Start with a known error so this tests a real update, not noise.
+  with torch.no_grad():
+    alg.wm.net[-1].bias[0]=0.1
   wm_before=[p.detach().clone() for p in alg.wm.parameters()]
   metrics=alg.world_model_update(buffer)
   assert all(torch.isfinite(torch.tensor(v)) for v in metrics.values())

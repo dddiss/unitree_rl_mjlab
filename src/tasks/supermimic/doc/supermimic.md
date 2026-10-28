@@ -28,7 +28,18 @@ unitree_rl_mjlab/
 │   │   ├── __init__.py               # 环境创建工厂 make_env
 │   │   └── g1/
 │   │       ├── env_cfgs.py           # G1 训练与评估环境配置
+│   │       ├── terrain_cfg.py        # P-BFM 六类混合地形与生成参数
 │   │       └── rl_cfg.py             # SuperMimicConfig 与算法默认参数
+│   ├── terrain/
+│   │   ├── primitives.py             # 六类地形的碰撞几何生成
+│   │   ├── pattern.py                # P-BFM reset 使用的 273 点查询网格
+│   │   ├── sensor.py                 # 地形射线与地图外围平地查询
+│   │   └── reset.py                  # 当地地面高度及周边高地抬升
+│   ├── perception/
+│   │   ├── camera.py                # 固定 G1 相机、mjlab raycast 与光轴深度
+│   │   ├── sensor.py                # 仅排除包围相机原点的头部可视外壳
+│   │   ├── preprocessing.py         # P-BFM G1 18×32 深度预处理
+│   │   └── history.py               # 逐步图像历史与间隔采样
 │   ├── mdp/
 │   │   ├── motion_lib.py             # 多 NPZ 加载、帧索引和 bin 划分
 │   │   ├── commands.py               # 参考目标、重置初始化与动作选择
@@ -44,6 +55,9 @@ unitree_rl_mjlab/
 │   │   └── metrics.py                # 跟踪指标
 │   ├── rl/
 │   │   ├── networks.py               # 世界模型、策略和 Critic 网络
+│   │   ├── depth_encoder.py          # 三份独立 CNN＋GRU 编码器
+│   │   ├── depth_decoder.py          # WM 预测特征 → 下一帧深度图
+│   │   ├── depth_buffer.py           # uint8 图像缓存与终止前下一帧
 │   │   ├── buffer.py                 # 经验池、WM 窗口和想象起点采样
 │   │   ├── algorithm.py              # WM 更新、策略 BPTT 和 Critic 更新
 │   │   ├── runner.py                 # 采集、更新调度、日志与 checkpoint
@@ -185,6 +199,42 @@ python scripts/csv_to_npz_multi.py \
 
 ## 3. 训练、恢复与日志
 
+地形在 `src/tasks/supermimic/config/g1/terrain_cfg.py` 中配置。当前默认
+`G1_TERRAIN_MODE = "mixed"`，训练、评估和播放共用这份环境工厂；已有平地
+checkpoint 需要在平地评估时，应先将它改为 `"plane"`。也支持单独选择
+`flat`、`slope`、`stairs_up`、`stairs_down`、`rough`、`platforms`。
+`flat` 是有限大小的平地地图，`plane` 是原有平面环境。Python 工厂还支持
+`make_env(..., terrain_type="plane")`；本次没有增加命令行地形选项。
+
+混合地形采用 P-BFM G1 的 10 行 × 6 列相连地图，每块 8×8 米，外围平地宽
+17 米，固定生成种子 0。六类地形的环境分配权重依次为
+15%、15%、20%、20%、15%、15%；每列一种地形，每行一个难度范围，不会给
+每个环境单独生成整张地图。坡度 5～8°，台阶高度 0.10～0.20 米、深度
+0.30 米、10 级；粗糙地形幅度 0.03～0.05 米，平台高度随难度由
+0.05～0.10 米过渡到 0.10～0.18 米。`curriculum=True` 在这里用于按行排列
+生成难度，没有加入运行期间升降难度的课程事件。
+
+reset 仍按原方式选择动作帧 k、XY、姿态、速度和关节扰动。仅根高度改为：
+
+```text
+期望离地高度 = 参考动作 k 的根高度 + 原有 Z 扰动
+最终根高度 = 最终 XY 下方的地面高度 + 期望离地高度 + 周边抬升
+周边抬升 = 0                         （周边未明显高于根下方地面）
+         = 周边最高地面 − 根下方地面 + 0.05 m  （高度差 > 1e-4 m）
+```
+
+周边采用 P-BFM 的前后不对称 273 点地形射线网格，取其中距根水平距离
+不超过 0.65 米的有效点。查询只命中地形，不命中机器人；射线从整张地图
+最高碰撞几何上方 1.5 米发出。这里只用来放置 reset 状态，不添加策略
+观测或可微高度图。局部 reset 仅写入指定环境，目标仍为 k+1，深度历史在
+最终放置并刷新后初始化。平面模式保留原来的 reset 路径。
+
+**这一步仅迁入地形与 reset 高度，奖励和终止仍采用当前的平地参考定义。**
+参考 NPZ、参考身体位置及其高度没有随地形重定向；因此跨台阶时仍可能因
+原有高度误差终止，不能将这一步视作已经完成地形奖励适配。地图有边界，
+reset XY 若落在地图外会明确报错，不会自动裁剪 XY 或更换动作帧。
+P-BFM 的区域采样、额外随机航向和躺姿 reset 没有加入。
+
 ### 3.1 开始训练
 
 ```bash
@@ -217,6 +267,40 @@ python scripts/train_supermimic.py \
 | `--log-every` / `--ckpt-every` | 50 / 2000 | 日志记录 / checkpoint 保存间隔，单位为迭代 |
 | `--amp none` | 默认 `bf16` | 关闭网络 BF16 混合精度 |
 | `--no-compile` | 默认开启编译 | 关闭 `torch.compile` |
+| `--no-depth-enabled` | 默认启用视觉 | 新训练使用无视觉网络；恢复默认遵循 checkpoint |
+
+新训练默认启用视觉 SuperMimic。Actor、WM、Critic 分别使用自己的 CNN＋GRU，参数互不共享；Actor 的动作参考编码器仍为 `640→32`，视觉 latent 接入动作解码器。默认 Actor 解码器输入 1218 维、WM 输入 389 维、Critic 输入 1103 维。数值观测继续使用原来的 RunningNorm；图像归一化到 `[0,1]`，视觉 latent 不加入数值 RunningNorm。
+
+相机使用 P-BFM G1 的固定安装位姿和光轴深度定义，原图 `36×64`，距离上限 2.5 m，裁剪、Gaussian blur 后得到 `18×32`。当前接入固定外参、零传感器延迟，不增加相机随机化，也不改变已有机器人随机化。图像每个控制步采集，历史按 `35、30、25、20、15、10、5、0` 的年龄选出 8 帧（50 Hz 时覆盖 0.7 s）。因此零延迟实现保留 36 帧即可；P-BFM 用于容纳额外 1 帧延迟的第 37 帧不在本次输入中。相机参数在 `perception/camera.py` 的 `DepthCameraCfg` 定义，由 G1 环境工厂接入。
+
+当前 G1 的相机原点位于 `head_link` 可视网格内部，因此沿用 P-BFM 的外壳排除方式：把这个可视网格划入射线不读取的 group 4，避免整幅图只看到相机自身外壳。其他身体仍可被相机看到，`contype`、`conaffinity` 等碰撞参数保持不变，也不修改机器人 XML 文件。
+
+感知结构和优化参数均在 `config/g1/rl_cfg.py` 修改：
+
+```python
+depth_enabled: bool = True
+depth_frames: int = 8
+depth_skip: int = 5
+depth_frame_dim: int = 256
+depth_latent_dim: int = 256
+actor_perception_lr: float = 2e-4
+wm_perception_lr: float = 2e-4
+critic_perception_lr: float = 2e-4
+depth_decoder_lr: float = 2e-4
+depth_loss_weight: float = 1.0
+depth_checkpoint: bool = True
+depth_batch_size: int = 256
+```
+
+这些感知学习率独立于 `--lr`，各自沿用相同的余弦衰减倍率。CNN 通道为 `16→32→64`、步长为 `1→2→1`，池化到 `2×4` 后投影到 256 维，单层 GRU 输出 256 维，对齐 P-BFM 的最终 G1 配置。`depth_checkpoint` 表示反向传播时重新计算视觉激活以节省显存，不是模型保存开关；`depth_batch_size` 限制单次编码的样本数，不改变学习器 batch 或更新次数。当前 BF16 设置用于原有 MLP，深度 CNN、GRU、解码器及图像缓存计算采用 FP32/uint8。
+
+WM 的 8 步自回归同时预测机器人状态与下一帧图像：起点使用经验池中的真实图像历史，之后每步把预测图像加入历史，再经过 WM 自己的 CNN＋GRU 输入下一步。真实未来图像只作为监督目标，不在展开中替换预测图像。Actor 的想象展开采用同样流程；Actor、WM、Critic读取相同的图像历史，但各自重新编码。预测图像保持浮点和梯度，不做 uint8 量化。WM 的视觉输出是解码用中间特征，不直接替代下一步的 GRU 输出，也不额外对两者做 latent L2。
+
+WM 总损失为原状态损失加 `depth_loss_weight × 深度损失`。深度损失先对归一化图像的像素求 MSE，再按现有 WM 终止掩码对有效时间步求和、对 batch 求平均；终止那一步包含真实下一帧，其后跨 episode 的图像不参与损失。奖励、终止阈值、采样算法、Actor 损失除以固定 horizon 和 motion end 自举方式保持不变。
+
+经验池每条 transition 只存一张当前 uint8 深度图；普通下一帧由相邻记录复用，终止前下一帧另存在可回收池中，最新 transition 的下一帧暂存。历史不跨 reset 或环形覆盖边界；缺少历史时重复最早可用的同回合图像。4096 环境、1000 步的主图像缓存约 2.20 GiB，此外还有终止图像、索引、网络和反向传播开销；该数值不是总显存，4096 环境下的峰值需在实际 GPU 上测量。首次运行可先降低 `--num-envs`、`--wm-batch`、`--pi-batch` 检查实际资源占用。
+
+本次默认场景仍为原有平地，未新增地形生成器或避障奖励。视觉网络接入并不等同于已经完成地形适应训练。
 
 动作探索的环境比例直接在 `src/tasks/supermimic/config/g1/rl_cfg.py` 中配置，不新增命令行参数：
 
@@ -281,7 +365,9 @@ python scripts/train_supermimic.py \
 
 新 checkpoint 保存有限长度归一化的起点 bin 分数。此前包含自举、沿途 bin 回报的旧统计无法准确转换；恢复这类 checkpoint 时会明确提示并重置 bin 分数和历史采样分布，再从新回合积累，网络、优化器和训练进度仍正常恢复。原 checkpoint 文件不改写。
 
-当前 Critic 已移除独立重复的 6 维根相对朝向，并加入 29 维上一动作（无历史）；未来参考目标中的朝向保留，默认 Critic 输入为 847 维。此前 824 维 Critic 的 checkpoint 不能直接完整恢复训练；Actor 结构未变，仍可用于评估和播放。
+无视觉 Critic 已移除独立重复的 6 维根相对朝向，并加入 29 维上一动作（无历史）；未来参考目标中的朝向保留，无视觉 Critic 输入为 847 维，视觉版加自己的 256 维图像 latent。此前 824 维 Critic 的 checkpoint 不能直接完整恢复训练。
+
+视觉 checkpoint 保存三套独立编码器、深度解码器及优化器状态。恢复仍重新填充经验池和历史，不保存图像经验池。旧 checkpoint 缺少 `depth_enabled` 时按无视觉版加载，可以继续原有评估、播放与兼容架构的恢复训练；不能把旧模型直接当作视觉模型恢复。评估和播放会在创建环境前读取 checkpoint 配置，自动决定是否加载深度传感器。
 
 恢复时可覆盖总迭代数、环境数量、缓存容量、日志/保存周期、初始填充步数、预热开关、编译/精度配置，以及第 3.4 节中的全部 W&B/日志选项；`collect_det_frac` 和 `bin_ema` 始终读取当前 `rl_cfg.py`。其余算法与网络配置应保持 checkpoint 原值。省略参数时沿用 checkpoint 的设置，旧 checkpoint 没有的新日志选项使用当前默认值。
 
@@ -313,6 +399,8 @@ CSV 和 W&B 每 `--log-every` 次迭代记录同一组聚合结果，W&B 横轴�
 `train_log.csv` 保留原有 17 列：`iteration`、`wall_h`、`sim_steps`、`env_steps`、`lr`、`wm_loss`、`wm_err_last`、`pi_loss`、`v_loss`、`pi_gradnorm`、`imag_survival`、`imag_reward`、`policy_skipped`、`sim_reward`、`episode_length`、`episode_return`、`failure_fraction`。其中 `episode_return` 仍是按实际步数和最大单步奖励归一化后的回报，`episode_length` 的单位为控制步；新增原始回报单独记录。
 
 W&B 将网络损失统一归入 `Loss/`：`Loss/wm_loss`、`Loss/wm_err_last`（WM 窗口末步误差）、`Loss/pi_loss`、`Loss/v_loss`。CSV 仍使用上述原始列名，两端数值和区间平均方式相同；没有更新时留空，不上传对应 W&B 指标。
+
+视觉训练另记录 `wm_depth_loss` / `Loss/wm_depth_loss` 和 `wm_total_loss` / `Loss/wm_total_loss`，终端也显示这两项。`wm_loss` 保留原状态损失的含义。和原 WM 日志一致，两项新增损失都除以配置的 WM 窗口长度用于展示，再在记录区间内平均；实际反向传播使用上述按有效步求和的总损失。
 
 | 新增指标 | 含义与统计口径 |
 |---|---|

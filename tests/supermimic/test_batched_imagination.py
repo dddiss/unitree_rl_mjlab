@@ -127,6 +127,7 @@ def test_batched_update_matches_original_stepwise_update(mdp):
   torch.set_num_threads(2)
   torch.manual_seed(13)
   cfg = SuperMimicConfig(
+    depth_enabled=False,
     pi_batch=3, horizon=3, hist=2, goal_frames=3,
     critic_epochs=2, critic_minibatches=2,
     wm_hidden=(24, 24), policy_hidden=(24, 24), critic_hidden=(24,),

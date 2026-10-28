@@ -10,15 +10,26 @@ from .mdp.state import read_state, flatten_state
 
 
 class SuperMimicEnv(ManagerBasedRlEnv):
-  def __init__(self, cfg, **kwargs):
+  def __init__(self, cfg, *, depth_camera=None, **kwargs):
     if cfg.auto_reset:
       raise ValueError("SuperMimic requires auto_reset=False")
     self._functional_mdp = self._context = self._reward_terms = None
     self.last_transition = None
     self.last_step_metrics = None
+    self._depth_camera = None
+    self._depth_image = None
     super().__init__(cfg, **kwargs)
+    if depth_camera is not None:
+      from .perception.camera import DepthCamera
+      self._depth_camera = DepthCamera(depth_camera, self.scene, self.device)
     self._context = self.read_context().clone()
     self.reset_version = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+
+  @property
+  def depth_image(self):
+    if self._depth_image is None:
+      raise RuntimeError("Reset a depth-enabled environment before requesting depth")
+    return self._depth_image
 
   @property
   def context(self):
@@ -69,6 +80,13 @@ class SuperMimicEnv(ManagerBasedRlEnv):
   def reset(self, *, seed=None, env_ids=None, options=None):
     self._reward_terms = None
     result = super().reset(seed=seed, env_ids=env_ids, options=options)
+    if self._depth_camera is not None:
+      frames = self._depth_camera.read()  # base reset already forwards and senses
+      if self._depth_image is None:
+        self._depth_image = frames
+      else:
+        ids = slice(None) if env_ids is None else env_ids
+        self._depth_image[ids] = frames[ids]
     self.reset_version[slice(None) if env_ids is None else env_ids] += 1
     return result
 
@@ -82,6 +100,8 @@ class SuperMimicEnv(ManagerBasedRlEnv):
       "s": flatten_state(read_state(self)).clone(), "f": cmd.time_steps.clone(),
       "a_prev": self.action_manager.action.clone(), "ep_step": self.episode_length_buf.clone(),
     }
+    if getattr(self, "_depth_camera", None) is not None:
+      transition["depth"] = self.depth_image.clone()
     self.extras["log"] = {}
     self._reward_terms = None
     self.action_manager.process_action(action.to(self.device))
@@ -118,6 +138,10 @@ class SuperMimicEnv(ManagerBasedRlEnv):
     # A finished row keeps its evaluated target until the caller resets it.
     self.command_manager.compute(dt=torch.where(self.reset_buf, 0.0, self.step_dt))
     self.sim.sense()
+    if getattr(self, "_depth_camera", None) is not None:
+      self._depth_image = self._depth_camera.read()
+      # Includes the terminal transition's real post-action, PRE-reset image.
+      transition["depth_next"] = self._depth_image.clone()
     self.obs_buf = self.observation_manager.compute(update_history=True)
     self._manual_reset_pending[self.reset_buf] = True
     self.recorder_manager.record_post_step()

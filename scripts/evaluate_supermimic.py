@@ -119,24 +119,32 @@ def main():
   args = parse_args()
   from src.tasks.supermimic.config import make_env
   from src.tasks.supermimic.mdp.motion_lib import _resolve_motion_files
-  from src.tasks.supermimic.rl.evaluation import load_policy, evaluate
+  from src.tasks.supermimic.rl.evaluation import load_policy, read_checkpoint_config, evaluate
   files = _resolve_motion_files(args.motion_file)
   base = Path(args.run_dir) if args.run_dir else Path(args.checkpoint_file).parent
   folder = Path(args.output_dir) if args.output_dir else base / "evaluation"
   folder.mkdir(parents=True, exist_ok=True)
-  env = make_env(files, num_envs=len(files), device=args.device, evaluation=True)
+  env, depth_enabled = None, None
   diagnostic = (args.noise_mode != "none" or args.seeds is not None
                 or args.action_noise is not None or args.action_clip is not None)
   try:
     while True:
       checkpoints = [Path(args.checkpoint_file)] if args.checkpoint_file else sorted((base / "checkpoints").glob("ckpt_*.pt"))
       for checkpoint in checkpoints:
+        report = folder / f"{checkpoint.stem}.json"
+        if not diagnostic and args.run_dir and report.exists():
+          continue
+        saved_cfg = read_checkpoint_config(checkpoint)
+        if env is None or depth_enabled != saved_cfg.depth_enabled:
+          if env is not None:
+            env.close()
+            env = None
+          depth_enabled = saved_cfg.depth_enabled
+          env = make_env(files, num_envs=len(files), device=args.device, evaluation=True,
+                         depth_enabled=depth_enabled)
         if diagnostic:
           policy, cfg, ck = load_policy(checkpoint, env)
           evaluate_noise_modes(env, policy, cfg, ck, checkpoint, folder, args, evaluate)
-          continue
-        report = folder / f"{checkpoint.stem}.json"
-        if args.run_dir and report.exists():
           continue
         policy, cfg, ck = load_policy(checkpoint, env)
         result = evaluate(env, policy, cfg, folder / checkpoint.stem if args.record else None)
@@ -157,7 +165,8 @@ def main():
         break
       time.sleep(30)
   finally:
-    env.close()
+    if env is not None:
+      env.close()
 
 
 if __name__ == "__main__":

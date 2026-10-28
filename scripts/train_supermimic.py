@@ -26,6 +26,8 @@ def main():
     parser.add_argument("--" + name, type=float)
   parser.add_argument("--amp", choices=("none", "bf16"))
   parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=None)
+  parser.add_argument("--depth-enabled", action=argparse.BooleanOptionalAction, default=None,
+                      help="Use visual SuperMimic (default: rl_cfg.py; resume uses checkpoint)")
   parser.add_argument("--enable-warmup", action=argparse.BooleanOptionalAction, default=None,
                       help="Enable the WM-only phase (default: enabled); initial replay filling "
                            "always runs. On resume, use the saved setting unless overridden.")
@@ -42,14 +44,14 @@ def main():
   from dataclasses import asdict
   from src.tasks.supermimic.config import make_env
   from src.tasks.supermimic.config.g1.rl_cfg import (
-    SuperMimicConfig, migrate_legacy_run_name, unitree_g1_supermimic_runner_cfg,
+    SuperMimicConfig, migrate_checkpoint_config, unitree_g1_supermimic_runner_cfg,
   )
   from src.tasks.supermimic.rl.runner import SuperMimicRunner
   defaults = asdict(unitree_g1_supermimic_runner_cfg())
   local_settings = {name: defaults[name] for name in
                     ("collect_det_frac", "bin_ema", "softmax_cap", "pi_clip", "pi_clip_value")}
   if args.resume:
-    defaults.update(migrate_legacy_run_name(
+    defaults.update(migrate_checkpoint_config(
       torch.load(args.resume, map_location="cpu", weights_only=False)["config"]))
   # These settings are configured in rl_cfg.py, including on resume.
   defaults.update(local_settings)
@@ -65,7 +67,7 @@ def main():
   if args.device.startswith("cuda") and not torch.cuda.is_available():
     raise RuntimeError("SuperMimic GPU training requires an available NVIDIA CUDA device")
   env = make_env(args.motion_file, num_envs=cfg.num_envs, device=args.device,
-                 gamma=cfg.gamma, seed=cfg.seed)
+                 gamma=cfg.gamma, seed=cfg.seed, depth_enabled=cfg.depth_enabled)
   runner = None
   exit_code = 1
   try:

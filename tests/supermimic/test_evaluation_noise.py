@@ -164,7 +164,8 @@ def test_all_modes_reports_and_cached_run_directory(cli, tmp_path):
 
 @pytest.mark.parametrize("diagnostic", [False, True])
 @pytest.mark.parametrize("fail", [False, True])
-def test_cli_keeps_legacy_default_and_closes_environment(cli, tmp_path, monkeypatch, diagnostic, fail):
+@pytest.mark.parametrize("visual", [False, True])
+def test_cli_keeps_legacy_default_and_closes_environment(cli, tmp_path, monkeypatch, diagnostic, fail, visual):
   calls, env_options = [], []
   closed = []
   env = NS(close=lambda: closed.append(True))
@@ -177,6 +178,7 @@ def test_cli_keeps_legacy_default_and_closes_environment(cli, tmp_path, monkeypa
   motion_module._resolve_motion_files = lambda path: ["a.npz", "b.npz"]
   eval_module = ModuleType("src.tasks.supermimic.rl.evaluation")
   eval_module.load_policy = lambda *args: (None, small_config(), {"iteration": 42})
+  eval_module.read_checkpoint_config = lambda *args: small_config(depth_enabled=visual)
   def score(*args, **kwargs):
     calls.append(kwargs)
     if fail:
@@ -204,5 +206,5 @@ def test_cli_keeps_legacy_default_and_closes_environment(cli, tmp_path, monkeypa
     else:
       assert calls == [{}]
       assert (tmp_path / "ckpt.json").exists() and (tmp_path / "eval.csv").exists()
-  assert env_options == [dict(num_envs=2, device="cpu", evaluation=True)]
+  assert env_options == [dict(num_envs=2, device="cpu", evaluation=True, depth_enabled=visual)]
   assert closed == [True]

@@ -6,18 +6,23 @@ import numpy as np
 import torch
 
 from . import networks
-from ..config.g1.rl_cfg import SuperMimicConfig, migrate_legacy_run_name
+from ..config.g1.rl_cfg import SuperMimicConfig, migrate_checkpoint_config
 from .networks import Policy
 from .runner import PolicyController, check_manifest, motion_manifest
 from ..mdp.state import GOAL_FRAME_DIM, OBS_DIM, read_state, flatten_state
 
 
+def read_checkpoint_config(checkpoint):
+  ck = torch.load(checkpoint, map_location="cpu", weights_only=False)
+  return SuperMimicConfig(**migrate_checkpoint_config(ck["config"]))
+
+
 def load_policy(checkpoint, env):
   ck = torch.load(checkpoint, map_location=env.device, weights_only=False)
   check_manifest(ck["motions"], motion_manifest(env.command_manager.get_term("motion").motion))
-  cfg = SuperMimicConfig(**migrate_legacy_run_name(ck["config"]))
+  cfg = SuperMimicConfig(**migrate_checkpoint_config(ck["config"]))
   networks.AMP_DTYPE = torch.bfloat16 if cfg.amp == "bf16" else None
-  policy = Policy(OBS_DIM, GOAL_FRAME_DIM * cfg.goal_frames, cfg.hist, hidden=cfg.policy_hidden).to(env.device)
+  policy = Policy(OBS_DIM, GOAL_FRAME_DIM * cfg.goal_frames, cfg.hist, hidden=cfg.policy_hidden, depth_cfg=cfg).to(env.device)
   policy.load_state_dict(ck["algorithm"]["policy"])
   return policy.eval(), cfg, ck
 

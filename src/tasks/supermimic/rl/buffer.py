@@ -11,7 +11,7 @@ FIELDS = {"s": (STATE_DIM, torch.float32), "s1": (STATE_DIM, torch.float32),
 
 
 class ReplayBuffer:
-  def __init__(self, capacity, num_envs, xi, clip_end, clip_id, horizon):
+  def __init__(self, capacity, num_envs, xi, clip_end, clip_id, horizon, depth_history_length=0):
     self.capacity, self.num_envs = capacity, num_envs
     self.xi = xi.detach().clone()  # startup parameters, immutable until buffer recreation
     self.device = xi.device
@@ -21,9 +21,17 @@ class ReplayBuffer:
     self.eligible = torch.zeros(capacity, num_envs, dtype=torch.bool, device=self.device)
     self.ptr = self.size = 0
     self._window_choices = {}
+    self.depth_history_length = depth_history_length
+    self.depth = None
+    if depth_history_length:
+      from .depth_buffer import DepthReplay
+      self.depth = DepthReplay(capacity, num_envs, self.device)
 
   @torch.no_grad()
   def add(self, transition):
+    if self.depth is not None:
+      self.depth.add(self.ptr, transition["depth"], transition["depth_next"],
+                     transition["terminated"] | transition["truncated"])
     for key in FIELDS:
       self.data[key][self.ptr].copy_(transition[key])
     f = transition["f"]
@@ -78,6 +86,10 @@ class ReplayBuffer:
     out["mask"] = torch.cat((torch.ones(batch, 1, device=self.device),
                               (~done[:, :-1]).float()), -1).cumprod(-1)
     out["xi"] = self.xi[envs].expand(-1, length, -1)
+    if self.depth is not None:
+      out["depth_history"] = self.depth.history(self, ages[:, 0], envs[:, 0],
+                                                self.depth_history_length)
+      out["depth_next"] = self.depth.next_frames(rows, envs)
     return out
 
   def sample_starts(self, batch, history):
@@ -97,4 +109,6 @@ class ReplayBuffer:
     hist = {k: self.data[k][rows, envs[:, None]] for k in keys}
     start["xi"] = self.xi[envs]
     hist["xi"] = self.xi[envs, None].expand(-1, history, -1)
+    if self.depth is not None:
+      start["depth_history"] = self.depth.history(self, age, envs, self.depth_history_length)
     return start, hist

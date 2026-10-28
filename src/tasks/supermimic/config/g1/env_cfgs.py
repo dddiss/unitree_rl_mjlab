@@ -1,4 +1,4 @@
-"""Unitree G1 flat tracking environment configurations."""
+"""Unitree G1 SuperMimic environment with P-BFM collision terrain."""
 
 from src.assets.robots.unitree_g1.g1_constants import (
   G1_ACTION_SCALE,
@@ -10,13 +10,21 @@ from mjlab.sensor import ContactMatch, ContactSensorCfg
 from src.tasks.supermimic.mdp import MotionCommandCfg
 
 from src.tasks.supermimic.tracking_env_cfg import make_tracking_env_cfg
+from .terrain_cfg import unitree_g1_terrain_cfg
+from ...terrain.pattern import RobotCentricGridPatternCfg
+from ...terrain.reset import TerrainResetCfg
+from ...terrain.sensor import PbfmTerrainHeightSensorCfg
+from mjlab.sensor import ObjRef
 
 
 def unitree_g1_flat_tracking_env_cfg(
   play: bool = False,
+  depth_camera=None,
+  terrain_type: str | None = None,
 ) -> ManagerBasedRlEnvCfg:
-  """Create Unitree G1 flat terrain tracking configuration."""
+  """Create G1 tracking configuration (legacy factory name retained)."""
   cfg = make_tracking_env_cfg()
+  cfg.scene.terrain = unitree_g1_terrain_cfg(terrain_type)
 
   cfg.scene.entities = {"robot": get_g1_robot_cfg()}
 
@@ -30,6 +38,8 @@ def unitree_g1_flat_tracking_env_cfg(
     history_length=4,
   )
   cfg.scene.sensors = (self_collision_cfg,)
+  if depth_camera is not None:
+    cfg.scene.sensors += (depth_camera.sensor_cfg(),)
 
   joint_pos_action = cfg.actions["joint_pos"]
   assert isinstance(joint_pos_action, JointPositionActionCfg)
@@ -37,6 +47,14 @@ def unitree_g1_flat_tracking_env_cfg(
 
   motion_cmd = cfg.commands["motion"]
   assert isinstance(motion_cmd, MotionCommandCfg)
+  if cfg.scene.terrain.terrain_type == "generator":
+    motion_cmd.terrain_reset = TerrainResetCfg()
+    cfg.scene.sensors += (PbfmTerrainHeightSensorCfg(
+      name=motion_cmd.terrain_reset.sensor_name,
+      frame=ObjRef(type="body", name="pelvis", entity="robot"),
+      pattern=RobotCentricGridPatternCfg(), ray_alignment="yaw",
+      include_geom_groups=(5,), reduction="none",
+    ),)
   motion_cmd.anchor_body_name = "pelvis"
   motion_cmd.body_names = (
     "pelvis",

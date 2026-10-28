@@ -14,6 +14,10 @@ from .algorithm import SuperMimicAlgorithm
 from .buffer import ReplayBuffer
 from .logging import TrainingLogger, format_terminal_summary
 from .metrics import LEGACY_FIELDS, PERFORMANCE_FIELDS, SAMPLING_FIELDS, IntervalMetrics, sampling_metrics
+from ..perception.history import DepthHistory, select_history
+from ..config.g1.rl_cfg import SuperMimicConfig, migrate_checkpoint_config
+
+VISUAL_FIELDS = ("wm_depth_loss", "wm_total_loss")
 
 
 def motion_manifest(motion):
@@ -44,6 +48,8 @@ class PolicyController:
     self.history = torch.zeros(env.num_envs, cfg.hist, OBS_DIM, device=env.device)
     self.version = torch.full_like(env.reset_version, -1)
     self.steps = torch.full_like(env.episode_length_buf, -1)
+    self.depth_history = (DepthHistory(env.num_envs, cfg.depth_history_length, env.device)
+                          if cfg.depth_enabled else None)
 
   @torch.no_grad()
   def __call__(self, observations=None):
@@ -67,6 +73,9 @@ class PolicyController:
       self.policy.goal_norm.update(goal[advanced])
     self.version.copy_(e.reset_version)
     self.steps.copy_(e.episode_length_buf)
+    if self.depth_history is not None:
+      depth = self.depth_history.update(e.depth_image, fresh, advanced)
+      return self.policy(self.history, goal, select_history(depth, self.cfg.depth_frames, self.cfg.depth_skip))
     return self.policy(self.history, goal)
 
 
@@ -81,7 +90,8 @@ class SuperMimicRunner:
     self.command.sampler.softmax_cap = cfg.softmax_cap
     self.motion = self.command.motion
     self.buffer = ReplayBuffer(cfg.buffer_steps, env.num_envs, env.context,
-                               self.motion.clip_end, self.motion.clip_id, cfg.horizon)
+                               self.motion.clip_end, self.motion.clip_id, cfg.horizon,
+                               cfg.depth_history_length if cfg.depth_enabled else 0)
     self.controller = PolicyController(env, self.algorithm.policy, cfg, noise=True, update_norm=True)
     self.iteration = self.sim_steps = self.env_steps = 0
     self.step_acc = self.wall_offset = 0.0
@@ -143,7 +153,7 @@ class SuperMimicRunner:
 
   def save(self, path):
     checkpoint = {
-      "format_version": 1, "algorithm": self.algorithm.state_dict(),
+      "format_version": 2 if self.cfg.depth_enabled else 1, "algorithm": self.algorithm.state_dict(),
       "config": asdict(self.cfg), "motions": motion_manifest(self.motion),
       "sampler": self.command.sampler.state_dict(), "iteration": self.iteration,
       "sim_steps": self.sim_steps, "env_steps": self.env_steps, "step_acc": self.step_acc,
@@ -157,13 +167,14 @@ class SuperMimicRunner:
   def load(self, path):
     ck = torch.load(path, map_location=self.env.device, weights_only=False)
     check_manifest(ck["motions"], motion_manifest(self.motion))
-    saved_cfg, current_cfg = dict(ck["config"]), asdict(self.cfg)
+    saved_cfg = asdict(SuperMimicConfig(**migrate_checkpoint_config(ck["config"])))
+    current_cfg = asdict(self.cfg)
     # Scheduling, logging, precision, collection mix, sampling and actor clipping may change without
     # reinterpreting weights. Replay is refilled after loading.
     mutable = {"iterations", "num_envs", "ckpt_every", "log_every", "amp", "compile",
                "buffer_steps", "warmup_steps", "enable_warmup", "logger", "wandb_project",
                "wandb_entity", "wandb_mode", "log_dir", "run_name", "collect_det_frac", "bin_ema",
-               "softmax_cap", "pi_clip", "pi_clip_value"}
+               "softmax_cap", "pi_clip", "pi_clip_value", "depth_checkpoint", "depth_batch_size"}
     for key in current_cfg:
       if key not in mutable and current_cfg[key] != saved_cfg[key]:
         raise ValueError(f"Resume configuration changed {key}; use the checkpoint configuration")
@@ -249,6 +260,8 @@ class SuperMimicRunner:
     row = {"iteration": self.iteration, "wall_h": (self.wall_offset + time.monotonic() - self._started) / 3600,
            "sim_steps": self.sim_steps, "env_steps": self.env_steps, "lr": lr}
     row.update({key: float(np.mean(self.stats[key])) if self.stats.get(key) else "" for key in LEGACY_FIELDS[5:]})
+    if self.cfg.depth_enabled:
+      row.update({key: float(np.mean(self.stats[key])) if self.stats.get(key) else "" for key in VISUAL_FIELDS})
     row.update(self.interval_metrics.values())
     row.update(sampling_metrics(self.command))
     now = time.monotonic()
@@ -279,6 +292,8 @@ class SuperMimicRunner:
   def _start_logging(self):
     if self.logger is None:
       fields = LEGACY_FIELDS + self.interval_metrics.fields + SAMPLING_FIELDS + PERFORMANCE_FIELDS
+      if self.cfg.depth_enabled:
+        fields += VISUAL_FIELDS
       self.logger = TrainingLogger(self.log_dir, self.cfg, fields,
                                    resume_checkpoint=self._resume_checkpoint, start_iteration=self.iteration)
 

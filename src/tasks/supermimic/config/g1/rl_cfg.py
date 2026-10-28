@@ -20,6 +20,18 @@ class SuperMimicConfig:
   pi_clip: float = 1.0 / 32  # Actor global gradient norm, after loss / horizon.
   pi_clip_value: float = 0.1 / 32  # Actor per-element gradient bound.
   lr: float = 2e-4
+  depth_enabled: bool = True
+  depth_frames: int = 8
+  depth_skip: int = 5
+  depth_latent_dim: int = 256
+  depth_frame_dim: int = 256
+  depth_checkpoint: bool = True  # Recompute visual activations during BPTT to save memory.
+  depth_batch_size: int = 256  # Bound CNN workspace for large critic minibatches.
+  depth_loss_weight: float = 1.0  # Normalized pixel MSE, summed over valid WM steps.
+  actor_perception_lr: float = 2e-4
+  wm_perception_lr: float = 2e-4
+  critic_perception_lr: float = 2e-4
+  depth_decoder_lr: float = 2e-4
   gamma: float = 0.99
   lam: float = 0.95
   action_noise: float = 0.1  # Gaussian std for environments with exploration noise.
@@ -55,6 +67,13 @@ class SuperMimicConfig:
         raise ValueError(f"{name} must be positive")
     if self.buffer_steps < self.wm_window:
       raise ValueError("buffer_steps must cover wm_window")
+    for name in ("depth_frames", "depth_skip", "depth_latent_dim", "depth_frame_dim", "depth_batch_size"):
+      if getattr(self, name) < 1:
+        raise ValueError(f"{name} must be positive")
+    for name in ("actor_perception_lr", "wm_perception_lr", "critic_perception_lr",
+                 "depth_decoder_lr", "depth_loss_weight"):
+      if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
+        raise ValueError(f"{name} must be finite and positive")
     for name in ("pi_clip", "pi_clip_value"):
       if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
         raise ValueError(f"{name} must be finite and positive")
@@ -79,6 +98,10 @@ class SuperMimicConfig:
     if self.run_name in (".", "..") or "/" in self.run_name or "\\" in self.run_name:
       raise ValueError("run_name must be a single directory name")
 
+  @property
+  def depth_history_length(self):
+    return (self.depth_frames - 1) * self.depth_skip + 1
+
 
 def migrate_legacy_run_name(config: dict) -> dict:
   """Read old checkpoint names without keeping a second naming option."""
@@ -91,3 +114,10 @@ def migrate_legacy_run_name(config: dict) -> dict:
 
 def unitree_g1_supermimic_runner_cfg() -> SuperMimicConfig:
   return SuperMimicConfig()
+
+
+def migrate_checkpoint_config(config: dict) -> dict:
+  """Old checkpoints predate vision; never reinterpret their weights as visual."""
+  config = migrate_legacy_run_name(config)
+  config.setdefault("depth_enabled", False)
+  return config

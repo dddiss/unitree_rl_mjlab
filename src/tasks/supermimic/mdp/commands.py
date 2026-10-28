@@ -20,6 +20,7 @@ from mjlab.utils.lab_api.math import (
 )
 from mjlab.viewer.debug_visualizer import DebugVisualizer
 
+from ..terrain.reset import TerrainResetCfg, place_on_terrain
 from .motion_lib import MotionLibrary, MotionReference
 from .sampling import ReturnBasedSampler
 
@@ -260,6 +261,10 @@ class MotionCommand(CommandTerm):
     self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
 
     root_state = torch.cat([root_pos, root_ori, root_lin_vel, root_ang_vel], dim=-1)
+    if self.cfg.terrain_reset is not None:
+      root_state = place_on_terrain(
+        self._env, self.robot, env_ids, root_state, self.cfg.terrain_reset,
+      )
     self.robot.write_root_state_to_sim(root_state, env_ids=env_ids)
     self.robot.reset(env_ids=env_ids)
 
@@ -647,6 +652,8 @@ class MotionCommandCfg(CommandTermCfg):
   # "uniform": uniform bins, then frames. "start": uniform clips, first frame.
   sampling_mode: Literal["uniform", "start", "return_based"] = "return_based"
   gamma: float = 0.99
+  # None retains the original plane reset. Geometry placement changes only Z.
+  terrain_reset: TerrainResetCfg | None = None
 
   @dataclass
   class VizCfg:

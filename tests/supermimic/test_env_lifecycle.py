@@ -37,7 +37,8 @@ def test_command_subset_dt_zero_and_last_frame():
   assert cmd.time_steps.tolist()==[3,3,5]
 
 
-def test_step_captures_state_and_target_before_command_advance():
+@pytest.mark.parametrize('visual', [False, True])
+def test_step_captures_state_and_target_before_command_advance(visual):
   events=[]
   ns=methods(ROOT/'src/tasks/supermimic/env.py','SuperMimicEnv',{'step'},
              {'torch':torch,'flatten_state':lambda x:x,'read_state':lambda e:e.state,
@@ -60,7 +61,14 @@ def test_step_captures_state_and_target_before_command_advance():
   def process(a): action.prev_action=action.action.clone();action.action=a.clone()
   action.process_action=process;e.action_manager=action
   def physics(): e.state+=1;events.append('physics')
-  e.sim=NS(step=physics,forward=lambda:events.append('forward'),sense=lambda:None)
+  e.sim=NS(step=physics,forward=lambda:events.append('forward'),sense=lambda:events.append('sense'))
+  if visual:
+    Env.depth_image=property(lambda self:self._depth_image)
+    e._depth_image=torch.zeros(2,18,32,dtype=torch.uint8)
+    def read_depth():
+      events.append('depth')
+      return e.state[:,0,None,None].to(torch.uint8).expand(-1,18,32).clone()
+    e._depth_camera=NS(read=read_depth)
   e.scene=NS(write_data_to_sim=lambda:None,update=lambda dt:None)
   e.metrics_manager=NS(compute_substep=lambda:None,compute=lambda:None)
   def term(): events.append('termination');return torch.tensor([True,False])
@@ -84,6 +92,12 @@ def test_step_captures_state_and_target_before_command_advance():
   assert cmd.metrics['error_anchor_pos'].tolist()==[0.,1.]
   torch.testing.assert_close(e.last_step_metrics['reward']['tracking'],tr['r'])
   assert e._manual_reset_pending.tolist()==[True,False]
+  if visual:
+    assert events.index('sense')<events.index('depth')
+    assert tr['depth'].eq(0).all() and tr['depth_next'].eq(4).all()
+    # A terminal row's supervision must survive the subsequent reset image.
+    e._depth_image[0].zero_()
+    assert tr['depth_next'][0].eq(4).all()
   e.state.zero_()
   assert tr['s1'].eq(4).all()
   with pytest.raises(RuntimeError):e.step(torch.zeros(2,29))
