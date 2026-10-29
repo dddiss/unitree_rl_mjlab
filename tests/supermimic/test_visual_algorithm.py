@@ -26,7 +26,7 @@ def visual_buffer(mdp,cfg):
   return b,transitions
 
 
-def test_eight_step_wm_reencodes_predictions_and_backpropagates(mdp):
+def test_eight_step_wm_reencodes_predictions_and_backpropagates(mdp,monkeypatch):
   torch.set_num_threads(2)
   cfg=visual_config(wm_window=8,depth_frames=8,depth_skip=5)
   alg=SuperMimicAlgorithm(mdp,cfg,'cpu')
@@ -34,7 +34,11 @@ def test_eight_step_wm_reencodes_predictions_and_backpropagates(mdp):
   for tr in transitions:alg.observe(tr,buffer.xi)
   window=buffer.sample_windows(2,8,strict=True)
   seen,images=[],[]
-  h1=alg.wm.depth_encoder.register_forward_pre_hook(lambda m,a:seen.append(a[0].detach().clone()))
+  step=alg.wm.step_visual
+  def capture(*args,**kwargs):
+    seen.append(kwargs['depth_features'].detach().clone())
+    return step(*args,**kwargs)
+  monkeypatch.setattr(alg.wm,'step_visual',capture)
   def save_image(m,a,o):
     o.retain_grad();images.append(o)
   h2=alg.wm.depth_decoder.register_forward_hook(save_image)
@@ -42,10 +46,12 @@ def test_eight_step_wm_reencodes_predictions_and_backpropagates(mdp):
     states,predicted=alg._rollout(window['s'],window['a'],window['xi'],window['depth_history'])
     # Last-step image loss must reach the first generated image through re-encoding.
     predicted[:,-1].square().mean().backward()
-  finally:h1.remove();h2.remove()
+  finally:h2.remove()
   assert len(seen)==len(images)==8
-  for t in range(1,8): torch.testing.assert_close(seen[t][:,-1],images[t-1].detach())
-  torch.testing.assert_close(seen[6][:,-2],images[0].detach())  # five-step spacing
+  with torch.no_grad():
+    features=[alg.wm.depth_encoder.encode_frames(image.detach()) for image in images]
+  for t in range(1,8): torch.testing.assert_close(seen[t][:,-1],features[t-1])
+  torch.testing.assert_close(seen[6][:,-2],features[0])  # five-step spacing
   assert images[0].grad is not None and images[0].grad.abs().sum()>0
   assert all(torch.isfinite(x).all() for x in states)
   before=copy.deepcopy(alg.policy.state_dict())
@@ -82,7 +88,12 @@ def test_visual_short_motion_bootstrap_uses_unpadded_depth_history(mdp):
   class Fixed:
     def sample_starts(self,*args):return start,hist
   seen=[]
-  hook=alg.critic.register_forward_pre_hook(lambda m,a:seen.append((a[0].detach().clone(),a[1].detach().clone())))
+  def capture(m,args,kwargs):
+    features=kwargs.get('depth_features')
+    if features is None:
+      with torch.no_grad():features=m.depth_encoder.encode_frames(args[1])
+    seen.append((args[0].detach().clone(),features.detach().clone()))
+  hook=alg.critic.register_forward_pre_hook(capture,with_kwargs=True)
   try:alg.policy_update(Fixed())
   finally:hook.remove()
   # Bootstrap vs lambda-return values, which are evaluated one time slice at a time.
@@ -128,7 +139,7 @@ def test_compiled_visual_rollout_matches_eager_gradients(mdp):
   w=b.sample_windows(2,cfg.wm_window,strict=True)
   image=w['depth_history'].float().div(255).requires_grad_()
   other=image.detach().clone().requires_grad_()
-  compiled=torch.compile(alg._rollout,backend='aot_eager')
+  compiled=torch.compile(alg._rollout,backend='aot_eager',fullgraph=True)
   try:
     state,depth=alg._rollout(w['s'],w['a'],w['xi'],image)
     got_state,got_depth=compiled(w['s'],w['a'],w['xi'],other)
