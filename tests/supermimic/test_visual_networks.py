@@ -6,11 +6,11 @@ from supermimic.rl.depth_encoder import DepthEncoder, WindowGRU
 from supermimic.config.g1.rl_cfg import SuperMimicConfig
 
 
-def test_default_architecture_and_three_independent_encoders():
+def test_default_architecture_with_shared_encoder():
   cfg=SuperMimicConfig()
-  p=Policy(93,640,hidden=(16,),depth_cfg=cfg)
   w=WorldModel((16,),depth_cfg=cfg)
-  v=Critic(847,(16,),depth_cfg=cfg)
+  p=Policy(93,640,hidden=(16,),depth_cfg=cfg,depth_encoder=w.depth_encoder)
+  v=Critic(847,(16,),depth_cfg=cfg,depth_encoder=w.depth_encoder)
   assert p.dec[0].in_features==1218
   assert w.net[0].in_features==389 and v.net[0].in_features==1103
   encoders=[m.depth_encoder for m in (p,w,v)]
@@ -19,7 +19,8 @@ def test_default_architecture_and_three_independent_encoders():
     assert e.frame_projection[1].out_features==256
     assert e.gru.input_size==e.gru.hidden_size==256 and e.gru.num_layers==1
   sets=[{id(x) for x in e.parameters()} for e in encoders]
-  assert not (sets[0]&sets[1] or sets[0]&sets[2] or sets[1]&sets[2])
+  assert encoders[0] is encoders[1] is encoders[2]
+  assert sets[0]==sets[1]==sets[2]
   with torch.no_grad():
     image=torch.randint(256,(1,8,18,32),dtype=torch.uint8)
     assert p(torch.zeros(1,10,93),torch.zeros(1,640),image).shape==(1,29)

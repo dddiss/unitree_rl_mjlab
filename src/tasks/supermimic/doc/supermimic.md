@@ -269,7 +269,7 @@ python scripts/train_supermimic.py \
 | `--no-compile` | 默认开启编译 | 关闭 `torch.compile` |
 | `--no-depth-enabled` | 默认启用视觉 | 新训练使用无视觉网络；恢复默认遵循 checkpoint |
 
-新训练默认启用视觉 SuperMimic。Actor、WM、Critic 分别使用自己的 CNN＋GRU，参数互不共享；Actor 的动作参考编码器仍为 `640→32`，视觉 latent 接入动作解码器。默认 Actor 解码器输入 1218 维、WM 输入 389 维、Critic 输入 1103 维。数值观测继续使用原来的 RunningNorm；图像归一化到 `[0,1]`，视觉 latent 不加入数值 RunningNorm。
+新训练默认启用视觉 SuperMimic。Actor、WM、Critic 共享同一份 CNN＋GRU，输出历史表征 `h`；共享参数只由 WM 优化器更新。Actor 的动作参考编码器仍为 `640→32`，视觉 latent 接入动作解码器。默认 Actor 解码器输入 1218 维、WM 输入 389 维、Critic 输入 1103 维。数值观测继续使用原来的 RunningNorm；图像归一化到 `[0,1]`，视觉 latent 不加入数值 RunningNorm。
 
 相机使用 P-BFM G1 的固定安装位姿和光轴深度定义，原图 `36×64`，距离上限 2.5 m，裁剪、Gaussian blur 后得到 `18×32`。当前接入固定外参、零传感器延迟，不增加相机随机化，也不改变已有机器人随机化。图像每个控制步采集，历史按 `35、30、25、20、15、10、5、0` 的年龄选出 8 帧（50 Hz 时覆盖 0.7 s）。因此零延迟实现保留 36 帧即可；P-BFM 用于容纳额外 1 帧延迟的第 37 帧不在本次输入中。相机参数在 `perception/camera.py` 的 `DepthCameraCfg` 定义，由 G1 环境工厂接入。
 
@@ -283,20 +283,24 @@ depth_frames: int = 8
 depth_skip: int = 5
 depth_frame_dim: int = 256
 depth_latent_dim: int = 256
-actor_perception_lr: float = 2e-4
 wm_perception_lr: float = 2e-4
-critic_perception_lr: float = 2e-4
 depth_decoder_lr: float = 2e-4
+state_loss_weight: float = 1.0
+latent_loss_weight: float = 1.0
 depth_loss_weight: float = 1.0
 depth_checkpoint: bool = True
 depth_batch_size: int = 256
 ```
 
-这些感知学习率独立于 `--lr`，各自沿用相同的余弦衰减倍率。CNN 通道为 `16→32→64`、步长为 `1→2→1`，池化到 `2×4` 后投影到 256 维，单层 GRU 输出 256 维，对齐 P-BFM 的最终 G1 配置。`depth_checkpoint` 表示反向传播时重新计算视觉激活以节省显存，不是模型保存开关；`depth_batch_size` 限制单次编码的样本数，不改变学习器 batch 或更新次数。当前 BF16 设置用于原有 MLP，深度 CNN、GRU、解码器及图像缓存计算采用 FP32/uint8。
+共享感知和 Decoder 的学习率独立于 `--lr`，沿用相同的余弦衰减倍率；Actor/Critic 优化器仅包含各自的非共享参数。CNN 通道为 `16→32→64`、步长为 `1→2→1`，池化到 `2×4` 后投影到 256 维，单层 GRU 输出 256 维，对齐 P-BFM 的最终 G1 配置。`depth_checkpoint` 表示反向传播时重新计算视觉激活以节省显存，不是模型保存开关；`depth_batch_size` 限制单次编码的样本数，展开后的批量解码最多每块处理 `depth_batch_size × depth_frames` 张图，不改变学习器 batch 或更新次数。当前 BF16 设置用于原有 MLP，深度 CNN、GRU、解码器及图像缓存计算采用 FP32/uint8。
 
-WM 的 8 步自回归同时预测机器人状态与下一帧图像：起点使用经验池中的真实图像历史，之后每步把预测图像加入历史，再经过 WM 自己的 CNN＋GRU 输入下一步。真实未来图像只作为监督目标，不在展开中替换预测图像。Actor 的想象展开采用同样流程；Actor、WM、Critic读取相同的图像历史，但各自重新编码。预测图像保持浮点和梯度，不做 uint8 量化。WM 的视觉输出是解码用中间特征，不直接替代下一步的 GRU 输出，也不额外对两者做 latent L2。
+WM 的 8 步自回归同时预测机器人状态与下一步历史表征 `h`：起点使用经验池中的真实图像历史，经共享 CNN＋GRU 编码为 `h0`；之后直接递推预测的 `h`，展开结束后才批量解码各步深度图。真实未来历史通过同一个编码器生成停止梯度的表征监督目标，不在展开中替换预测值。WM 损失通过初始 `h0` 回传到共享 CNN＋GRU。
 
-WM 总损失为原状态损失加 `depth_loss_weight × 深度损失`。深度损失先对归一化图像的像素求 MSE，再按现有 WM 终止掩码对有效时间步求和、对 batch 求平均；终止那一步包含真实下一帧，其后跨 episode 的图像不参与损失。奖励、终止阈值、采样算法、Actor 损失除以固定 horizon 和 motion end 自举方式保持不变。
+Actor 的想象展开同样直接递推 `h`，全程不解码图像、不重新运行 CNN＋GRU。WM 和 Critic 参数在 Actor 更新时冻结，但保留预测状态、`h` 和自举价值对动作的梯度。Critic 使用停止梯度的想象状态与 `h` 更新自己的网络，共享感知参数不参与其梯度裁剪或优化。真实采集和播放仍用真实深度历史编码 `h`，播放无需运行 WM。
+
+WM 总损失为 `state_loss_weight × 状态损失 + latent_loss_weight × 表征一致性损失 + depth_loss_weight × 深度损失`，三个权重均可设为非负值。状态误差缩放保持原样；表征误差对 latent 维度求 MSE，深度误差对归一化图像像素求 MSE，然后各自按现有终止掩码对有效时间步求和、对 batch 求平均。终止那一步包含真实下一帧，其后跨 episode 的数据不参与损失。日志新增 `Loss/wm_latent_loss`；分项日志是未乘权重且除以窗口长度的值，`Loss/wm_total_loss` 使用加权总和。奖励、终止阈值、采样算法、Actor 损失除以固定 horizon 和 motion end 自举方式保持不变。
+
+新视觉 checkpoint 使用格式 3。旧视觉 checkpoint 的 WM 输出代表图像解码中间变量，无法直接恢复为历史表征预测，因此需要重新训练；旧策略仍可用于播放和评估。无视觉 checkpoint 的兼容方式不变。
 
 经验池每条 transition 只存一张当前 uint8 深度图；普通下一帧由相邻记录复用，终止前下一帧另存在可回收池中，最新 transition 的下一帧暂存。历史不跨 reset 或环形覆盖边界；缺少历史时重复最早可用的同回合图像。4096 环境、1000 步的主图像缓存约 2.20 GiB，此外还有终止图像、索引、网络和反向传播开销；该数值不是总显存，4096 环境下的峰值需在实际 GPU 上测量。首次运行可先降低 `--num-envs`、`--wm-batch`、`--pi-batch` 检查实际资源占用。
 
@@ -367,7 +371,7 @@ python scripts/train_supermimic.py \
 
 无视觉 Critic 已移除独立重复的 6 维根相对朝向，并加入 29 维上一动作（无历史）；未来参考目标中的朝向保留，无视觉 Critic 输入为 847 维，视觉版加自己的 256 维图像 latent。此前 824 维 Critic 的 checkpoint 不能直接完整恢复训练。
 
-视觉 checkpoint 保存三套独立编码器、深度解码器及优化器状态。恢复仍重新填充经验池和历史，不保存图像经验池。旧 checkpoint 缺少 `depth_enabled` 时按无视觉版加载，可以继续原有评估、播放与兼容架构的恢复训练；不能把旧模型直接当作视觉模型恢复。评估和播放会在创建环境前读取 checkpoint 配置，自动决定是否加载深度传感器。
+视觉 checkpoint 保存共享 CNN＋GRU、WM、Actor、Critic、深度解码器及优化器状态。恢复仍重新填充经验池和历史，不保存图像经验池。新视觉训练只能从格式 3 的兼容 checkpoint 恢复；旧视觉策略仍可评估和播放。旧 checkpoint 缺少 `depth_enabled` 时按无视觉版加载，可以继续原有评估、播放与兼容架构的恢复训练；不能把旧模型直接当作视觉模型恢复。评估和播放会在创建环境前读取 checkpoint 配置，自动决定是否加载深度传感器。
 
 恢复时可覆盖总迭代数、环境数量、缓存容量、日志/保存周期、初始填充步数、预热开关、编译/精度配置，以及第 3.4 节中的全部 W&B/日志选项；`collect_det_frac` 和 `bin_ema` 始终读取当前 `rl_cfg.py`。其余算法与网络配置应保持 checkpoint 原值。省略参数时沿用 checkpoint 的设置，旧 checkpoint 没有的新日志选项使用当前默认值。
 

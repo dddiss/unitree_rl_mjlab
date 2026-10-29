@@ -35,20 +35,21 @@ class VisualTensorEnv(TensorEnv):
 def test_visual_train_resume_and_evaluate(mdp,tmp_path):
   torch.set_num_threads(2)
   cfg=visual_config(iterations=2,warmup_steps=4,wm_only_iters=1,ckpt_every=1,log_every=1,
-                    actor_perception_lr=1e-4,wm_perception_lr=3e-4)
+                    wm_perception_lr=3e-4,latent_loss_weight=.3)
   runner=SuperMimicRunner(VisualTensorEnv(mdp),cfg,tmp_path/'run')
   runner.learn()
   with (tmp_path/'run/train_log.csv').open() as f:rows=list(csv.DictReader(f))
-  assert all(float(row['wm_depth_loss'])>0 for row in rows)
+  assert all(float(row['wm_depth_loss'])>0 and float(row['wm_latent_loss'])>0 for row in rows)
   checkpoint=tmp_path/'run/last.pt'
   saved=read_checkpoint_config(checkpoint)
-  assert saved.depth_enabled and saved.actor_perception_lr==1e-4
+  assert saved.depth_enabled and saved.wm_perception_lr==3e-4 and saved.latent_loss_weight==.3
   weights={k:v.clone() for k,v in runner.algorithm.policy.state_dict().items()}
   cfg.iterations=3
   resumed=SuperMimicRunner(VisualTensorEnv(mdp),cfg,tmp_path/'resume')
   resumed.load(checkpoint)
   assert resumed.buffer.size==0 and resumed.buffer.depth.latest==-1
   for k,v in weights.items():torch.testing.assert_close(v,resumed.algorithm.policy.state_dict()[k])
+  assert resumed.algorithm.wm.depth_encoder is resumed.algorithm.policy.depth_encoder is resumed.algorithm.critic.depth_encoder
   resumed.learn()
   assert resumed.iteration==3 and resumed.buffer.size>=cfg.warmup_steps
   policy,loaded,_=load_policy(checkpoint,VisualTensorEnv(mdp))
@@ -115,3 +116,22 @@ def test_real_visual_environment_training_and_partial_reset(mdp,tmp_path):
     runner=Runner(env,cfg,tmp_path/'gpu');runner.learn()
     assert runner.iteration==2
   finally:env.close()
+
+
+def test_old_visual_checkpoint_rejected_for_resume_but_policy_still_loads(mdp,tmp_path):
+  cfg=visual_config()
+  runner=SuperMimicRunner(VisualTensorEnv(mdp),cfg,tmp_path/'run')
+  path=tmp_path/'old_visual.pt'
+  runner.save(path)
+  ck=torch.load(path,weights_only=False)
+  ck['format_version']=2
+  ck['config']['actor_perception_lr']=1e-4
+  ck['config']['critic_perception_lr']=1e-4
+  ck['config'].pop('latent_loss_weight')
+  torch.save(ck,path)
+  with pytest.raises(ValueError,match='Legacy visual checkpoint'):
+    runner.load(path)
+  policy,config,_=load_policy(path,VisualTensorEnv(mdp))
+  assert config.depth_enabled
+  for key,value in runner.algorithm.policy.state_dict().items():
+    torch.testing.assert_close(policy.state_dict()[key],value)

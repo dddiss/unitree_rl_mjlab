@@ -11,13 +11,13 @@ from torch import nn
 from ..mdp.state import GOAL_FRAME_DIM, INV_DIM, OBS_DIM, normalize_xi, unflatten_state
 from . import networks
 from .networks import WorldModel, Policy, Critic
-from ..perception.history import window_from_frames
+from ..perception.history import select_history
 from ..perception.preprocessing import depth_float
 
 
-def parameter_groups(model, lr, visual_groups=()):
+def parameter_groups(model, lr, visual_groups=(), excluded=()):
   """Keep each parameter in exactly one optimizer group with its own base LR."""
-  groups, excluded = [], set()
+  groups, excluded = [], {id(p) for p in excluded}
   for module, rate in visual_groups:
     parameters = list(module.parameters())
     excluded.update(id(p) for p in parameters)
@@ -45,15 +45,19 @@ class SuperMimicAlgorithm:
     networks.AMP_DTYPE = torch.bfloat16 if cfg.amp == "bf16" else None
     goal_dim = GOAL_FRAME_DIM * cfg.goal_frames
     self.wm = WorldModel(cfg.wm_hidden, depth_cfg=cfg).to(device)
-    self.policy = Policy(OBS_DIM, goal_dim, cfg.hist, hidden=cfg.policy_hidden, depth_cfg=cfg).to(device)
-    self.critic = Critic(INV_DIM + 29 + 14 * 3 + 3 + 29 + 33 + goal_dim, cfg.critic_hidden, depth_cfg=cfg).to(device)
+    encoder = self.wm.depth_encoder if cfg.depth_enabled else None
+    self.policy = Policy(OBS_DIM, goal_dim, cfg.hist, hidden=cfg.policy_hidden,
+                         depth_cfg=cfg, depth_encoder=encoder).to(device)
+    self.critic = Critic(INV_DIM + 29 + 14 * 3 + 3 + 29 + 33 + goal_dim, cfg.critic_hidden,
+                         depth_cfg=cfg, depth_encoder=encoder).to(device)
     wm_groups = ((self.wm.depth_encoder, cfg.wm_perception_lr),
                  (self.wm.depth_decoder, cfg.depth_decoder_lr)) if cfg.depth_enabled else ()
-    pi_groups = ((self.policy.depth_encoder, cfg.actor_perception_lr),) if cfg.depth_enabled else ()
-    v_groups = ((self.critic.depth_encoder, cfg.critic_perception_lr),) if cfg.depth_enabled else ()
+    shared = tuple(encoder.parameters()) if encoder is not None else ()
     self.opt_wm = torch.optim.Adam(parameter_groups(self.wm, cfg.lr, wm_groups))
-    self.opt_pi = torch.optim.Adam(parameter_groups(self.policy, cfg.lr, pi_groups), betas=(0.9, 0.95))
-    self.opt_v = torch.optim.Adam(parameter_groups(self.critic, cfg.lr, v_groups))
+    self.opt_pi = torch.optim.Adam(parameter_groups(self.policy, cfg.lr, excluded=shared), betas=(0.9, 0.95))
+    self.opt_v = torch.optim.Adam(parameter_groups(self.critic, cfg.lr, excluded=shared))
+    # Shared encoder gradients from the preceding WM step must never enter
+    # Actor/Critic clipping, nor be stepped by either of their optimizers.
     self.error_floor = torch.tensor([3e-3]*3 + [5e-3]*3 + [2e-2]*3 + [5e-2]*3
                                     + [3e-3]*29 + [5e-2]*29, device=device)
     compile_fn = torch.compile if cfg.compile and self.device.type == "cuda" else lambda f, **kw: f
@@ -66,9 +70,17 @@ class SuperMimicAlgorithm:
     self._critic_forward_chunk = compile_fn(self.critic_forward, dynamic=True)
     self._critic_error = compile_fn(self.critic_error, dynamic=True)
     if cfg.depth_enabled:
-      self._policy_frames = compile_fn(self.policy.depth_encoder.encode_frames)
-      self._wm_frames = compile_fn(self.wm.depth_encoder.encode_frames)
-      self._critic_frames = compile_fn(self.critic.depth_encoder.encode_frames)
+      self._encode_depth = compile_fn(self.encode_depth)
+      self._depth_targets = compile_fn(self.depth_targets)
+      self._decode_depth = compile_fn(self.wm.decode_depth)
+
+  @property
+  def pi_parameters(self):
+    return [p for group in self.opt_pi.param_groups for p in group["params"]]
+
+  @property
+  def v_parameters(self):
+    return [p for group in self.opt_v.param_groups for p in group["params"]]
 
   def set_lr(self, iteration):
     c = self.cfg
@@ -85,30 +97,40 @@ class SuperMimicAlgorithm:
     self.wm.in_norm.update(self.wm.inputs(s, transition["a"], normalize_xi(xi)))
     self.wm.out_norm.update(self.wm.targets(s, s1))
 
-  def depth_window(self, history):
-    return window_from_frames(history, self.cfg.depth_frames, self.cfg.depth_skip)
+  def encode_depth(self, history):
+    return self.wm.depth_encoder(select_history(history, self.cfg.depth_frames, self.cfg.depth_skip))
+
+  @torch.no_grad()
+  def depth_targets(self, history, next_images):
+    """True h[t+1:t+K+1], including pre-reset terminal images, never predictions.
+
+    Later cross-episode rows are masked by the existing WM mask. Encode each
+    real frame once and aggregate the same strided windows used in collection.
+    This target branch does not update perception; the initial rollout h does.
+    """
+    c = self.cfg
+    images = torch.cat((depth_float(history), depth_float(next_images)), 1)
+    features = self.wm.depth_encoder.encode_frames(images)
+    times = history.shape[1] + torch.arange(next_images.shape[1], device=images.device)
+    ages = torch.arange(c.depth_frames - 1, -1, -1, device=images.device) * c.depth_skip
+    return self.wm.depth_encoder.aggregate(features[:, times[:, None] - ages[None]])
 
   def _rollout(self, states, actions, xi, depth_history=None):
     state = unflatten_state(states[:, 0])
     predictions = []
-    images = []
+    latents = []
     if self.cfg.depth_enabled:
-      # This cache lives for one WM update only. Reusing a CNN result does not
-      # detach it: later image/state losses still reach earlier predictions.
-      feature_history = tuple(self.wm.depth_encoder.encode_frames(depth_history).unbind(1))
+      # Only the initial h reads real images, with gradients to the shared CNN/GRU.
+      latent = self.encode_depth(depth_history)
     for j in range(self.cfg.wm_window):
       if self.cfg.depth_enabled:
-        state, image = self.wm.step_visual(state, actions[:, j], normalize_xi(xi[:, j]),
-                                          depth_features=self.depth_window(feature_history))
-        if j + 1 < self.cfg.wm_window:
-          features = self.wm.depth_encoder.encode_frames(image)
-          feature_history = (*feature_history[1:], features)
-        images.append(image)
+        state, latent = self.wm.step_visual(state, actions[:, j], normalize_xi(xi[:, j]), latent)
+        latents.append(latent)
       else:
         state = self.wm.step(state, actions[:, j], normalize_xi(xi[:, j]))
       predictions.append(state)
     states = tuple(torch.stack([s[i] for s in predictions], 1) for i in range(6))
-    return (states, torch.stack(images, 1)) if self.cfg.depth_enabled else states
+    return (states, torch.stack(latents, 1)) if self.cfg.depth_enabled else states
 
   def world_model_update(self, buffer, *, strict=False):
     """Fit one batch; skip if strict sampling has no complete same-episode window."""
@@ -117,17 +139,21 @@ class SuperMimicAlgorithm:
     if w is None:
       return None
     if c.depth_enabled:
-      predicted, images = self._world_rollout(w["s"], w["a"], w["xi"], w["depth_history"])
+      target_latents = self._depth_targets(w["depth_history"], w["depth_next"])
+      predicted, latents = self._world_rollout(w["s"], w["a"], w["xi"], w["depth_history"])
+      images = self._decode_depth(latents)
+      latent_error = (latents - target_latents).square().mean(-1)
+      latent_loss = (latent_error * w["mask"]).sum() / c.wm_batch
       depth_error = (images - depth_float(w["depth_next"])).square().mean((-2, -1))
       depth_loss = (depth_error * w["mask"]).sum() / c.wm_batch
     else:
       predicted = self._world_rollout(w["s"], w["a"], w["xi"])
     scale = torch.maximum(self.wm.out_norm.std(), self.error_floor)
     error = (self.wm.state_error(predicted, unflatten_state(w["s1"])) / scale).square().mean(-1)
-    loss = (error * w["mask"]).sum() / c.wm_batch
-    state_loss = loss
+    state_loss = (error * w["mask"]).sum() / c.wm_batch
+    loss = c.state_loss_weight * state_loss
     if c.depth_enabled:
-      loss = loss + c.depth_loss_weight * depth_loss
+      loss = loss + c.latent_loss_weight * latent_loss + c.depth_loss_weight * depth_loss
     self.opt_wm.zero_grad(set_to_none=True)
     loss.backward()
     norm = nn.utils.clip_grad_norm_(self.wm.parameters(), 1.0)
@@ -137,36 +163,36 @@ class SuperMimicAlgorithm:
     last = (error[:, -1] * w["mask"][:, -1]).sum() / w["mask"][:, -1].sum().clamp_min(1)
     metrics = {"wm_loss": float(state_loss.detach() / c.wm_window), "wm_err_last": float(last.detach())}
     if c.depth_enabled:
-      metrics.update(wm_depth_loss=float(depth_loss.detach() / c.wm_window),
+      metrics.update(wm_latent_loss=float(latent_loss.detach() / c.wm_window),
+                     wm_depth_loss=float(depth_loss.detach() / c.wm_window),
                      wm_total_loss=float(loss.detach() / c.wm_window))
     return metrics
 
   def critic_input(self, state, f, xi_n, goal, a_prev):
     return torch.cat((self.mdp.critic_features(state, f, xi_n, a_prev), goal), -1)
 
-  def critic_forward(self, x, depth=None, *, depth_features=None):
+  def critic_forward(self, x, depth_latent=None):
     if self.cfg.depth_enabled:
-      return self.critic(x, depth, depth_features=depth_features)
+      return self.critic(x, depth_latent=depth_latent)
     return self.critic(x)
 
-  def _critic_forward(self, x, depth=None, *, depth_features=None):
+  def _critic_forward(self, x, depth_latent=None):
     if not self.cfg.depth_enabled:
       return self._critic_forward_chunk(x)
     predictions = []
     for start in range(0, x.shape[0], self.cfg.depth_batch_size):
       stop = start + self.cfg.depth_batch_size
       predictions.append(self._critic_forward_chunk(
-        x[start:stop], None if depth is None else depth[start:stop],
-        depth_features=None if depth_features is None else depth_features[start:stop]))
+        x[start:stop], depth_latent[start:stop]))
     return torch.cat(predictions, 0)
 
   @staticmethod
   def critic_error(prediction, target):
     return (prediction - target).square().mean()
 
-  def _critic_loss(self, x, target, depth=None):
+  def _critic_loss(self, x, target, depth_latent=None):
     # One mean/backward/optimizer step for the original complete minibatch.
-    return self._critic_error(self._critic_forward(x, depth), target)
+    return self._critic_error(self._critic_forward(x, depth_latent), target)
 
   def reward_term(self, state, f, action, a_prev):
     return self.mdp.reward(state, f, action, a_prev), self.mdp.soft_termination(state, f)
@@ -175,13 +201,10 @@ class SuperMimicAlgorithm:
     m = self.mdp.motion
     return torch.minimum(f + 1, m.clip_end[m.clip_id[f]])
 
-  def _imagine_step(self, state, history, f, xi, goal, depth=None, *,
-                    policy_depth_features=None, wm_depth_features=None):
+  def _imagine_step(self, state, history, f, xi, goal, depth_latent=None):
     if self.cfg.depth_enabled:
-      action = self.policy(history, self.mdp.add_goal_noise(goal), depth,
-                           depth_features=policy_depth_features)
-      next_state, image = self.wm.step_visual(state, action, normalize_xi(xi), depth,
-                                             depth_features=wm_depth_features)
+      action = self.policy(history, self.mdp.add_goal_noise(goal), depth_latent=depth_latent)
+      next_state, next_latent = self.wm.step_visual(state, action, normalize_xi(xi), depth_latent)
     else:
       action = self.policy(history, self.mdp.add_goal_noise(goal))
       next_state = self.wm.step(state, action, normalize_xi(xi))
@@ -193,7 +216,7 @@ class SuperMimicAlgorithm:
     # Keep a clean goal and its gradient for the critic; only the policy adds noise.
     next_goal = self.mdp.goal(next_state, next_f, self.cfg.goal_frames)
     result = next_state, action, history, next_f, next_goal
-    return (*result, image) if self.cfg.depth_enabled else result
+    return (*result, next_latent) if self.cfg.depth_enabled else result
 
   def policy_update(self, buffer):
     c = self.cfg
@@ -209,9 +232,6 @@ class SuperMimicAlgorithm:
     goal = self.mdp.goal(state, f, c.goal_frames)
     states, frames, goals = [state], [f], [goal]
     actions, previous_actions = [], []
-    if c.depth_enabled:
-      initial_depth = depth_float(start["depth_history"])
-      predicted_images = []
     batch_size = f.shape[0]
     motion = self.mdp.motion
     lengths = (motion.clip_end[motion.clip_id[f]] - f + 1).clamp(max=c.horizon)
@@ -222,16 +242,13 @@ class SuperMimicAlgorithm:
 
     with frozen(self.wm, self.critic):
       if c.depth_enabled:
-        # Each network owns its own features. No optimizer step occurs while
-        # these caches are in use; the strided window advances as before.
-        policy_features = tuple(self._policy_frames(initial_depth).unbind(1))
-        wm_features = tuple(self._wm_frames(initial_depth).unbind(1))
+        with torch.no_grad():
+          latent = self._encode_depth(start["depth_history"])
+        visual_states = [latent]
       for t in range(c.horizon):
         if c.depth_enabled:
-          next_state, action, next_history, next_f, next_goal, next_image = self._imag_step(
-            state, history, f, xi, goal,
-            policy_depth_features=self.depth_window(policy_features),
-            wm_depth_features=self.depth_window(wm_features))
+          next_state, action, next_history, next_f, next_goal, next_latent = self._imag_step(
+            state, history, f, xi, goal, latent)
         else:
           next_state, action, next_history, next_f, next_goal = self._imag_step(state, history, f, xi, goal)
         # Keep fixed batch shapes, but hold every row at its own endpoint.
@@ -243,12 +260,10 @@ class SuperMimicAlgorithm:
         history = advance(history, next_history)
         next_f, next_goal = advance(f, next_f), advance(goal, next_goal)
         if c.depth_enabled:
-          # Padded rows have no reward/gradient contribution. Save frames once;
-          # the bootstrap below explicitly selects each row's true endpoint.
-          if t + 1 < c.horizon:
-            policy_features = (*policy_features[1:], self._policy_frames(next_image))
-            wm_features = (*wm_features[1:], self._wm_frames(next_image))
-          predicted_images.append(next_image)
+          # Hold h at each row's true motion endpoint, just like physical state.
+          # Keep gradients through predicted h to all preceding Actor actions.
+          latent = advance(latent, next_latent)
+          visual_states.append(latent)
         actions.append(action); previous_actions.append(a_prev)
         state, f, goal, a_prev = next_state, next_f, next_goal, action
         states.append(state); frames.append(f); goals.append(goal)
@@ -266,11 +281,7 @@ class SuperMimicAlgorithm:
       objective = (discount * prior_alive * r).sum(0)
       bootstrap_input = self._critic_input(state, f, xi_n, goal, a_prev)
       if c.depth_enabled:
-        depth_sequence = torch.cat((initial_depth, torch.stack(predicted_images, 1)), 1)
-        ages = torch.arange(c.depth_frames - 1, -1, -1, device=self.device) * c.depth_skip
-        indices = c.depth_history_length - 1 + lengths[:, None] - ages[None]
-        endpoint_depth = depth_sequence[torch.arange(batch_size, device=self.device)[:, None], indices]
-        bootstrap = self._critic_forward(bootstrap_input, endpoint_depth)
+        bootstrap = self._critic_forward(bootstrap_input, latent)
       else:
         bootstrap = self._critic_forward(bootstrap_input)
       objective += c.gamma ** lengths * alive[-1] * bootstrap
@@ -279,14 +290,11 @@ class SuperMimicAlgorithm:
       loss = -objective.mean() / c.horizon
       self.opt_pi.zero_grad(set_to_none=True)
       loss.backward()
-      norm = nn.utils.clip_grad_norm_(self.policy.parameters(), c.pi_clip)
-      nn.utils.clip_grad_value_(self.policy.parameters(), c.pi_clip_value)
+      norm = nn.utils.clip_grad_norm_(self.pi_parameters, c.pi_clip)
+      nn.utils.clip_grad_value_(self.pi_parameters, c.pi_clip_value)
       if not torch.isfinite(loss) or not torch.isfinite(norm):
         raise FloatingPointError("Non-finite policy loss/gradient")
       self.opt_pi.step()
-      if c.depth_enabled:
-        # Actor parameters just changed. Never reuse these caches next update.
-        del policy_features, wm_features
     # All targets are detached; critic training must not retain the BPTT graph.
     with torch.no_grad():
       critic_states = tuple(flat([s[i].detach() for s in states]) for i in range(6))
@@ -299,23 +307,12 @@ class SuperMimicAlgorithm:
       state_valid = torch.arange(c.horizon + 1, device=self.device)[:, None] <= lengths[None]
       self.critic.norm.update(x[state_valid])
       if c.depth_enabled:
-        # Keep one dense sequence, not (H+1) copies of eight image histories.
-        depth_sequence = depth_sequence.detach()
-
-        def critic_history(sequence, times, env_ids):
-          times = torch.minimum(times, lengths[env_ids])
-          indices = c.depth_history_length - 1 + times[:, None] - ages[None]
-          return sequence[env_ids[:, None], indices]
-
-        env_ids = torch.arange(batch_size, device=self.device)
-        # Critic weights are fixed throughout target construction. Its CNN can
-        # encode each frame once, but every GRU window still restarts from h=0.
-        feature_sequence = self._critic_frames(depth_sequence)
-        v = torch.stack([self._critic_forward(x[t], depth_features=critic_history(
-                           feature_sequence, torch.full_like(lengths, t), env_ids))
+        # Shared perception and dynamics stay fixed during Actor/Critic updates.
+        # Detached latent rows are reusable throughout every critic epoch.
+        latent_sequence = torch.stack([h.detach() for h in visual_states])
+        v = torch.stack([self._critic_forward(x[t], latent_sequence[t])
                          for t in range(c.horizon + 1)])
-        del feature_sequence
-        training_times, training_envs = valid.nonzero(as_tuple=True)
+        critic_latents = latent_sequence[:-1][valid]
       else:
         v = self._critic_forward(x)
       ret, targets = v[-1], []
@@ -333,14 +330,11 @@ class SuperMimicAlgorithm:
       for ids in permutation.tensor_split(c.critic_minibatches):
         if ids.numel() == 0:
           continue
-        # Fresh CNN/GRU features on every optimizer step; no target-cache reuse
-        # across minibatches/epochs where the critic weights have changed.
-        value_loss = (self._critic_loss(x[ids], y[ids], critic_history(
-                        depth_sequence, training_times[ids], training_envs[ids]))
+        value_loss = (self._critic_loss(x[ids], y[ids], critic_latents[ids])
                       if c.depth_enabled else self._critic_loss(x[ids], y[ids]))
         self.opt_v.zero_grad(set_to_none=True)
         value_loss.backward()
-        value_norm = nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
+        value_norm = nn.utils.clip_grad_norm_(self.v_parameters, 1.0)
         if not torch.isfinite(value_loss) or not torch.isfinite(value_norm):
           raise FloatingPointError("Non-finite critic loss/gradient")
         self.opt_v.step()

@@ -26,11 +26,11 @@ class SuperMimicConfig:
   depth_latent_dim: int = 256
   depth_frame_dim: int = 256
   depth_checkpoint: bool = True  # Recompute visual activations during BPTT to save memory.
-  depth_batch_size: int = 256  # Bound CNN workspace for large critic minibatches.
-  depth_loss_weight: float = 1.0  # Normalized pixel MSE, summed over valid WM steps.
-  actor_perception_lr: float = 2e-4
-  wm_perception_lr: float = 2e-4
-  critic_perception_lr: float = 2e-4
+  depth_batch_size: int = 256  # Bound perception/decoder workspace; does not change learner batches.
+  state_loss_weight: float = 1.0  # Existing scaled state MSE.
+  latent_loss_weight: float = 1.0  # Predicted h vs stop-gradient real-history h, mean over features.
+  depth_loss_weight: float = 1.0  # Normalized pixel MSE. All losses sum valid steps / batch.
+  wm_perception_lr: float = 2e-4  # Shared CNN+GRU; updated by the WM optimizer only.
   depth_decoder_lr: float = 2e-4
   gamma: float = 0.99
   lam: float = 0.95
@@ -70,10 +70,12 @@ class SuperMimicConfig:
     for name in ("depth_frames", "depth_skip", "depth_latent_dim", "depth_frame_dim", "depth_batch_size"):
       if getattr(self, name) < 1:
         raise ValueError(f"{name} must be positive")
-    for name in ("actor_perception_lr", "wm_perception_lr", "critic_perception_lr",
-                 "depth_decoder_lr", "depth_loss_weight"):
+    for name in ("wm_perception_lr", "depth_decoder_lr"):
       if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
         raise ValueError(f"{name} must be finite and positive")
+    for name in ("state_loss_weight", "latent_loss_weight", "depth_loss_weight"):
+      if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
+        raise ValueError(f"{name} must be finite and nonnegative")
     for name in ("pi_clip", "pi_clip_value"):
       if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
         raise ValueError(f"{name} must be finite and positive")
@@ -120,4 +122,7 @@ def migrate_checkpoint_config(config: dict) -> dict:
   """Old checkpoints predate vision; never reinterpret their weights as visual."""
   config = migrate_legacy_run_name(config)
   config.setdefault("depth_enabled", False)
+  # Older policies remain playable; these rates belonged to independent encoders.
+  config.pop("actor_perception_lr", None)
+  config.pop("critic_perception_lr", None)
   return config

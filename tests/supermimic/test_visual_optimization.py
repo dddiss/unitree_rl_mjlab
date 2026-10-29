@@ -1,4 +1,4 @@
-"""Numerical and work-count regressions against uncached nn.GRU perception."""
+"""Numerical, compilation and work-count regressions for shared latent dynamics."""
 import copy
 from unittest.mock import patch
 
@@ -83,7 +83,7 @@ def test_cached_training_matches_uncached_losses_gradients_updates_and_rng(mdp, 
   window = buffer.sample_windows(cfg.wm_batch, cfg.wm_window, strict=True)
   start, history = buffer.sample_starts(cfg.pi_batch, cfg.hist)
   # One trajectory ends immediately, the other has all eight valid steps.
-  # Both still use their own endpoint images/target for the bootstrap.
+  # Both still use their own endpoint latent/target for the bootstrap.
   start['f'] = torch.tensor([50, 10])
   # Nonidentical initial frames expose stride/order mistakes hidden by padding.
   start['depth_history'] = torch.randint(256, start['depth_history'].shape, dtype=torch.uint8)
@@ -108,39 +108,27 @@ def test_cached_training_matches_uncached_losses_gradients_updates_and_rng(mdp, 
       assert_learners_close(actual, expected)
 
 
-def test_frame_cnn_work_reuses_history_and_invalidates_critic_cache(mdp):
+def test_imagination_encodes_once_and_never_decodes_even_during_critic_epochs(mdp):
   cfg = visual_config(wm_window=8, horizon=8, depth_frames=8, depth_skip=5,
                       depth_checkpoint=False, critic_epochs=2)
   alg = SuperMimicAlgorithm(mdp, cfg, 'cpu')
   buffer, _ = visual_buffer(mdp, cfg)
-  counts = {name: 0 for name in ('wm', 'policy', 'critic')}
-  hooks = []
-  for name in counts:
-    def count(module, args, name=name): counts[name] += len(args[0])
-    hooks.append(getattr(alg, name).depth_encoder.frame_cnn.register_forward_pre_hook(count))
+  frames=[];decoded=[]
+  hook=alg.wm.depth_encoder.frame_cnn.register_forward_pre_hook(lambda m,a:frames.append(len(a[0])))
+  decode_hook=alg.wm.depth_decoder.register_forward_pre_hook(lambda m,a:decoded.append(len(a[0])))
   try:
     alg.world_model_update(buffer, strict=True)
-    assert counts['wm'] == cfg.wm_batch * (cfg.depth_history_length + cfg.wm_window - 1)
-    assert counts['policy'] == counts['critic'] == 0
-    start, history = buffer.sample_starts(cfg.pi_batch, cfg.hist)
-    start['f'] = torch.tensor([50, 10])
-    class Fixed:
-      def sample_starts(self, *args): return start, history
-    counts.update(dict.fromkeys(counts, 0))
-    alg.policy_update(Fixed())
-    for name in ('policy', 'wm'):
-      assert counts[name] == cfg.pi_batch * (cfg.depth_history_length + cfg.horizon - 1)
-    # Endpoint bootstrap; once-only target frame bank; fresh histories for EVERY
-    # critic minibatch in every epoch (weights change after each minibatch).
-    expected = (cfg.pi_batch * cfg.depth_frames
-                + cfg.pi_batch * (cfg.depth_history_length + cfg.horizon)
-                + cfg.critic_epochs * (1 + cfg.horizon) * cfg.depth_frames)
-    assert counts['critic'] == expected
-  finally:
-    for hook in hooks: hook.remove()
+    # Initial differentiable window + dense no-grad real frame bank for targets.
+    assert sum(frames)==cfg.wm_batch*(cfg.depth_frames+cfg.depth_history_length+cfg.wm_window)
+    assert sum(decoded)==cfg.wm_batch*cfg.wm_window
+    frames.clear();decoded.clear()
+    alg.policy_update(buffer)
+    assert sum(frames)==cfg.pi_batch*cfg.depth_frames
+    assert not decoded
+  finally:hook.remove();decode_hook.remove()
 
 
-def test_imagination_step_and_critic_compile_fullgraph_with_gradients(mdp):
+def test_imagination_step_and_critic_compile_fullgraph_with_latent_gradients(mdp):
   cfg = visual_config(depth_checkpoint=True, depth_frames=8, depth_skip=5,
                       horizon=3, depth_batch_size=1)
   alg = SuperMimicAlgorithm(mdp, cfg, 'cpu')
@@ -150,38 +138,45 @@ def test_imagination_step_and_critic_compile_fullgraph_with_gradients(mdp):
   f, xi = start['f'], start['xi']
   obs = mdp.obs(unflatten_state(history['s']), history['a_prev'], history['xi'], history['f'])
   goal = mdp.goal(state, f, cfg.goal_frames)
-  image = torch.rand(cfg.pi_batch, cfg.depth_frames, 18, 32, requires_grad=True)
+  h=torch.randn(cfg.pi_batch,cfg.depth_latent_dim,requires_grad=True)
   compiled_step = torch.compile(alg._imagine_step, backend='aot_eager', fullgraph=True)
   compiled_value = torch.compile(alg.critic_forward, backend='aot_eager', fullgraph=True)
   compiled_error = torch.compile(alg.critic_error, backend='aot_eager', fullgraph=True)
   try:
     with frozen(alg.wm, alg.critic):
-      pf = alg.policy.depth_encoder.encode_frames(image)
-      wf = alg.wm.depth_encoder.encode_frames(image)
       rng = torch.get_rng_state().clone()
-      expected = alg._imagine_step(state, obs, f, xi, goal,
-                                  policy_depth_features=pf, wm_depth_features=wf)
+      expected = alg._imagine_step(state, obs, f, xi, goal, h)
       torch.set_rng_state(rng)
-      got = compiled_step(state, obs, f, xi, goal,
-                          policy_depth_features=pf, wm_depth_features=wf)
+      got = compiled_step(state, obs, f, xi, goal, h)
       for a, b in zip((*got[0], *got[1:]), (*expected[0], *expected[1:])):
         torch.testing.assert_close(a, b)
-      expected_grad, = torch.autograd.grad(expected[-1].square().mean(), image, retain_graph=True)
-      actual_grad, = torch.autograd.grad(got[-1].square().mean(), image)
+      expected_grad, = torch.autograd.grad(expected[-1].square().mean(), h)
+      actual_grad, = torch.autograd.grad(got[-1].square().mean(), h)
       torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-4, atol=1e-6)
       assert actual_grad.abs().sum() > 0
       x = alg.critic_input(state, f, normalize_xi(xi), goal, start['a_prev'])
-      a = image.detach().clone().requires_grad_(); b = a.detach().clone().requires_grad_()
+      a = h.detach().clone().requires_grad_(); b = a.detach().clone().requires_grad_()
       expected_value = alg.critic_forward(x, a); got_value = compiled_value(x, b)
       torch.testing.assert_close(got_value, expected_value)
       torch.testing.assert_close(torch.autograd.grad(got_value.sum(), b)[0],
                                  torch.autograd.grad(expected_value.sum(), a)[0], rtol=1e-4, atol=1e-6)
-    # Trainable critic, compiled forward AND reduction, including parameter grads.
-    actual_loss = compiled_error(compiled_value(x, image.detach()), torch.ones(cfg.pi_batch))
-    expected_loss = alg.critic_error(alg.critic_forward(x, image.detach()), torch.ones(cfg.pi_batch))
-    torch.testing.assert_close(actual_loss, expected_loss)
-    ag = torch.autograd.grad(actual_loss, tuple(alg.critic.parameters()))
-    eg = torch.autograd.grad(expected_loss, tuple(alg.critic.parameters()))
+    actual_loss = compiled_error(compiled_value(x, h.detach()), torch.ones(cfg.pi_batch))
+    expected_loss = alg.critic_error(alg.critic_forward(x, h.detach()), torch.ones(cfg.pi_batch))
+    ag = torch.autograd.grad(actual_loss, tuple(alg.v_parameters))
+    eg = torch.autograd.grad(expected_loss, tuple(alg.v_parameters))
     for a, b in zip(ag, eg): torch.testing.assert_close(a, b, rtol=1e-4, atol=1e-6)
   finally:
     torch.compiler.reset()
+
+
+def test_batched_decoder_matches_stepwise_outputs_and_gradients(mdp):
+  cfg=visual_config(depth_frames=2,depth_batch_size=1)
+  alg=SuperMimicAlgorithm(mdp,cfg,'cpu')
+  h=torch.randn(3,5,cfg.depth_latent_dim,requires_grad=True)
+  other=h.detach().clone().requires_grad_()
+  expected=torch.stack([alg.wm.depth_decoder(h[:,t]) for t in range(5)],1)
+  actual=alg.wm.decode_depth(other)
+  torch.testing.assert_close(actual,expected)
+  eg=torch.autograd.grad(expected.square().mean(),(h,*alg.wm.depth_decoder.parameters()))
+  ag=torch.autograd.grad(actual.square().mean(),(other,*alg.wm.depth_decoder.parameters()))
+  for a,b in zip(ag,eg):torch.testing.assert_close(a,b,rtol=1e-4,atol=1e-6)

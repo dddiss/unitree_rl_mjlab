@@ -88,6 +88,7 @@ class WorldModel(nn.Module):
         if self.visual:
             self.depth_encoder = make_depth_encoder(depth_cfg)
             self.depth_decoder = DepthDecoder(visual_dim)
+            self.decode_batch_size = depth_cfg.depth_batch_size * depth_cfg.depth_frames
         self.in_norm = RunningNorm(self.in_dim)
         self.out_norm = RunningNorm(WM_OUT, eps=1e-4)
 
@@ -115,17 +116,13 @@ class WorldModel(nn.Module):
             -1,
         )
 
-    def _predict(self, S, a, xi_n, depth=None, *, depth_features=None):
+    def _predict(self, S, a, xi_n, *, depth_latent=None):
         p, R, v, w, q, qd = S
         x = self.in_norm(self.inputs(S, a, xi_n))
         if self.visual:
-            if depth_features is not None:
-                visual = self.depth_encoder.aggregate(depth_features)
-            elif depth is not None:
-                visual = self.depth_encoder(depth)
-            else:
-                raise ValueError("Visual WM requires a depth history")
-            x = torch.cat((x, visual), -1)
+            if depth_latent is None:
+                raise ValueError("Visual WM requires the aggregated history latent h")
+            x = torch.cat((x, depth_latent), -1)
         y = run_mlp(self.net, x)
         d = y[..., :WM_OUT] * self.out_norm.std() + self.out_norm.mean
         H = yaw_mat(R)
@@ -139,9 +136,15 @@ class WorldModel(nn.Module):
     def step(self, S, a, xi_n):
         return self._predict(S, a, xi_n)[0]
 
-    def step_visual(self, S, a, xi_n, depth=None, *, depth_features=None):
-        state, latent = self._predict(S, a, xi_n, depth, depth_features=depth_features)
-        return state, self.depth_decoder(latent)
+    def step_visual(self, S, a, xi_n, depth_latent):
+        """Predict next state and next history latent; no image-space feedback."""
+        return self._predict(S, a, xi_n, depth_latent=depth_latent)
+
+    def decode_depth(self, latents):
+        """Decode batch/time rows after rollout, bounding convolution workspace."""
+        rows = latents.reshape(-1, latents.shape[-1])
+        images = [self.depth_decoder(chunk) for chunk in rows.split(self.decode_batch_size)]
+        return torch.cat(images, 0).reshape(*latents.shape[:-1], 18, 32)
 
     @staticmethod
     def state_error(S_hat, S):
@@ -168,13 +171,13 @@ class WorldModel(nn.Module):
 class Policy(nn.Module):
     """a = dec(enc(g), o_{t-9:t}); deterministic, latent z in R^32 bounded by tanh."""
 
-    def __init__(self, obs_dim: int, goal_dim: int, hist: int = 10, z_dim: int = 32, hidden=(2048, 1024, 512, 256), depth_cfg=None):
+    def __init__(self, obs_dim: int, goal_dim: int, hist: int = 10, z_dim: int = 32, hidden=(2048, 1024, 512, 256), depth_cfg=None, *, depth_encoder=None):
         super().__init__()
         self.hist = hist
         self.visual = depth_cfg is not None and depth_cfg.depth_enabled
         visual_dim = depth_cfg.depth_latent_dim if self.visual else 0
         if self.visual:
-            self.depth_encoder = make_depth_encoder(depth_cfg)
+            self.depth_encoder = depth_encoder if depth_encoder is not None else make_depth_encoder(depth_cfg)
         self.enc = mlp(goal_dim, list(hidden), z_dim)
         self.dec = mlp(z_dim + obs_dim * hist + visual_dim, list(hidden), NUM_J)
         with torch.no_grad():
@@ -184,14 +187,14 @@ class Policy(nn.Module):
         self.goal_norm = RunningNorm(goal_dim)
 
     def forward(self, obs_hist: torch.Tensor, goal: torch.Tensor, depth=None,
-                *, depth_features=None) -> torch.Tensor:
+                *, depth_latent=None) -> torch.Tensor:
         """obs_hist: (B, hist, obs_dim) noisy observations, newest last."""
         z = torch.tanh(run_mlp(self.enc, self.goal_norm(goal)))
         o = self.obs_norm(obs_hist).flatten(-2)
         x = torch.cat((z, o), -1)
         if self.visual:
-            if depth_features is not None:
-                visual = self.depth_encoder.aggregate(depth_features)
+            if depth_latent is not None:
+                visual = depth_latent
             elif depth is not None:
                 visual = self.depth_encoder(depth)
             else:
@@ -201,20 +204,20 @@ class Policy(nn.Module):
 
 
 class Critic(nn.Module):
-    def __init__(self, in_dim: int, hidden=(256, 128), depth_cfg=None):
+    def __init__(self, in_dim: int, hidden=(256, 128), depth_cfg=None, *, depth_encoder=None):
         super().__init__()
         self.visual = depth_cfg is not None and depth_cfg.depth_enabled
         visual_dim = depth_cfg.depth_latent_dim if self.visual else 0
         if self.visual:
-            self.depth_encoder = make_depth_encoder(depth_cfg)
+            self.depth_encoder = depth_encoder if depth_encoder is not None else make_depth_encoder(depth_cfg)
         self.net = mlp(in_dim + visual_dim, list(hidden), 1)
         self.norm = RunningNorm(in_dim)
 
-    def forward(self, x, depth=None, *, depth_features=None):
+    def forward(self, x, depth=None, *, depth_latent=None):
         x = self.norm(x)
         if self.visual:
-            if depth_features is not None:
-                visual = self.depth_encoder.aggregate(depth_features)
+            if depth_latent is not None:
+                visual = depth_latent
             elif depth is not None:
                 visual = self.depth_encoder(depth)
             else:

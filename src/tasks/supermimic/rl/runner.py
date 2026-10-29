@@ -17,7 +17,7 @@ from .metrics import LEGACY_FIELDS, PERFORMANCE_FIELDS, SAMPLING_FIELDS, Interva
 from ..perception.history import DepthHistory, select_history
 from ..config.g1.rl_cfg import SuperMimicConfig, migrate_checkpoint_config
 
-VISUAL_FIELDS = ("wm_depth_loss", "wm_total_loss")
+VISUAL_FIELDS = ("wm_latent_loss", "wm_depth_loss", "wm_total_loss")
 
 
 def motion_manifest(motion):
@@ -153,7 +153,7 @@ class SuperMimicRunner:
 
   def save(self, path):
     checkpoint = {
-      "format_version": 2 if self.cfg.depth_enabled else 1, "algorithm": self.algorithm.state_dict(),
+      "format_version": 3 if self.cfg.depth_enabled else 1, "algorithm": self.algorithm.state_dict(),
       "config": asdict(self.cfg), "motions": motion_manifest(self.motion),
       "sampler": self.command.sampler.state_dict(), "iteration": self.iteration,
       "sim_steps": self.sim_steps, "env_steps": self.env_steps, "step_acc": self.step_acc,
@@ -167,6 +167,9 @@ class SuperMimicRunner:
   def load(self, path):
     ck = torch.load(path, map_location=self.env.device, weights_only=False)
     check_manifest(ck["motions"], motion_manifest(self.motion))
+    if ck["config"].get("depth_enabled", False) and ck.get("format_version", 1) < 3:
+      raise ValueError("Legacy visual checkpoint predicts image-decoder latents, not shared history h. "
+                       "Start new training; legacy policies remain available for play/evaluation.")
     saved_cfg = asdict(SuperMimicConfig(**migrate_checkpoint_config(ck["config"])))
     current_cfg = asdict(self.cfg)
     # Scheduling, logging, precision, collection mix, sampling and actor clipping may change without
