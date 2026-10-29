@@ -65,9 +65,9 @@ class SuperMimicAlgorithm:
     self._imag_step = compile_fn(self._imagine_step)
     self._reward_term = compile_fn(self.reward_term)
     self._critic_input = compile_fn(self.critic_input)
-    # Compile a bounded critic chunk, not a graph containing a variable number
-    # of visual chunks. The final chunk may vary with motion-end masking.
-    self._critic_forward_chunk = compile_fn(self.critic_forward, dynamic=True)
+    # Critic consumes ready-made h: evaluate the full trajectory/minibatch,
+    # independent of perception's image workspace limit. Valid row counts vary.
+    self._critic_forward = compile_fn(self.critic_forward, dynamic=True)
     self._critic_error = compile_fn(self.critic_error, dynamic=True)
     if cfg.depth_enabled:
       self._encode_depth = compile_fn(self.encode_depth)
@@ -175,16 +175,6 @@ class SuperMimicAlgorithm:
     if self.cfg.depth_enabled:
       return self.critic(x, depth_latent=depth_latent)
     return self.critic(x)
-
-  def _critic_forward(self, x, depth_latent=None):
-    if not self.cfg.depth_enabled:
-      return self._critic_forward_chunk(x)
-    predictions = []
-    for start in range(0, x.shape[0], self.cfg.depth_batch_size):
-      stop = start + self.cfg.depth_batch_size
-      predictions.append(self._critic_forward_chunk(
-        x[start:stop], depth_latent[start:stop]))
-    return torch.cat(predictions, 0)
 
   @staticmethod
   def critic_error(prediction, target):
@@ -310,8 +300,7 @@ class SuperMimicAlgorithm:
         # Shared perception and dynamics stay fixed during Actor/Critic updates.
         # Detached latent rows are reusable throughout every critic epoch.
         latent_sequence = torch.stack([h.detach() for h in visual_states])
-        v = torch.stack([self._critic_forward(x[t], latent_sequence[t])
-                         for t in range(c.horizon + 1)])
+        v = self._critic_forward(x, latent_sequence)
         critic_latents = latent_sequence[:-1][valid]
       else:
         v = self._critic_forward(x)

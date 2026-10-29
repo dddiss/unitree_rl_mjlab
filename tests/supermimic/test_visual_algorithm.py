@@ -104,10 +104,11 @@ def test_visual_short_motion_bootstrap_uses_true_endpoint_latent(mdp):
     lambda m,args,kwargs:seen.append(kwargs['depth_latent'].detach().clone()),with_kwargs=True)
   try:alg.policy_update(Fixed())
   finally:hook.remove()
-  # First call is bootstrap. Subsequent calls are V(s_0)...V(s_H).
-  torch.testing.assert_close(seen[0][0],seen[2][0])
-  torch.testing.assert_close(seen[0][1],seen[5][1])
-  for t in range(2,6):torch.testing.assert_close(seen[t][0],seen[2][0])
+  # First call is bootstrap; the second batches V(s_0)...V(s_H).
+  assert seen[1].shape==(cfg.horizon+1,cfg.pi_batch,cfg.depth_latent_dim)
+  torch.testing.assert_close(seen[0][0],seen[1][1,0])
+  torch.testing.assert_close(seen[0][1],seen[1][4,1])
+  for t in range(2,5):torch.testing.assert_close(seen[1][t,0],seen[1][1,0])
 
 
 def test_shared_parameters_have_exactly_one_optimizer_owner_and_lr(mdp):
@@ -184,7 +185,7 @@ def test_actor_gradient_passes_through_predicted_h_with_frozen_perception(mdp,mo
   monkeypatch.setattr(alg.wm,'step_visual',dynamics)
   monkeypatch.setattr(alg,'_reward_term',lambda s,f,a,prev:(torch.zeros(len(f)),torch.zeros(len(f))))
   # Only the visual endpoint contributes to Actor's return.
-  alg._critic_forward_chunk=lambda x,h=None: h.sum(-1)+alg.critic.net[-1].bias.sum()*0
+  alg._critic_forward=lambda x,h=None: h.sum(-1)+alg.critic.net[-1].bias.sum()*0
   result=alg.policy_update(b)
   assert result['pi_gradnorm']>0
   assert len(saved)==cfg.horizon and saved[0].grad.abs().sum()>0

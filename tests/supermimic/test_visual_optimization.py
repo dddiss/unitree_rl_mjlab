@@ -1,5 +1,6 @@
 """Numerical, compilation and work-count regressions for shared latent dynamics."""
 import copy
+from contextlib import nullcontext
 from unittest.mock import patch
 
 import pytest
@@ -180,3 +181,114 @@ def test_batched_decoder_matches_stepwise_outputs_and_gradients(mdp):
   eg=torch.autograd.grad(expected.square().mean(),(h,*alg.wm.depth_decoder.parameters()))
   ag=torch.autograd.grad(actual.square().mean(),(other,*alg.wm.depth_decoder.parameters()))
   for a,b in zip(ag,eg):torch.testing.assert_close(a,b,rtol=1e-4,atol=1e-6)
+
+
+def legacy_critic_forward(alg, x, h):
+  """Reference execution: one time step at a time, then image-sized chunks."""
+  if x.ndim == 3:
+    return torch.stack([legacy_critic_forward(alg, row, latent)
+                        for row, latent in zip(x, h)])
+  size = alg.cfg.depth_batch_size
+  return torch.cat([alg.critic_forward(x[i:i+size], h[i:i+size])
+                    for i in range(0, len(x), size)])
+
+
+@pytest.mark.parametrize('short_clips', [False, True])
+def test_batched_critic_matches_chunked_updates_and_preserves_gradient_boundaries(mdp, short_clips):
+  cfg = visual_config(horizon=4, pi_batch=3, critic_epochs=2,
+                      critic_minibatches=2, depth_batch_size=1)
+  actual = SuperMimicAlgorithm(mdp, cfg, 'cpu')
+  expected = SuperMimicAlgorithm(mdp, cfg, 'cpu')
+  expected.load_state_dict(copy.deepcopy(actual.state_dict()))
+  expected._critic_forward = lambda x, h=None: legacy_critic_forward(expected, x, h)
+  buffer, _ = visual_buffer(mdp, cfg)
+  start, history = buffer.sample_starts(cfg.pi_batch, cfg.hist)
+  start['f'] = torch.tensor([50, 56, 10] if short_clips else [10, 20, 30])
+  start['depth_history'] = torch.randint(256, start['depth_history'].shape, dtype=torch.uint8)
+
+  class Fixed:
+    def sample_starts(self, *args): return start, history
+
+  # Keep stale WM perception gradients: batching must not include them in
+  # Actor/Critic clipping or assign these parameters to another optimizer.
+  for alg in (actual, expected):
+    for p in alg.wm.depth_encoder.parameters():
+      p.grad = torch.full_like(p, 100.)
+  wm_before = copy.deepcopy(actual.wm.state_dict())
+  calls = []
+
+  def capture(module, args, kwargs):
+    x, h = args[0], kwargs['depth_latent']
+    calls.append((tuple(x.shape[:-1]), tuple(h.shape[:-1]),
+                  torch.is_grad_enabled(), x.requires_grad, h.requires_grad))
+
+  hook = actual.critic.register_forward_pre_hook(capture, with_kwargs=True)
+  valid_steps = 7 if short_clips else cfg.pi_batch * cfg.horizon
+  minibatch_sizes = [len(ids) for ids in torch.arange(valid_steps).tensor_split(cfg.critic_minibatches)]
+  try:
+    # Repeating the update also catches stale values reused after optimizer steps.
+    for _ in range(2):
+      calls.clear()
+      rng = torch.get_rng_state().clone()
+      expected_metrics = expected.policy_update(Fixed())
+      expected_rng = torch.get_rng_state().clone()
+      torch.set_rng_state(rng)
+      with patch.object(actual.opt_pi, 'step', wraps=actual.opt_pi.step) as pi_step, \
+           patch.object(actual.opt_v, 'step', wraps=actual.opt_v.step) as v_step:
+        actual_metrics = actual.policy_update(Fixed())
+      assert pi_step.call_count == 1
+      assert v_step.call_count == cfg.critic_epochs * cfg.critic_minibatches
+      assert torch.equal(torch.get_rng_state(), expected_rng)
+      for key, value in actual_metrics.items():
+        torch.testing.assert_close(value, expected_metrics[key], rtol=2e-4, atol=2e-6)
+      assert_learners_close(actual, expected)
+      # One differentiable endpoint batch, one no-grad trajectory batch,
+      # then one forward per original minibatch (including uneven sizes).
+      assert calls == [
+        ((3,), (3,), True, True, True),
+        ((5, 3), (5, 3), False, False, False),
+        *[((n,), (n,), True, False, False)
+          for n in minibatch_sizes * cfg.critic_epochs],
+      ]
+      for key, value in wm_before.items():
+        torch.testing.assert_close(actual.wm.state_dict()[key], value, rtol=0, atol=0)
+      for p in actual.wm.depth_encoder.parameters():
+        torch.testing.assert_close(p.grad, torch.full_like(p, 100.), rtol=0, atol=0)
+  finally:
+    hook.remove()
+
+
+@pytest.mark.parametrize('device', [
+  'cpu', pytest.param('cuda', marks=pytest.mark.skipif(
+    not torch.cuda.is_available(), reason='Requires NVIDIA GPU for Inductor')),
+])
+def test_batched_critic_compiles_with_time_axis_and_variable_minibatches(mdp, device):
+  cfg = visual_config(depth_batch_size=1)
+  alg = SuperMimicAlgorithm(mdp, cfg, device)
+  backend = 'inductor' if device == 'cuda' else 'aot_eager'
+  value = torch.compile(alg.critic_forward, backend=backend, fullgraph=True, dynamic=True)
+  error = torch.compile(alg.critic_error, backend=backend, fullgraph=True, dynamic=True)
+  try:
+    for frozen_parameters in (True, False):
+      with frozen(alg.critic) if frozen_parameters else nullcontext():
+        # Both a time-major trajectory and differently sized minibatches.
+        for shape in ((7,), (3, 2), (5,)):
+          x = torch.randn(*shape, alg.critic.norm.mean.numel(), device=device, requires_grad=True)
+          h = torch.randn(*shape, cfg.depth_latent_dim, device=device, requires_grad=True)
+          other_x = x.detach().clone().requires_grad_()
+          other_h = h.detach().clone().requires_grad_()
+          target = torch.randn(*shape, device=device)
+          expected = legacy_critic_forward(alg, x, h)
+          actual = value(other_x, other_h)
+          torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
+          expected_loss = alg.critic_error(expected, target)
+          actual_loss = error(actual, target)
+          parameters = () if frozen_parameters else tuple(alg.v_parameters)
+          eg = torch.autograd.grad(expected_loss, (x, h, *parameters))
+          ag = torch.autograd.grad(actual_loss, (other_x, other_h, *parameters))
+          assert ag[0].abs().sum() > 0 and ag[1].abs().sum() > 0
+          for a, b in zip(ag, eg):
+            torch.testing.assert_close(a, b, rtol=1e-3, atol=1e-5)
+    assert all(p.grad is None for p in alg.wm.depth_encoder.parameters())
+  finally:
+    torch.compiler.reset()
