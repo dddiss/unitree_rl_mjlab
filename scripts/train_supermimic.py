@@ -67,7 +67,8 @@ def main():
   if args.device.startswith("cuda") and not torch.cuda.is_available():
     raise RuntimeError("SuperMimic GPU training requires an available NVIDIA CUDA device")
   env = make_env(args.motion_file, num_envs=cfg.num_envs, device=args.device,
-                 gamma=cfg.gamma, seed=cfg.seed, depth_enabled=cfg.depth_enabled)
+                 gamma=cfg.gamma, seed=cfg.seed, depth_enabled=cfg.depth_enabled,
+                 collect_foot_rewards=True)
   runner = None
   exit_code = 1
   try:

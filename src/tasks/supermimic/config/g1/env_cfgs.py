@@ -17,10 +17,46 @@ from ...terrain.sensor import PbfmTerrainHeightSensorCfg
 from mjlab.sensor import ObjRef
 
 
+def configure_foot_reward_sensors(cfg, *, collect_foot_rewards=False):
+  """Training also measures zero-weight terms to supervise the WM cost heads."""
+  from mjlab.sensor.raycast_sensor import GridPatternCfg
+  from ...terrain.foot_sensor import WorldUpTerrainHeightSensorCfg
+
+  stumble = cfg.rewards.get("feet_stumble")
+  support = cfg.rewards.get("feet_at_plane")
+  if stumble is not None and (collect_foot_rewards or stumble.weight != 0):
+    cfg.scene.sensors += (ContactSensorCfg(
+      name=stumble.params["sensor_name"],
+      primary=ContactMatch(mode="geom", pattern=r"(left|right)_foot.*_collision", entity="robot"),
+      fields=("force", "normal", "tangent"), reduce="maxforce", num_slots=2,
+      global_frame=True, history_length=cfg.decimation,
+    ),)
+  if support is not None and (collect_foot_rewards or support.weight != 0):
+    feet = support.params.get("foot_body_names", ("left_ankle_roll_link", "right_ankle_roll_link"))
+    cfg.scene.sensors += (
+      ContactSensorCfg(
+        name=support.params["contact_sensor_name"],
+        primary=ContactMatch(mode="body", pattern=feet, entity="robot"),
+        fields=("force",), reduce="netforce", history_length=cfg.decimation,
+      ),
+      WorldUpTerrainHeightSensorCfg(
+        name=support.params["sensor_name"],
+        frame=tuple(ObjRef(type="body", name=name, entity="robot") for name in feet),
+        pattern=GridPatternCfg(size=(0.23, 0.04), resolution=0.01),
+        ray_alignment="base", local_center=(0.025, 0.0, -0.045),
+        ray_start_height=20.0, max_distance=25.0,
+        # Generated terrain and its remapped padding use 5; the plane uses 0.
+        include_geom_groups=(5,) if cfg.scene.terrain.terrain_type == "generator" else (0,),
+        debug_vis=False,
+      ),
+    )
+
+
 def unitree_g1_flat_tracking_env_cfg(
   play: bool = False,
   depth_camera=None,
   terrain_type: str | None = None,
+  collect_foot_rewards: bool = False,
 ) -> ManagerBasedRlEnvCfg:
   """Create G1 tracking configuration (legacy factory name retained)."""
   cfg = make_tracking_env_cfg()
@@ -95,4 +131,5 @@ def unitree_g1_flat_tracking_env_cfg(
       replace(g, friction=(1.0,)) for g in cfg.scene.terrain.geoms
     ))
 
+  configure_foot_reward_sensors(cfg, collect_foot_rewards=collect_foot_rewards)
   return cfg

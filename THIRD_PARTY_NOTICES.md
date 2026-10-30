@@ -34,7 +34,15 @@ configuration without Hydra, and applied height placement to SuperMimic's existi
 reset XY/pose/velocity/joint sampling. The ground probe starts above the compiled
 map's highest collision bound to cover reference positions outside their initial
 tile; the final height rule is unchanged. P-BFM's region sampling, random heading,
-lying resets, terrain observations, and reward definitions are not imported.
+lying resets and terrain observations are not imported.
+
+`src/tasks/supermimic/mdp/foot_rewards.py` and
+`src/tasks/supermimic/terrain/foot_sensor.py` additionally adapt that revision's
+`feet_stumble`, `feet_at_plane`, fixed sole weights, height-clearance handling,
+and world-down sole scanner. Manager adapters and G1 sensor configuration are
+integrated locally. Measured raw costs supervise a shared world-model prediction
+head; imagination applies the configured reward weights and control timestep.
+These portions retain the same CC BY-NC 4.0 license and attribution above.
 
 ## supermimic_vibed
 

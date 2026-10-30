@@ -49,7 +49,10 @@ def test_warmup_cli_defaults_and_resume_overrides(tmp_path, monkeypatch, saved_s
 
   # Keep the real CLI and configuration; replace only environment/runner startup.
   config_module = ModuleType("src.tasks.supermimic.config")
-  config_module.make_env = lambda *args, **kwargs: env
+  def make_env(*args, **kwargs):
+    assert kwargs['collect_foot_rewards'] is True
+    return env
+  config_module.make_env = make_env
   runner_module = ModuleType("src.tasks.supermimic.rl.runner")
   runner_module.SuperMimicRunner = Runner
   monkeypatch.setitem(sys.modules, config_module.__name__, config_module)

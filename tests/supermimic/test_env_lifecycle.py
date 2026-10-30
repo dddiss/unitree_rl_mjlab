@@ -38,7 +38,8 @@ def test_command_subset_dt_zero_and_last_frame():
 
 
 @pytest.mark.parametrize('visual', [False, True])
-def test_step_captures_state_and_target_before_command_advance(visual):
+@pytest.mark.parametrize('foot_support', [False, True])
+def test_step_captures_state_and_target_before_command_advance(visual, foot_support):
   events=[]
   ns=methods(ROOT/'src/tasks/supermimic/env.py','SuperMimicEnv',{'step'},
              {'torch':torch,'flatten_state':lambda x:x,'read_state':lambda e:e.state,
@@ -46,6 +47,7 @@ def test_step_captures_state_and_target_before_command_advance(visual):
   class Env: step=ns['step']
   e=Env();e.state=torch.zeros(2,71);e.device='cpu';e._manual_reset_pending=torch.zeros(2,dtype=torch.bool)
   e._sim_step_counter=e.common_step_counter=0;e.physics_dt=.005;e.step_dt=.02
+  e._sense_before_rewards=foot_support
   e.episode_length_buf=torch.zeros(2,dtype=torch.long);e.cfg=NS(decimation=4);e.extras={}
   cmd=NS(time_steps=torch.tensor([4,7]),update_relative_body_poses=lambda:events.append('align'))
   cmd.metrics={name:torch.zeros(2) for name in TRACKING_METRICS}
@@ -77,7 +79,18 @@ def test_step_captures_state_and_target_before_command_advance(visual):
   e.termination_manager.get_term=lambda name:e.termination_manager.terminated
   def reward(dt):
     events.append('reward');assert cmd.time_steps.tolist()==[4,7];return torch.tensor([.1,.1])
-  e.reward_manager=NS(compute=reward,active_terms=['tracking'],get_term_cfg=lambda name:NS(weight=5.0))
+  e.reward_manager=NS(compute=reward,active_terms=['tracking', 'feet_at_plane'],
+                      get_term_cfg=lambda name:NS(weight=5.0 if name=='tracking' else 0.0),
+                      _step_reward=torch.tensor([[5., 0.], [5., 0.]]))
+  if foot_support:
+    e.foot_reward_names = ('feet_stumble', 'feet_at_plane')
+    def measured(env, factor):
+      events.append('foot_label')
+      assert events[-2] != 'command'
+      return env.state[:, 0] * factor + cmd.time_steps * .01
+    e.reward_manager.get_term_cfg = lambda name: NS(
+      weight=5. if name == 'tracking' else 0., func=measured,
+      params={'factor': .1 if name == 'feet_stumble' else .2})
   e.shared_reward_terms=lambda:{'tracking':torch.ones(2)}
   e.event_manager=NS(available_modes=['startup'])
   e.observation_manager=NS(compute=lambda update_history:{})
@@ -91,6 +104,16 @@ def test_step_captures_state_and_target_before_command_advance(visual):
   assert e.last_step_metrics['tracking']['error_anchor_pos'].tolist()==[0.,0.]
   assert cmd.metrics['error_anchor_pos'].tolist()==[0.,1.]
   torch.testing.assert_close(e.last_step_metrics['reward']['tracking'],tr['r'])
+  assert e.last_step_metrics['reward']['feet_at_plane'].eq(0).all()
+  assert events.count('sense') == 1
+  if foot_support:
+    assert events.index('forward') < events.index('sense') < events.index('reward')
+    assert events.index('reward') < events.index('foot_label') < events.index('command')
+    torch.testing.assert_close(tr['foot_costs'], torch.tensor([[.44, .84], [.47, .87]]))
+    # Raw labels are available although the actual foot reward is still zero.
+    assert tr['r'].eq(.1).all()
+  else:
+    assert events.index('command') < events.index('sense')
   assert e._manual_reset_pending.tolist()==[True,False]
   if visual:
     assert events.index('sense')<events.index('depth')
@@ -100,6 +123,8 @@ def test_step_captures_state_and_target_before_command_advance(visual):
     assert tr['depth_next'][0].eq(4).all()
   e.state.zero_()
   assert tr['s1'].eq(4).all()
+  if foot_support:
+    torch.testing.assert_close(tr['foot_costs'], torch.tensor([[.44, .84], [.47, .87]]))
   with pytest.raises(RuntimeError):e.step(torch.zeros(2,29))
 
 

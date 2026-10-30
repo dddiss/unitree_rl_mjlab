@@ -172,6 +172,18 @@ def make_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
       weight=-2.0,
       params={"asset_cfg": SceneEntityCfg("robot", joint_names=(".*",))},
     ),
+    # Measured P-BFM costs supervise two outputs of one WM head even at weight=0.
+    # Keep these reward weights unchanged; use negative weights to penalize.
+    "feet_stumble": RewardTermCfg(
+      func=mdp.feet_stumble, weight=-2.0,
+      params={"sensor_name": "foot_collision_contacts", "horizontal_ratio": 1.0,
+              "force_threshold": 20.0, "force_scale": 100.0, "max_penalty": 1.0},
+    ),
+    "feet_at_plane": RewardTermCfg(
+      func=mdp.feet_at_plane, weight=0.0,
+      params={"sensor_name": "foot_height_scanners", "contact_sensor_name": "foot_support_contacts",
+              "height_tolerance": 0.03, "transition_width": 0.005, "contact_threshold": 1.0},
+    ),
   }
 
   ##
@@ -233,8 +245,8 @@ def make_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
       azimuth=120.0,
     ),
     sim=SimulationCfg(
-      nconmax=35,
-      njmax=250,
+      nconmax=128,
+      njmax=512,
       mujoco=MujocoCfg(
         timestep=0.005,
         iterations=10,

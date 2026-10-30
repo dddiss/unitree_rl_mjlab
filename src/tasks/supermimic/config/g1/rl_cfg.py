@@ -25,11 +25,13 @@ class SuperMimicConfig:
   depth_skip: int = 5
   depth_latent_dim: int = 256
   depth_frame_dim: int = 256
-  depth_checkpoint: bool = True  # Recompute visual activations during BPTT to save memory.
+  depth_checkpoint: bool = False  # Recompute visual activations during BPTT to save memory.
   depth_batch_size: int = 256  # Bound perception/decoder workspace; does not change learner batches.
   state_loss_weight: float = 1.0  # Existing scaled state MSE.
   latent_loss_weight: float = 1.0  # Predicted h vs stop-gradient real-history h, mean over features.
   depth_loss_weight: float = 1.0  # Normalized pixel MSE. All losses sum valid steps / batch.
+  feet_stumble_loss_weight: float = 1.0  # Raw measured cost MSE; independent of reward weight.
+  feet_at_plane_loss_weight: float = 1.0  # Raw measured cost MSE; sum valid steps / batch.
   wm_perception_lr: float = 2e-4  # Shared CNN+GRU; updated by the WM optimizer only.
   depth_decoder_lr: float = 2e-4
   gamma: float = 0.99
@@ -73,7 +75,8 @@ class SuperMimicConfig:
     for name in ("wm_perception_lr", "depth_decoder_lr"):
       if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
         raise ValueError(f"{name} must be finite and positive")
-    for name in ("state_loss_weight", "latent_loss_weight", "depth_loss_weight"):
+    for name in ("state_loss_weight", "latent_loss_weight", "depth_loss_weight",
+                 "feet_stumble_loss_weight", "feet_at_plane_loss_weight"):
       if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
         raise ValueError(f"{name} must be finite and nonnegative")
     for name in ("pi_clip", "pi_clip_value"):

@@ -27,9 +27,29 @@ class MdpConfig:
   body_ori_std: float = 0.4
   body_linvel_std: float = 1.0
   body_angvel_std: float = 3.14
-  term_height: float = 0.25
-  term_tilt: float = 0.8
+  # None disables the corresponding hard AND imagined soft termination.
+  term_height: float | None = 0.25
+  term_tilt: float | None = 0.8
   step_dt: float = 0.02
+
+  @classmethod
+  def from_env_cfg(cls, rewards, terminations, step_dt):
+    """Mirror enabled manager terms without requiring every optional component."""
+    cfg = cls(weights={k: v.weight for k, v in rewards.items() if v is not None},
+              step_dt=step_dt)
+    for key, attribute in (("motion_global_root_pos", "root_pos_std"),
+                           ("motion_global_root_ori", "root_ori_std"),
+                           ("motion_body_pos", "body_pos_std"),
+                           ("motion_body_ori", "body_ori_std"),
+                           ("motion_body_lin_vel", "body_linvel_std"),
+                           ("motion_body_ang_vel", "body_angvel_std")):
+      term = rewards.get(key)
+      if term is not None:
+        setattr(cfg, attribute, term.params["std"])
+    for key, attribute in (("anchor_pos", "term_height"), ("anchor_ori", "term_tilt")):
+      term = terminations.get(key)
+      setattr(cfg, attribute, None if term is None else term.params["threshold"])
+    return cfg
 
 
 class FunctionalMDP:
@@ -52,6 +72,15 @@ class FunctionalMDP:
   @property
   def max_step_reward(self):
     return sum(max(0.0, w) for w in self.cfg.weights.values()) * self.cfg.step_dt
+
+  def validate_imagination_rewards(self, learned_rewards=()):
+    unsupported = [name for name, weight in self.cfg.weights.items()
+                   if weight != 0 and name not in REWARD_WEIGHTS and name not in learned_rewards]
+    if unsupported:
+      raise ValueError(
+        f"No imagined reward implementation for {unsupported}. "
+        "Keep their weights at 0 until matching WM reward heads are implemented."
+      )
 
   def reference_root(self, f):
     m, b = self.motion, self.root_body_index
@@ -124,7 +153,7 @@ class FunctionalMDP:
 
   def reward(self, state, f, action, a_prev):
     terms = self.reward_terms(state, f, action, a_prev)
-    return sum(self.cfg.weights[k] * value for k, value in terms.items()) * self.cfg.step_dt
+    return sum(self.cfg.weights.get(k, 0.0) * value for k, value in terms.items()) * self.cfg.step_dt
 
   def termination_errors(self, state, f):
     rp, rr, _, _ = self.reference_root(f)
@@ -132,12 +161,20 @@ class FunctionalMDP:
 
   def termination(self, state, f):
     z, tilt = self.termination_errors(state, f)
-    return (z > self.cfg.term_height) | (tilt > self.cfg.term_tilt)
+    done = torch.zeros_like(z, dtype=torch.bool)
+    if self.cfg.term_height is not None:
+      done = done | (z > self.cfg.term_height)
+    if self.cfg.term_tilt is not None:
+      done = done | (tilt > self.cfg.term_tilt)
+    return done
 
   def soft_termination(self, state, f):
     z, tilt = self.termination_errors(state, f)
-    alive = ((1 - torch.sigmoid((z - self.cfg.term_height) / 0.02))
-             * (1 - torch.sigmoid((tilt - self.cfg.term_tilt) / 0.04)))
+    alive = torch.ones_like(z)
+    if self.cfg.term_height is not None:
+      alive = alive * (1 - torch.sigmoid((z - self.cfg.term_height) / 0.02))
+    if self.cfg.term_tilt is not None:
+      alive = alive * (1 - torch.sigmoid((tilt - self.cfg.term_tilt) / 0.04))
     return 1 - alive
 
   def critic_features(self, state, f, normalized_xi, a_prev):

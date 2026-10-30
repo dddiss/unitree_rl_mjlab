@@ -4,13 +4,14 @@ import torch
 from mjlab.envs import ManagerBasedRlEnv
 
 from .mdp.functional import FunctionalMDP, MdpConfig
+from .mdp.foot_rewards import FOOT_REWARD_NAMES
 from .mdp.kinematics import G1Kinematics
 from .mdp.logging_metrics import capture_step_metrics
 from .mdp.state import read_state, flatten_state
 
 
 class SuperMimicEnv(ManagerBasedRlEnv):
-  def __init__(self, cfg, *, depth_camera=None, **kwargs):
+  def __init__(self, cfg, *, depth_camera=None, collect_foot_rewards=False, **kwargs):
     if cfg.auto_reset:
       raise ValueError("SuperMimic requires auto_reset=False")
     self._functional_mdp = self._context = self._reward_terms = None
@@ -18,6 +19,11 @@ class SuperMimicEnv(ManagerBasedRlEnv):
     self.last_step_metrics = None
     self._depth_camera = None
     self._depth_image = None
+    self.foot_reward_names = tuple(name for name in FOOT_REWARD_NAMES
+                                   if collect_foot_rewards and cfg.rewards.get(name) is not None)
+    support = cfg.rewards.get("feet_at_plane")
+    self._sense_before_rewards = support is not None and (
+      support.weight != 0 or "feet_at_plane" in self.foot_reward_names)
     super().__init__(cfg, **kwargs)
     if depth_camera is not None:
       from .perception.camera import DepthCamera
@@ -55,15 +61,7 @@ class SuperMimicEnv(ManagerBasedRlEnv):
       kin = G1Kinematics(self.sim.mj_model, robot.indexing.joint_ids.tolist(),
                          robot.indexing.body_ids[cmd.body_indexes].tolist(),
                          int(robot.indexing.body_ids[cmd.root_body_index]), self.device)
-      cfg = MdpConfig(weights={k: v.weight for k, v in self.cfg.rewards.items()}, step_dt=self.step_dt)
-      for key, attribute in (("motion_global_root_pos", "root_pos_std"),
-                             ("motion_global_root_ori", "root_ori_std"),
-                             ("motion_body_pos", "body_pos_std"), ("motion_body_ori", "body_ori_std"),
-                             ("motion_body_lin_vel", "body_linvel_std"),
-                             ("motion_body_ang_vel", "body_angvel_std")):
-        setattr(cfg, attribute, self.cfg.rewards[key].params["std"])
-      cfg.term_height = self.cfg.terminations["anchor_pos"].params["threshold"]
-      cfg.term_tilt = self.cfg.terminations["anchor_ori"].params["threshold"]
+      cfg = MdpConfig.from_env_cfg(self.cfg.rewards, self.cfg.terminations, self.step_dt)
       self._functional_mdp = FunctionalMDP(cmd.motion, kin, robot.data.default_joint_pos[0],
                                            cmd.body_indexes, cmd.root_body_index,
                                            robot.data.soft_joint_pos_limits[0], cfg)
@@ -115,6 +113,9 @@ class SuperMimicEnv(ManagerBasedRlEnv):
     self.episode_length_buf += 1
     self.common_step_counter += 1
     self.sim.forward()
+    if getattr(self, "_sense_before_rewards", False):
+      # Foot support must query post-action ground, not the preceding step's rays.
+      self.sim.sense()
     cmd.update_relative_body_poses()
     self.reset_buf = self.termination_manager.compute()
     self.reset_terminated = self.termination_manager.terminated
@@ -125,11 +126,24 @@ class SuperMimicEnv(ManagerBasedRlEnv):
       {name: self.reward_manager.get_term_cfg(name).weight for name in self.reward_manager.active_terms},
       {name: self.termination_manager.get_term(name) for name in self.termination_manager.active_terms},
       self.step_dt,
+      reward_contributions={
+        name: self.reward_manager._step_reward[:, i] * self.step_dt
+        for i, name in enumerate(self.reward_manager.active_terms)
+      },
     )
     self.metrics_manager.compute()
     transition.update(s1=flatten_state(read_state(self)).clone(),
                       a=self.action_manager.action.clone(), r=self.reward_buf.clone(),
                       terminated=self.reset_terminated.clone(), truncated=self.reset_time_outs.clone())
+    if getattr(self, "foot_reward_names", ()):
+      # RewardManager skips weight=0, so evaluate raw sensor labels explicitly.
+      # These include terminal contacts/terrain BEFORE target advance or reset.
+      values = []
+      for name in self.foot_reward_names:
+        term = self.reward_manager.get_term_cfg(name)
+        values.append(torch.nan_to_num(term.func(self, **term.params).float(),
+                                       nan=0.0, posinf=0.0, neginf=0.0))
+      transition["foot_costs"] = torch.stack(values, -1).clone()
     self.last_transition = transition
     # The scoped configuration only contains startup events. Fail explicitly if
     # a later extension adds post-step perturbations without defining s1 timing.
@@ -137,7 +151,8 @@ class SuperMimicEnv(ManagerBasedRlEnv):
       raise ValueError("SuperMimic step/interval events need an explicit transition convention")
     # A finished row keeps its evaluated target until the caller resets it.
     self.command_manager.compute(dt=torch.where(self.reset_buf, 0.0, self.step_dt))
-    self.sim.sense()
+    if not getattr(self, "_sense_before_rewards", False):
+      self.sim.sense()
     if getattr(self, "_depth_camera", None) is not None:
       self._depth_image = self._depth_camera.read()
       # Includes the terminal transition's real post-action, PRE-reset image.

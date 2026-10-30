@@ -18,6 +18,8 @@ def capture_step_metrics(
   reward_weights: Mapping[str, float],
   termination_terms: Mapping[str, torch.Tensor],
   step_dt: float,
+  *,
+  reward_contributions: Mapping[str, torch.Tensor] | None = None,
 ) -> dict[str, dict[str, torch.Tensor]]:
   """Capture per-environment values before advancing targets or resetting.
 
@@ -30,10 +32,14 @@ def capture_step_metrics(
   command._update_metrics()
   return {
     "tracking": {name: command.metrics[name].detach().clone() for name in TRACKING_METRICS},
-    "reward": {
+    # The environment supplies the mjlab 1.6 manager's already weighted/sanitized
+    # cache. This also covers measured terms absent from the analytic MDP and
+    # zero-weight terms whose sensor/function was deliberately not evaluated.
+    "reward": ({name: value.detach().clone() for name, value in reward_contributions.items()}
+               if reward_contributions is not None else {
       name: torch.nan_to_num(raw_reward_terms[name].detach() * weight * step_dt,
                              nan=0.0, posinf=0.0, neginf=0.0)
       for name, weight in reward_weights.items()
-    },
+    }),
     "termination": {name: value.detach().clone() for name, value in termination_terms.items()},
   }

@@ -85,13 +85,16 @@ class SuperMimicRunner:
     self.log_dir = Path(log_dir)
     self.log_dir.mkdir(parents=True, exist_ok=True)
     self.algorithm = SuperMimicAlgorithm(env.functional_mdp, cfg, env.device)
+    if tuple(getattr(env, "foot_reward_names", ())) != self.algorithm.foot_reward_names:
+      raise ValueError("Training environment must collect the configured WM foot-cost labels")
     self.command = env.command_manager.get_term("motion")
     self.command.sampler.bin_ema = cfg.bin_ema
     self.command.sampler.softmax_cap = cfg.softmax_cap
     self.motion = self.command.motion
     self.buffer = ReplayBuffer(cfg.buffer_steps, env.num_envs, env.context,
                                self.motion.clip_end, self.motion.clip_id, cfg.horizon,
-                               cfg.depth_history_length if cfg.depth_enabled else 0)
+                               cfg.depth_history_length if cfg.depth_enabled else 0,
+                               foot_reward_names=self.algorithm.foot_reward_names)
     self.controller = PolicyController(env, self.algorithm.policy, cfg, noise=True, update_norm=True)
     self.iteration = self.sim_steps = self.env_steps = 0
     self.step_acc = self.wall_offset = 0.0
@@ -153,7 +156,8 @@ class SuperMimicRunner:
 
   def save(self, path):
     checkpoint = {
-      "format_version": 3 if self.cfg.depth_enabled else 1, "algorithm": self.algorithm.state_dict(),
+      "format_version": (5 if self.algorithm.foot_reward_names else
+                         3 if self.cfg.depth_enabled else 1), "algorithm": self.algorithm.state_dict(),
       "config": asdict(self.cfg), "motions": motion_manifest(self.motion),
       "sampler": self.command.sampler.state_dict(), "iteration": self.iteration,
       "sim_steps": self.sim_steps, "env_steps": self.env_steps, "step_acc": self.step_acc,
@@ -170,6 +174,12 @@ class SuperMimicRunner:
     if ck["config"].get("depth_enabled", False) and ck.get("format_version", 1) < 3:
       raise ValueError("Legacy visual checkpoint predicts image-decoder latents, not shared history h. "
                        "Start new training; legacy policies remain available for play/evaluation.")
+    if self.algorithm.foot_reward_names and ck.get("format_version", 1) < 4:
+      raise ValueError("This checkpoint has no WM foot-cost heads or their optimizer state. "
+                       "Start new training with foot-cost supervision; the old policy remains playable.")
+    if self.algorithm.foot_reward_names and ck.get("format_version", 1) == 4:
+      raise ValueError("This checkpoint uses independent WM foot-cost MLPs, not the shared MLP. "
+                       "Start new training with the shared head; the old policy remains playable.")
     saved_cfg = asdict(SuperMimicConfig(**migrate_checkpoint_config(ck["config"])))
     current_cfg = asdict(self.cfg)
     # Scheduling, logging, precision, collection mix, sampling and actor clipping may change without
@@ -263,8 +273,8 @@ class SuperMimicRunner:
     row = {"iteration": self.iteration, "wall_h": (self.wall_offset + time.monotonic() - self._started) / 3600,
            "sim_steps": self.sim_steps, "env_steps": self.env_steps, "lr": lr}
     row.update({key: float(np.mean(self.stats[key])) if self.stats.get(key) else "" for key in LEGACY_FIELDS[5:]})
-    if self.cfg.depth_enabled:
-      row.update({key: float(np.mean(self.stats[key])) if self.stats.get(key) else "" for key in VISUAL_FIELDS})
+    row.update({key: float(np.mean(self.stats[key])) if self.stats.get(key) else ""
+                for key in self.wm_auxiliary_fields})
     row.update(self.interval_metrics.values())
     row.update(sampling_metrics(self.command))
     now = time.monotonic()
@@ -295,10 +305,17 @@ class SuperMimicRunner:
   def _start_logging(self):
     if self.logger is None:
       fields = LEGACY_FIELDS + self.interval_metrics.fields + SAMPLING_FIELDS + PERFORMANCE_FIELDS
-      if self.cfg.depth_enabled:
-        fields += VISUAL_FIELDS
+      fields += self.wm_auxiliary_fields
       self.logger = TrainingLogger(self.log_dir, self.cfg, fields,
                                    resume_checkpoint=self._resume_checkpoint, start_iteration=self.iteration)
+
+  @property
+  def wm_auxiliary_fields(self):
+    fields = VISUAL_FIELDS if self.cfg.depth_enabled else ()
+    fields += tuple("wm_" + name + "_loss" for name in self.algorithm.foot_reward_names)
+    if self.algorithm.foot_reward_names and not self.cfg.depth_enabled:
+      fields += ("wm_total_loss",)
+    return fields
 
   def close(self, exit_code=0):
     if self.logger is not None:

@@ -7,6 +7,7 @@ import torch
 from mjlab.sensor import ContactSensor
 
 from .commands import MotionCommand
+from .foot_rewards import clipped_height_clearance, feet_at_plane_penalty, feet_stumble_penalty
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
@@ -97,3 +98,47 @@ def supermimic_action_rate(env):
 
 def supermimic_joint_limit(env, asset_cfg=None):
   return env.shared_reward_terms()["joint_limit"]
+
+
+def feet_stumble(
+  env, sensor_name: str = "foot_collision_contacts", horizontal_ratio: float = 1.0,
+  force_threshold: float = 20.0, force_scale: float = 100.0, max_penalty: float = 1.0,
+) -> torch.Tensor:
+  """P-BFM cost for the strongest horizontal-dominant foot impact this step.
+
+  Requires world-frame, per-geometry contact history covering the decimation.
+  Its unweighted value supervises the WM's feet_stumble prediction head.
+  """
+  history = env.scene[sensor_name].data.force_history
+  if history is None:
+    raise ValueError("feet_stumble requires a contact sensor with force history")
+  return feet_stumble_penalty(history, horizontal_ratio, force_threshold, force_scale, max_penalty)
+
+
+def feet_at_plane(
+  env, sensor_name: str = "foot_height_scanners", contact_sensor_name: str = "foot_support_contacts",
+  foot_body_names: tuple[str, ...] = ("left_ankle_roll_link", "right_ankle_roll_link"),
+  height_tolerance: float = 0.03, transition_width: float = 0.005,
+  contact_threshold: float = 1.0,
+) -> torch.Tensor:
+  """P-BFM unsupported-sole cost, gated by each foot's vertical net contact.
+
+  The scanner must have sensed the post-action state, before target advancement.
+  Swing feet are unpenalized. A ray miss is treated as unsupported, not as ground.
+  """
+  sensor = env.scene[sensor_name]
+  contacts = env.scene[contact_sensor_name]
+  history = contacts.data.force_history
+  if history is None:
+    raise ValueError("feet_at_plane requires a contact sensor with force history")
+  names = [name.rsplit("/", 1)[-1] for name in contacts.primary_names]
+  indices = [names.index(name) for name in foot_body_names]
+  is_contact = history[:, indices, :, 2].abs().amax(dim=-1) > contact_threshold
+  shape = (env.num_envs, len(foot_body_names), sensor.num_rays_per_frame)
+  data = sensor.data
+  clearance = clipped_height_clearance(
+    sensor.sample_points_w[..., 2].reshape(shape),
+    data.hit_pos_w[..., 2].reshape(shape), data.distances.reshape(shape),
+  )
+  return feet_at_plane_penalty(clearance, is_contact, sensor.point_weights,
+                               height_tolerance=height_tolerance, transition_width=transition_width)

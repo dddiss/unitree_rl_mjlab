@@ -22,6 +22,8 @@ WANDB_METRIC_NAMES = {
   "wm_depth_loss": "Loss/wm_depth_loss",
   "wm_latent_loss": "Loss/wm_latent_loss",
   "wm_total_loss": "Loss/wm_total_loss",
+  "wm_feet_stumble_loss": "Loss/wm_feet_stumble_loss",
+  "wm_feet_at_plane_loss": "Loss/wm_feet_at_plane_loss",
   "pi_loss": "Loss/pi_loss",
   "v_loss": "Loss/v_loss",
   "lr": "Training/lr",
@@ -84,7 +86,8 @@ def format_terminal_summary(
   lines.append("-" * width)
   for key in ("wm_loss", "wm_err_last", "pi_loss", "v_loss"):
     add(WANDB_METRIC_NAMES[key], value(row.get(key), ".6f"))
-  for key in ("wm_latent_loss", "wm_depth_loss", "wm_total_loss"):
+  for key in ("wm_latent_loss", "wm_depth_loss", "wm_feet_stumble_loss",
+              "wm_feet_at_plane_loss", "wm_total_loss"):
     if key in row:
       add(WANDB_METRIC_NAMES[key], value(row.get(key), ".6f"))
   add("Training/lr", value(row.get("lr"), ".3e"))

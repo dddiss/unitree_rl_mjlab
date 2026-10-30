@@ -11,13 +11,18 @@ FIELDS = {"s": (STATE_DIM, torch.float32), "s1": (STATE_DIM, torch.float32),
 
 
 class ReplayBuffer:
-  def __init__(self, capacity, num_envs, xi, clip_end, clip_id, horizon, depth_history_length=0):
+  def __init__(self, capacity, num_envs, xi, clip_end, clip_id, horizon, depth_history_length=0,
+               foot_reward_names=()):
     self.capacity, self.num_envs = capacity, num_envs
     self.xi = xi.detach().clone()  # startup parameters, immutable until buffer recreation
     self.device = xi.device
     self.clip_end, self.clip_id, self.horizon = clip_end, clip_id, horizon
     self.data = {k: torch.empty((capacity, num_envs) + (() if n is None else (n,)),
                                dtype=dtype, device=self.device) for k, (n, dtype) in FIELDS.items()}
+    self.foot_reward_names = tuple(foot_reward_names)
+    if self.foot_reward_names:
+      self.data["foot_costs"] = torch.empty(capacity, num_envs, len(self.foot_reward_names),
+                                            device=self.device, dtype=torch.float32)
     self.eligible = torch.zeros(capacity, num_envs, dtype=torch.bool, device=self.device)
     self.ptr = self.size = 0
     self._window_choices = {}
@@ -32,7 +37,7 @@ class ReplayBuffer:
     if self.depth is not None:
       self.depth.add(self.ptr, transition["depth"], transition["depth_next"],
                      transition["terminated"] | transition["truncated"])
-    for key in FIELDS:
+    for key in self.data:
       self.data[key][self.ptr].copy_(transition[key])
     f = transition["f"]
     # f is the next target, so even the last frame has one valid transition.
@@ -82,6 +87,8 @@ class ReplayBuffer:
       envs = torch.randint(self.num_envs, (batch,), device=self.device)[:, None]
     rows = self._row(ages + torch.arange(length, device=self.device))
     out = {k: self.data[k][rows, envs] for k in ("s", "s1", "a", "terminated", "truncated")}
+    if self.foot_reward_names:
+      out["foot_costs"] = self.data["foot_costs"][rows, envs]
     done = out["terminated"] | out["truncated"]
     out["mask"] = torch.cat((torch.ones(batch, 1, device=self.device),
                               (~done[:, :-1]).float()), -1).cumprod(-1)

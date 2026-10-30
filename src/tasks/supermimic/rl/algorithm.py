@@ -9,6 +9,7 @@ import torch
 from torch import nn
 
 from ..mdp.state import GOAL_FRAME_DIM, INV_DIM, OBS_DIM, normalize_xi, unflatten_state
+from ..mdp.foot_rewards import FOOT_REWARD_NAMES
 from . import networks
 from .networks import WorldModel, Policy, Critic
 from ..perception.history import select_history
@@ -42,9 +43,11 @@ def frozen(*models):
 class SuperMimicAlgorithm:
   def __init__(self, mdp, cfg, device):
     self.mdp, self.cfg, self.device = mdp, cfg, torch.device(device)
+    self.foot_reward_names = tuple(name for name in FOOT_REWARD_NAMES if name in mdp.cfg.weights)
+    mdp.validate_imagination_rewards(self.foot_reward_names)
     networks.AMP_DTYPE = torch.bfloat16 if cfg.amp == "bf16" else None
     goal_dim = GOAL_FRAME_DIM * cfg.goal_frames
-    self.wm = WorldModel(cfg.wm_hidden, depth_cfg=cfg).to(device)
+    self.wm = WorldModel(cfg.wm_hidden, depth_cfg=cfg, foot_reward_names=self.foot_reward_names).to(device)
     encoder = self.wm.depth_encoder if cfg.depth_enabled else None
     self.policy = Policy(OBS_DIM, goal_dim, cfg.hist, hidden=cfg.policy_hidden,
                          depth_cfg=cfg, depth_encoder=encoder).to(device)
@@ -119,18 +122,29 @@ class SuperMimicAlgorithm:
     state = unflatten_state(states[:, 0])
     predictions = []
     latents = []
+    costs = []
+    latent = None
     if self.cfg.depth_enabled:
       # Only the initial h reads real images, with gradients to the shared CNN/GRU.
       latent = self.encode_depth(depth_history)
     for j in range(self.cfg.wm_window):
-      if self.cfg.depth_enabled:
+      if self.foot_reward_names:
+        state, latent, foot_cost = self.wm.step_with_foot_costs(
+          state, actions[:, j], normalize_xi(xi[:, j]), latent)
+        costs.append(foot_cost)
+        if self.cfg.depth_enabled:
+          latents.append(latent)
+      elif self.cfg.depth_enabled:
         state, latent = self.wm.step_visual(state, actions[:, j], normalize_xi(xi[:, j]), latent)
         latents.append(latent)
       else:
         state = self.wm.step(state, actions[:, j], normalize_xi(xi[:, j]))
       predictions.append(state)
     states = tuple(torch.stack([s[i] for s in predictions], 1) for i in range(6))
-    return (states, torch.stack(latents, 1)) if self.cfg.depth_enabled else states
+    result = (states, torch.stack(latents, 1)) if self.cfg.depth_enabled else (states,)
+    if self.foot_reward_names:
+      return (*result, torch.stack(costs, 1))
+    return result if self.cfg.depth_enabled else states
 
   def world_model_update(self, buffer, *, strict=False):
     """Fit one batch; skip if strict sampling has no complete same-episode window."""
@@ -138,22 +152,34 @@ class SuperMimicAlgorithm:
     w = buffer.sample_windows(c.wm_batch, c.wm_window, strict=strict)
     if w is None:
       return None
+    if self.foot_reward_names and tuple(buffer.foot_reward_names) != self.foot_reward_names:
+      raise ValueError("Replay foot-cost labels must match the WM prediction heads")
     if c.depth_enabled:
       target_latents = self._depth_targets(w["depth_history"], w["depth_next"])
-      predicted, latents = self._world_rollout(w["s"], w["a"], w["xi"], w["depth_history"])
+    rollout = self._world_rollout(w["s"], w["a"], w["xi"], w.get("depth_history"))
+    if self.foot_reward_names:
+      *rollout, costs = rollout
+    if c.depth_enabled:
+      predicted, latents = rollout
       images = self._decode_depth(latents)
       latent_error = (latents - target_latents).square().mean(-1)
       latent_loss = (latent_error * w["mask"]).sum() / c.wm_batch
       depth_error = (images - depth_float(w["depth_next"])).square().mean((-2, -1))
       depth_loss = (depth_error * w["mask"]).sum() / c.wm_batch
     else:
-      predicted = self._world_rollout(w["s"], w["a"], w["xi"])
+      predicted = rollout[0] if self.foot_reward_names else rollout
     scale = torch.maximum(self.wm.out_norm.std(), self.error_floor)
     error = (self.wm.state_error(predicted, unflatten_state(w["s1"])) / scale).square().mean(-1)
     state_loss = (error * w["mask"]).sum() / c.wm_batch
     loss = c.state_loss_weight * state_loss
     if c.depth_enabled:
       loss = loss + c.latent_loss_weight * latent_loss + c.depth_loss_weight * depth_loss
+    cost_losses = {}
+    for i, name in enumerate(self.foot_reward_names):
+      # Same valid-window mask/reduction as state loss, including terminal rows.
+      error_cost = (costs[..., i] - w["foot_costs"][..., i]).square()
+      cost_losses[name] = torch.where(w["mask"].bool(), error_cost, 0.0).sum() / c.wm_batch
+      loss = loss + getattr(c, name + "_loss_weight") * cost_losses[name]
     self.opt_wm.zero_grad(set_to_none=True)
     loss.backward()
     norm = nn.utils.clip_grad_norm_(self.wm.parameters(), 1.0)
@@ -164,8 +190,11 @@ class SuperMimicAlgorithm:
     metrics = {"wm_loss": float(state_loss.detach() / c.wm_window), "wm_err_last": float(last.detach())}
     if c.depth_enabled:
       metrics.update(wm_latent_loss=float(latent_loss.detach() / c.wm_window),
-                     wm_depth_loss=float(depth_loss.detach() / c.wm_window),
-                     wm_total_loss=float(loss.detach() / c.wm_window))
+                     wm_depth_loss=float(depth_loss.detach() / c.wm_window))
+    metrics.update({"wm_" + name + "_loss": float(value.detach() / c.wm_window)
+                    for name, value in cost_losses.items()})
+    if c.depth_enabled or self.foot_reward_names:
+      metrics["wm_total_loss"] = float(loss.detach() / c.wm_window)
     return metrics
 
   def critic_input(self, state, f, xi_n, goal, a_prev):
@@ -184,8 +213,12 @@ class SuperMimicAlgorithm:
     # One mean/backward/optimizer step for the original complete minibatch.
     return self._critic_error(self._critic_forward(x, depth_latent), target)
 
-  def reward_term(self, state, f, action, a_prev):
-    return self.mdp.reward(state, f, action, a_prev), self.mdp.soft_termination(state, f)
+  def reward_term(self, state, f, action, a_prev, foot_costs=None):
+    reward = self.mdp.reward(state, f, action, a_prev)
+    if foot_costs is not None:
+      for i, name in enumerate(self.foot_reward_names):
+        reward = reward + self.mdp.cfg.weights[name] * foot_costs[..., i] * self.mdp.cfg.step_dt
+    return reward, self.mdp.soft_termination(state, f)
 
   def next_target(self, f):
     m = self.mdp.motion
@@ -194,9 +227,14 @@ class SuperMimicAlgorithm:
   def _imagine_step(self, state, history, f, xi, goal, depth_latent=None):
     if self.cfg.depth_enabled:
       action = self.policy(history, self.mdp.add_goal_noise(goal), depth_latent=depth_latent)
-      next_state, next_latent = self.wm.step_visual(state, action, normalize_xi(xi), depth_latent)
     else:
       action = self.policy(history, self.mdp.add_goal_noise(goal))
+    if self.foot_reward_names:
+      next_state, next_latent, costs = self.wm.step_with_foot_costs(
+        state, action, normalize_xi(xi), depth_latent)
+    elif self.cfg.depth_enabled:
+      next_state, next_latent = self.wm.step_visual(state, action, normalize_xi(xi), depth_latent)
+    else:
       next_state = self.wm.step(state, action, normalize_xi(xi))
     # Reward evaluates next_state against f, BEFORE changing the target.
     next_f = self.next_target(f)
@@ -206,7 +244,8 @@ class SuperMimicAlgorithm:
     # Keep a clean goal and its gradient for the critic; only the policy adds noise.
     next_goal = self.mdp.goal(next_state, next_f, self.cfg.goal_frames)
     result = next_state, action, history, next_f, next_goal
-    return (*result, next_latent) if self.cfg.depth_enabled else result
+    result = (*result, next_latent) if self.cfg.depth_enabled else result
+    return (*result, costs) if self.foot_reward_names else result
 
   def policy_update(self, buffer):
     c = self.cfg
@@ -222,6 +261,7 @@ class SuperMimicAlgorithm:
     goal = self.mdp.goal(state, f, c.goal_frames)
     states, frames, goals = [state], [f], [goal]
     actions, previous_actions = [], []
+    predicted_costs = []
     batch_size = f.shape[0]
     motion = self.mdp.motion
     lengths = (motion.clip_end[motion.clip_id[f]] - f + 1).clamp(max=c.horizon)
@@ -237,10 +277,16 @@ class SuperMimicAlgorithm:
         visual_states = [latent]
       for t in range(c.horizon):
         if c.depth_enabled:
-          next_state, action, next_history, next_f, next_goal, next_latent = self._imag_step(
-            state, history, f, xi, goal, latent)
+          result = self._imag_step(state, history, f, xi, goal, latent)
         else:
-          next_state, action, next_history, next_f, next_goal = self._imag_step(state, history, f, xi, goal)
+          result = self._imag_step(state, history, f, xi, goal)
+        if self.foot_reward_names:
+          *result, costs = result
+          predicted_costs.append(costs)
+        if c.depth_enabled:
+          next_state, action, next_history, next_f, next_goal, next_latent = result
+        else:
+          next_state, action, next_history, next_f, next_goal = result
         # Keep fixed batch shapes, but hold every row at its own endpoint.
         # Padded steps must not change the bootstrap state or previous action.
         def advance(old, new):
@@ -260,7 +306,10 @@ class SuperMimicAlgorithm:
       # Time-major batch: post-action s[t+1] still compares with target f[t].
       # Keep the rollout graph, including both actions in the action-rate cost.
       reward_states = tuple(flat([s[i] for s in states[1:]]) for i in range(6))
-      r, d = self._reward_term(reward_states, flat(frames[:-1]), flat(actions), flat(previous_actions))
+      reward_inputs = (reward_states, flat(frames[:-1]), flat(actions), flat(previous_actions))
+      if self.foot_reward_names:
+        reward_inputs += (flat(predicted_costs),)
+      r, d = self._reward_term(*reward_inputs)
       r, d = r.reshape(c.horizon, batch_size), d.reshape(c.horizon, batch_size)
       # Motion end is a truncation, not a failure: stop rewards there while
       # retaining the last valid state's soft survival factor for bootstrapping.
