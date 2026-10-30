@@ -21,7 +21,8 @@ def main():
   from src.tasks.supermimic.rl.runner import PolicyController
   from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
   saved_cfg = read_checkpoint_config(args.checkpoint_file)
-  env = make_env(args.motion_file, device=args.device, evaluation=True,
+  env = make_env(args.motion_file, num_envs=1, device=args.device, evaluation=True,
+                 randomize_terrain_on_reset=True,
                  depth_enabled=saved_cfg.depth_enabled,
                  render_mode="rgb_array" if args.video_dir else None)
   try:

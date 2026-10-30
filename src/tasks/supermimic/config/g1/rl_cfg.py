@@ -31,7 +31,7 @@ class SuperMimicConfig:
   latent_loss_weight: float = 1.0  # Predicted h vs stop-gradient real-history h, mean over features.
   depth_loss_weight: float = 1.0  # Normalized pixel MSE. All losses sum valid steps / batch.
   feet_stumble_loss_weight: float = 1.0  # Raw measured cost MSE; independent of reward weight.
-  feet_at_plane_loss_weight: float = 1.0  # Raw measured cost MSE; sum valid steps / batch.
+  feet_at_plane_loss_weight: float = 0.0  # Raw measured cost MSE; sum valid steps / batch.
   wm_perception_lr: float = 2e-4  # Shared CNN+GRU; updated by the WM optimizer only.
   depth_decoder_lr: float = 2e-4
   gamma: float = 0.99

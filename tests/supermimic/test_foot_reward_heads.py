@@ -39,11 +39,12 @@ def training_case(mdp, visual=False, **options):
   return alg, replay, transitions
 
 
-@pytest.mark.parametrize('name', FOOT_REWARD_NAMES)
-def test_cost_loss_weights_configurable_and_separate_from_reward_weights(name):
+@pytest.mark.parametrize('name,default', [('feet_stumble', 1.), ('feet_at_plane', 0.)])
+def test_cost_loss_weights_configurable_and_separate_from_reward_weights(name, default):
   field = name + '_loss_weight'
-  assert getattr(SuperMimicConfig(), field) == 1.
+  assert getattr(SuperMimicConfig(), field) == default
   assert getattr(SuperMimicConfig(**{field: 0.}), field) == 0.
+  assert getattr(SuperMimicConfig(**{field: 1.}), field) == 1.
   for value in (-1., float('inf'), float('nan')):
     with pytest.raises(ValueError, match=field):
       SuperMimicConfig(**{field: value})
@@ -131,8 +132,10 @@ def test_wm_supervises_raw_costs_with_mask_and_independent_loss_weights(mdp, vis
 
 @pytest.mark.parametrize('disabled', [0, 1])
 def test_independent_loss_weights_gate_output_rows_but_share_hidden_features(mdp, disabled):
+  weights = {name + '_loss_weight': float(i != disabled)
+             for i, name in enumerate(FOOT_REWARD_NAMES)}
   alg, replay, _ = training_case(mdp, state_loss_weight=0.,
-                                **{FOOT_REWARD_NAMES[disabled] + '_loss_weight': 0.})
+                                **weights)
   head = alg.wm.foot_head
   output = head[0][-1]
   row_before = output.weight[disabled].detach().clone()
@@ -295,7 +298,9 @@ def test_cost_heads_train_resume_and_log_to_csv_and_wandb(mdp, tmp_path, sdk):
       assert float(row[key]) == pytest.approx(logged['Loss/'+key])
       assert float(row['Reward/'+name]) == 0.
     assert float(row['wm_total_loss']) == pytest.approx(
-      float(row['wm_loss']) + float(row['wm_feet_stumble_loss']) + float(row['wm_feet_at_plane_loss']))
+      cfg.state_loss_weight * float(row['wm_loss'])
+      + cfg.feet_stumble_loss_weight * float(row['wm_feet_stumble_loss'])
+      + cfg.feet_at_plane_loss_weight * float(row['wm_feet_at_plane_loss']))
   saved = copy.deepcopy(runner.algorithm.wm.foot_head.state_dict())
   assert torch.load(tmp_path/'first/last.pt', weights_only=False)['format_version'] == 5
   cfg.iterations = 3

@@ -11,7 +11,8 @@ from .mdp.state import read_state, flatten_state
 
 
 class SuperMimicEnv(ManagerBasedRlEnv):
-  def __init__(self, cfg, *, depth_camera=None, collect_foot_rewards=False, **kwargs):
+  def __init__(self, cfg, *, depth_camera=None, collect_foot_rewards=False,
+               randomize_terrain_on_reset=False, **kwargs):
     if cfg.auto_reset:
       raise ValueError("SuperMimic requires auto_reset=False")
     self._functional_mdp = self._context = self._reward_terms = None
@@ -19,6 +20,7 @@ class SuperMimicEnv(ManagerBasedRlEnv):
     self.last_step_metrics = None
     self._depth_camera = None
     self._depth_image = None
+    self._randomize_terrain_on_reset = randomize_terrain_on_reset
     self.foot_reward_names = tuple(name for name in FOOT_REWARD_NAMES
                                    if collect_foot_rewards and cfg.rewards.get(name) is not None)
     support = cfg.rewards.get("feet_at_plane")
@@ -87,6 +89,18 @@ class SuperMimicEnv(ManagerBasedRlEnv):
         self._depth_image[ids] = frames[ids]
     self.reset_version[slice(None) if env_ids is None else env_ids] += 1
     return result
+
+  def _reset_idx(self, env_ids=None):
+    # Play opts in here so even Viser's unwrapped Start Here reset is covered.
+    # Base reset seeds before this hook; commands then use the new origin for k.
+    if self._randomize_terrain_on_reset and self.scene.terrain is not None:
+      ids = (torch.arange(self.num_envs, device=self.device)
+             if env_ids is None else env_ids)
+      if ids.numel():
+        # mjlab samples difficulty rows and terrain columns independently and
+        # uniformly. Plane terrain has no origin grid and is a no-op.
+        self.scene.terrain.randomize_env_origins(ids)
+    super()._reset_idx(env_ids)
 
   @torch.no_grad()
   def step(self, action):

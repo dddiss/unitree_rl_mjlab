@@ -69,7 +69,7 @@ class Gui:
     return GuiHandle()
 
 
-def make_playback_env(motion):
+def make_playback_env(motion, num_envs=2):
   # All reset noise ranges are zero for evaluation. The real motion reference
   # and resample method still select k and write its complete robot state.
   def identity_quaternion(roll, pitch, yaw):
@@ -94,36 +94,36 @@ def make_playback_env(motion):
 
   class Env:
     device = 'cpu'
-    num_envs = 2
 
     def __init__(self):
-      self.episode_length_buf = torch.zeros(2, dtype=torch.long)
-      self.history = torch.zeros(2, 10, 3)
-      self.actions = torch.zeros(2, 29)
-      self.scene = NS(env_origins=torch.zeros(2, 3))
+      self.num_envs = num_envs
+      self.episode_length_buf = torch.zeros(num_envs, dtype=torch.long)
+      self.history = torch.zeros(num_envs, 10, 3)
+      self.actions = torch.zeros(num_envs, 29)
+      self.scene = NS(env_origins=torch.zeros(num_envs, 3))
       self.command = command_type()
       cmd = self.command
       cmd._env = self
       cmd.device = self.device
       cmd.motion = motion
-      cmd._all_env_ids = torch.arange(2)
-      cmd.time_steps = torch.zeros(2, dtype=torch.long)
+      cmd._all_env_ids = torch.arange(num_envs)
+      cmd.time_steps = torch.zeros(num_envs, dtype=torch.long)
       cmd._initialization_frames = torch.zeros_like(cmd.time_steps)
       cmd._requested_frames = torch.full_like(cmd.time_steps, -1)
       cmd.start_bin = torch.zeros_like(cmd.time_steps)
       cmd.root_body_index = 0
       cmd.cfg = NS(sampling_mode='start', pose_range={}, velocity_range={},
                    joint_position_range=(0., 0.))
-      cmd.metrics = {name: torch.zeros(2) for name in
+      cmd.metrics = {name: torch.zeros(num_envs) for name in
                      ('sampling_entropy', 'sampling_top1_prob', 'sampling_top1_bin')}
       cmd._update_command = lambda ids: None
       cmd._update_metrics = lambda ids: None
       cmd._write_reference_state_to_sim = self.write_state
       self.command_manager = NS(get_term=lambda _: cmd)
-      self.root_pos = torch.zeros(2, 3)
-      self.joint_pos = torch.zeros(2, 29)
-      self.terminated = torch.zeros(2, dtype=torch.bool)
-      self.truncated = torch.zeros(2, dtype=torch.bool)
+      self.root_pos = torch.zeros(num_envs, 3)
+      self.joint_pos = torch.zeros(num_envs, 29)
+      self.terminated = torch.zeros(num_envs, dtype=torch.bool)
+      self.truncated = torch.zeros(num_envs, dtype=torch.bool)
       self.reset_calls = []
 
     def write_state(self, ids, pos, quat, lin_vel, ang_vel, joint_pos, joint_vel):
@@ -144,11 +144,11 @@ def make_playback_env(motion):
       self.episode_length_buf += 1
       done = self.terminated | self.truncated
       self.command.compute(torch.where(done, 0., .02))
-      return {}, torch.ones(2), self.terminated, self.truncated, {'step': True}
+      return {}, torch.ones(num_envs), self.terminated, self.truncated, {'step': True}
 
   env = Env()
   # Deliberately begin in different clips, away from their first frames.
-  env.command.request_frames(torch.tensor([12, 54]))
+  env.command.request_frames(torch.tensor([12, 54])[:num_envs])
   env.reset()
   env.reset_calls.clear()
   return env
