@@ -183,7 +183,7 @@ def test_actor_gradient_passes_through_predicted_h_with_frozen_perception(mdp,mo
     next_h.retain_grad();saved.append(next_h)
     return s,next_h
   monkeypatch.setattr(alg.wm,'step_visual',dynamics)
-  monkeypatch.setattr(alg,'_reward_term',lambda s,f,a,prev:(torch.zeros(len(f)),torch.zeros(len(f))))
+  monkeypatch.setattr(alg,'_reward_term',lambda s,f,a,prev,**kwargs:(torch.zeros(len(f)),torch.zeros(len(f))))
   # Only the visual endpoint contributes to Actor's return.
   alg._critic_forward=lambda x,h=None: h.sum(-1)+alg.critic.net[-1].bias.sum()*0
   result=alg.policy_update(b)

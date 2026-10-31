@@ -3,7 +3,7 @@
 def make_env(motion_file, *, num_envs=1, device="cuda:0", evaluation=False,
              gamma=0.99, seed=0, render_mode=None, depth_enabled=False,
              terrain_type=None, collect_foot_rewards=None,
-             randomize_terrain_on_reset=False):
+             randomize_terrain_on_reset=False, viewer_geom_group=None):
   from .g1.env_cfgs import unitree_g1_flat_tracking_env_cfg
   from ..env import SuperMimicEnv
   from ..perception.camera import DepthCameraCfg
@@ -16,6 +16,9 @@ def make_env(motion_file, *, num_envs=1, device="cuda:0", evaluation=False,
   )
   cfg.seed = seed
   cfg.scene.num_envs = num_envs
+  if viewer_geom_group is not None:
+    # Set before environment construction: its offscreen renderer reads this once.
+    cfg.viewer.geom_group = viewer_geom_group
   cmd = cfg.commands["motion"]
   if isinstance(motion_file, (list, tuple)):
     cmd.motion_files = tuple(str(p) for p in motion_file)

@@ -97,6 +97,7 @@ def test_each_play_reset_selects_terrain_before_writing_k_and_refreshing_depth(m
 
 def test_subset_reset_only_moves_selected_environment(mdp):
   env = terrain_playback_env(mdp.motion, num_envs=2)
+  env.command.request_frames(torch.tensor([12, 53]))
   env.reset()
   env.actions.fill_(3)
   env.history.fill_(7)
@@ -175,7 +176,8 @@ def test_real_play_terrain_uses_uniform_rows_columns_and_preserves_xy(mdp):
 @pytest.mark.parametrize('evaluation,opt_in', [(False, False), (True, False), (True, True)])
 def test_factory_keeps_training_and_evaluation_fixed_unless_play_opts_in(monkeypatch, evaluation, opt_in):
   from supermimic.config import make_env
-  cfg = NS(scene=NS(num_envs=0), commands={'motion': NS()})
+  cfg = NS(scene=NS(num_envs=0), commands={'motion': NS()},
+           viewer=NS(geom_group=(1, 1, 1, 0, 0, 0)))
   env_cfgs = ModuleType('supermimic.config.g1.env_cfgs')
   env_cfgs.unitree_g1_flat_tracking_env_cfg = lambda **kwargs: cfg
   environment = ModuleType('supermimic.env')
@@ -188,6 +190,10 @@ def test_factory_keeps_training_and_evaluation_fixed_unless_play_opts_in(monkeyp
   env = make_env('motion.npz', evaluation=evaluation, device='cpu', **kwargs)
   assert env.randomize_terrain_on_reset is opt_in
   assert env.cfg.scene.num_envs == 1
+  assert env.cfg.viewer.geom_group == (1, 1, 1, 0, 0, 0)
+  env = make_env('motion.npz', evaluation=True, device='cpu',
+                 viewer_geom_group=(1, 1, 1, 0, 1, 1))
+  assert env.cfg.viewer.geom_group == (1, 1, 1, 0, 1, 1)
 
 
 @pytest.mark.parametrize('mode', ['native', 'viser', 'video'])
@@ -223,6 +229,12 @@ def test_play_cli_enables_random_terrain_for_single_environment(monkeypatch, mod
   viewers.NativeMujocoViewer = viewers.ViserPlayViewer = Viewer
   for module in (config, evaluation, runner, viewers):
     monkeypatch.setitem(sys.modules, module.__name__, module)
+  # Load the real playback adapters against our viewer test doubles.
+  playback_viewers = ModuleType('src.tasks.supermimic.playback_viewer')
+  implementations = runpy.run_path(str(ROOT / 'src/tasks/supermimic/playback_viewer.py'))
+  for name in ('NativePlayViewer', 'ViserPlayViewer'):
+    setattr(playback_viewers, name, implementations[name])
+  monkeypatch.setitem(sys.modules, playback_viewers.__name__, playback_viewers)
   script = ROOT / 'scripts/play_supermimic.py'
   args = [str(script), '--motion-file', 'motions', '--checkpoint-file', 'last.pt', '--device', 'cpu']
   args += ['--video-dir', 'videos'] if mode == 'video' else ['--viewer', mode]
@@ -232,5 +244,6 @@ def test_play_cli_enables_random_terrain_for_single_environment(monkeypatch, mod
   assert options['num_envs'] == 1
   assert options['evaluation'] and options['randomize_terrain_on_reset']
   assert options['depth_enabled']
+  assert options['viewer_geom_group'] == (1, 1, 1, 0, 1, 1)
   assert events == ([('video',), ('close',)] if mode == 'video' else
                     [('request', [0]), ('reset',), ('viewer',), ('close',)])

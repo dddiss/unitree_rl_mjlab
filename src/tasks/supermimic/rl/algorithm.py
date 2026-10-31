@@ -8,7 +8,9 @@ from contextlib import contextmanager
 import torch
 from torch import nn
 
-from ..mdp.state import GOAL_FRAME_DIM, INV_DIM, OBS_DIM, normalize_xi, unflatten_state
+from ..mdp.state import (
+  GOAL_FRAME_DIM, INV_DIM, OBS_DIM, normalize_xi, unflatten_state, state_in_reference_frame,
+)
 from ..mdp.foot_rewards import FOOT_REWARD_NAMES
 from . import networks
 from .networks import WorldModel, Policy, Critic
@@ -213,8 +215,8 @@ class SuperMimicAlgorithm:
     # One mean/backward/optimizer step for the original complete minibatch.
     return self._critic_error(self._critic_forward(x, depth_latent), target)
 
-  def reward_term(self, state, f, action, a_prev, foot_costs=None):
-    reward = self.mdp.reward(state, f, action, a_prev)
+  def reward_term(self, state, f, action, a_prev, foot_costs=None, *, terrain_tolerance=None):
+    reward = self.mdp.reward(state, f, action, a_prev, terrain_tolerance=terrain_tolerance)
     if foot_costs is not None:
       for i, name in enumerate(self.foot_reward_names):
         reward = reward + self.mdp.cfg.weights[name] * foot_costs[..., i] * self.mdp.cfg.step_dt
@@ -253,11 +255,14 @@ class SuperMimicAlgorithm:
     if sampled is None:
       return {"policy_skipped": 1.0}
     start, hist = sampled
-    state = unflatten_state(start["s"])
+    # Freeze the sampled episode's reference placement, not the environment's
+    # latest reset. The XY-invariant WM can roll forward in this same frame.
+    state = state_in_reference_frame(unflatten_state(start["s"]), start.get("reference_xy_offset"))
     xi, f, a_prev = start["xi"], start["f"], start["a_prev"]
     xi_n = normalize_xi(xi)
     with torch.no_grad():
-      history = self.mdp.add_noise(self.mdp.obs(unflatten_state(hist["s"]), hist["a_prev"], hist["xi"], hist["f"]))
+      history_state = state_in_reference_frame(unflatten_state(hist["s"]), hist.get("reference_xy_offset"))
+      history = self.mdp.add_noise(self.mdp.obs(history_state, hist["a_prev"], hist["xi"], hist["f"]))
     goal = self.mdp.goal(state, f, c.goal_frames)
     states, frames, goals = [state], [f], [goal]
     actions, previous_actions = [], []
@@ -309,7 +314,13 @@ class SuperMimicAlgorithm:
       reward_inputs = (reward_states, flat(frames[:-1]), flat(actions), flat(previous_actions))
       if self.foot_reward_names:
         reward_inputs += (flat(predicted_costs),)
-      r, d = self._reward_term(*reward_inputs)
+      # The rollout stays in its starting episode/terrain assignment. Expand
+      # labels in the same time-major order as the flattened imagined states.
+      terrain_tolerance = start.get("terrain_tolerance")
+      reward_kwargs = {} if terrain_tolerance is None else {
+        "terrain_tolerance": terrain_tolerance.unsqueeze(0).expand(c.horizon, -1).reshape(-1),
+      }
+      r, d = self._reward_term(*reward_inputs, **reward_kwargs)
       r, d = r.reshape(c.horizon, batch_size), d.reshape(c.horizon, batch_size)
       # Motion end is a truncation, not a failure: stop rewards there while
       # retaining the last valid state's soft survival factor for bootstrapping.

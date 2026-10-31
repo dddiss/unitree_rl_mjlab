@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from supermimic.mdp.logging_metrics import TRACKING_METRICS, capture_step_metrics
+from supermimic.mdp.state import state_in_reference_frame
 
 ROOT=Path(__file__).resolve().parents[2]
 
@@ -46,10 +47,12 @@ def test_step_captures_state_and_target_before_command_advance(visual, foot_supp
               'capture_step_metrics':capture_step_metrics})
   class Env: step=ns['step']
   e=Env();e.state=torch.zeros(2,71);e.device='cpu';e._manual_reset_pending=torch.zeros(2,dtype=torch.bool)
+  e.terrain_tolerance=torch.tensor([False, True])
   e._sim_step_counter=e.common_step_counter=0;e.physics_dt=.005;e.step_dt=.02
   e._sense_before_rewards=foot_support
   e.episode_length_buf=torch.zeros(2,dtype=torch.long);e.cfg=NS(decimation=4);e.extras={}
-  cmd=NS(time_steps=torch.tensor([4,7]),update_relative_body_poses=lambda:events.append('align'))
+  cmd=NS(time_steps=torch.tensor([4,7]),reference_xy_offset=torch.tensor([[1.,2.],[3.,4.]]),
+         update_relative_body_poses=lambda:events.append('align'))
   cmd.metrics={name:torch.zeros(2) for name in TRACKING_METRICS}
   def update_metrics():
     events.append('metrics')
@@ -123,6 +126,11 @@ def test_step_captures_state_and_target_before_command_advance(visual, foot_supp
     assert tr['depth_next'][0].eq(4).all()
   e.state.zero_()
   assert tr['s1'].eq(4).all()
+  assert tr['terrain_tolerance'].tolist() == [False, True]
+  cmd.reference_xy_offset.zero_()
+  assert tr['reference_xy_offset'].tolist()==[[1.,2.],[3.,4.]]
+  e.terrain_tolerance.logical_not_()
+  assert tr['terrain_tolerance'].tolist() == [False, True]
   if foot_support:
     torch.testing.assert_close(tr['foot_costs'], torch.tensor([[.44, .84], [.47, .87]]))
   with pytest.raises(RuntimeError):e.step(torch.zeros(2,29))
@@ -134,6 +142,7 @@ def test_real_env_reset_and_reward_parity(mdp):
   sys.path.insert(0,str(ROOT))
   from src.tasks.supermimic.config import make_env
   from src.tasks.supermimic.mdp.state import unflatten_state
+  from src.tasks.supermimic.terrain.reset import terrain_tile_xy_bounds
   env=make_env(mdp.motion.motion_files,num_envs=4)
   try:
     cmd=env.command_manager.get_term('motion');env.reset()
@@ -141,13 +150,24 @@ def test_real_env_reset_and_reward_parity(mdp):
     ids=torch.tensor([0,2],device=env.device)
     frames=torch.tensor([0,51],device=env.device)
     before=cmd.time_steps.clone()
+    offsets_before=cmd.reference_xy_offset.clone()
     cmd.request_frames(frames,ids);env.reset(env_ids=ids)
     assert torch.equal(cmd.time_steps[ids],frames+1)
     assert torch.equal(cmd.time_steps[[1,3]],before[[1,3]])
+    torch.testing.assert_close(cmd.reference_xy_offset[[1,3]],offsets_before[[1,3]])
+    if cmd.cfg.terrain_reset is not None:
+      assert cmd.cfg.terrain_reset.randomize_xy
+      root_xy=cmd.robot.data.body_link_pose_w[ids,cmd.root_body_index,:2]
+      low,high=terrain_tile_xy_bounds(env.scene.terrain,ids,cmd.cfg.terrain_reset.footprint_radius)
+      assert ((root_xy>=low)&(root_xy<=high)).all()
+      torch.testing.assert_close(root_xy,cmd.motion.body_pos_w[frames,cmd.root_body_index,:2]
+                                  +env.scene.env_origins[ids,:2]+cmd.reference_xy_offset[ids])
     for _ in range(64):
       env.step(torch.zeros(4,29,device=env.device))
       tr=env.last_transition
-      expected=env.functional_mdp.reward(unflatten_state(tr['s1']),tr['f'],tr['a'],tr['a_prev'])
+      expected=env.functional_mdp.reward(state_in_reference_frame(unflatten_state(tr['s1']),tr['reference_xy_offset']),
+                                         tr['f'],tr['a'],tr['a_prev'],
+                                         terrain_tolerance=tr['terrain_tolerance'])
       torch.testing.assert_close(tr['r'],expected,rtol=1e-4,atol=1e-5)
       assert torch.isfinite(tr['s1']).all()
       done=(tr['terminated']|tr['truncated']).nonzero().flatten()

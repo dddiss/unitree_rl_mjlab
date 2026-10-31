@@ -28,7 +28,8 @@ def filled_buffer(mdp,cfg):
     make=lambda frame:flatten_state((*mdp.reference_root(frame),m.joint_pos[frame],m.joint_vel[frame]))
     tr=dict(s=make(f-1),s1=make(f),a=torch.zeros(2,29),a_prev=torch.zeros(2,29),f=f,
             r=torch.ones(2)*.1,ep_step=torch.full((2,),step),terminated=torch.zeros(2,dtype=torch.bool),
-            truncated=torch.zeros(2,dtype=torch.bool))
+            truncated=torch.zeros(2,dtype=torch.bool),terrain_tolerance=torch.zeros(2,dtype=torch.bool),
+            reference_xy_offset=torch.zeros(2,2))
     b.add(tr);transitions.append(tr)
   return b,transitions
 
@@ -91,7 +92,7 @@ def test_terminal_bootstrap_backpropagates_through_previous_action(mdp,monkeypat
       parameter.zero_()
     alg.critic.net[0].weight[0,145]=1
     alg.critic.net[-1].weight[0,0]=1
-  monkeypatch.setattr(alg,'_reward_term',lambda state,f,a,a_prev:(
+  monkeypatch.setattr(alg,'_reward_term',lambda state,f,a,a_prev,**kwargs:(
     torch.zeros(len(f)),torch.zeros(len(f))))
   bootstrap_previous=[]
   original=alg._critic_input

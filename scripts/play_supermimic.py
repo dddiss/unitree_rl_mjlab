@@ -19,10 +19,11 @@ def main():
   from src.tasks.supermimic.config import make_env
   from src.tasks.supermimic.rl.evaluation import load_policy, read_checkpoint_config, record_clips, PlaybackEnv
   from src.tasks.supermimic.rl.runner import PolicyController
-  from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
+  from src.tasks.supermimic.playback_viewer import NativePlayViewer, ViserPlayViewer
   saved_cfg = read_checkpoint_config(args.checkpoint_file)
   env = make_env(args.motion_file, num_envs=1, device=args.device, evaluation=True,
                  randomize_terrain_on_reset=True,
+                 viewer_geom_group=(1, 1, 1, 0, 1, 1),
                  depth_enabled=saved_cfg.depth_enabled,
                  render_mode="rgb_array" if args.video_dir else None)
   try:
@@ -39,7 +40,7 @@ def main():
     viewer = args.viewer
     if viewer == "auto":
       viewer = "native" if sys.platform == "darwin" or os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY") else "viser"
-    viewer_cls = NativeMujocoViewer if viewer == "native" else ViserPlayViewer
+    viewer_cls = NativePlayViewer if viewer == "native" else ViserPlayViewer
     viewer_cls(PlaybackEnv(env), controller).run()
   finally:
     env.close()

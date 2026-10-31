@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import torch
 
-from mjlab.sensor import ContactSensor
-
-from .commands import MotionCommand
 from .foot_rewards import clipped_height_clearance, feet_at_plane_penalty, feet_stumble_penalty
+from .rotations import quat_to_mat, rot_angle_sq, yaw_mat
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
+  from mjlab.sensor import ContactSensor
+  from .commands import MotionCommand
 
 
 def _get_body_indexes(
@@ -69,6 +69,82 @@ def motion_global_body_angular_velocity_error_exp(
   body_names: tuple[str, ...] | None = None,
 ) -> torch.Tensor:
   return env.shared_reward_terms()["motion_body_ang_vel"]
+
+
+def terrain_tolerance_radius(tolerance, enabled):
+  """Resolve the configured radius per sample, keeping flat rows strict."""
+  if tolerance == 0.0:
+    return 0.0
+  if enabled is None:
+    raise ValueError("Terrain-dependent body rewards require the sampled terrain_tolerance flag")
+  return enabled.to(dtype=torch.float32) * tolerance
+
+
+def root_relative_body_position_reward(
+  body_pos, root_pos, root_rot, reference_pos, reference_root_pos,
+  reference_root_rot, *, std: float, tolerance: float = 0.0,
+) -> torch.Tensor:
+  """XYZ root-relative tracking, with the existing yaw alignment.
+
+  Tolerance is a distance in metres, applied per body before squaring/averaging.
+  Inputs may have any leading batch/trajectory dimensions. No terrain query is
+  needed, so the same formula differentiates through imagined states and FK.
+  """
+  alignment = yaw_mat(root_rot @ reference_root_rot.transpose(-1, -2))
+  reference_relative = reference_pos - reference_root_pos.unsqueeze(-2)
+  aligned = (alignment.unsqueeze(-3) @ reference_relative.unsqueeze(-1)).squeeze(-1)
+  error = torch.linalg.vector_norm(body_pos - root_pos.unsqueeze(-2) - aligned, dim=-1)
+  radius = tolerance.unsqueeze(-1) if isinstance(tolerance, torch.Tensor) else tolerance
+  residual = torch.relu(error - radius)
+  return torch.exp(-residual.square().mean(-1) / std**2)
+
+
+def body_orientation_tolerance_reward(
+  body_rot, root_rot, reference_rot, reference_root_rot, *,
+  std: float, tolerance: float = 0.0,
+) -> torch.Tensor:
+  """Yaw-aligned body rotation tracking; std and tolerance are in radians."""
+  alignment = yaw_mat(root_rot @ reference_root_rot.transpose(-1, -2))
+  aligned = alignment.unsqueeze(-3) @ reference_rot
+  # rot_angle_sq clamps acos away from its singular endpoints, also keeping
+  # the square root's gradient finite for exactly matching rotations.
+  error = rot_angle_sq(aligned, body_rot).sqrt()
+  radius = tolerance.unsqueeze(-1) if isinstance(tolerance, torch.Tensor) else tolerance
+  residual = torch.relu(error - radius)
+  return torch.exp(-residual.square().mean(-1) / std**2)
+
+
+def motion_root_relative_body_position_error_exp(
+  env: ManagerBasedRlEnv, command_name: str, std: float,
+  body_names: tuple[str, ...], tolerance: float = 0.0,
+) -> torch.Tensor:
+  """Measured counterpart of root_relative_body_position_reward; target is f."""
+  command = env.command_manager.get_term(command_name)
+  indexes = _get_body_indexes(command, body_names)
+  root = command.root_body_index
+  tolerance = terrain_tolerance_radius(tolerance, env.terrain_tolerance) if tolerance else 0.0
+  return root_relative_body_position_reward(
+    command.robot_body_pos_w[:, indexes], command.robot.data.body_link_pos_w[:, root],
+    quat_to_mat(command.robot.data.body_link_quat_w[:, root]),
+    command.body_pos_w[:, indexes], command.body_pos_w[:, 0],
+    quat_to_mat(command.body_quat_w[:, 0]), std=std, tolerance=tolerance,
+  )
+
+
+def motion_body_orientation_tolerance_error_exp(
+  env: ManagerBasedRlEnv, command_name: str, std: float,
+  body_names: tuple[str, ...], tolerance: float = 0.0,
+) -> torch.Tensor:
+  """Measured counterpart of body_orientation_tolerance_reward; target is f."""
+  command = env.command_manager.get_term(command_name)
+  indexes = _get_body_indexes(command, body_names)
+  tolerance = terrain_tolerance_radius(tolerance, env.terrain_tolerance) if tolerance else 0.0
+  return body_orientation_tolerance_reward(
+    quat_to_mat(command.robot_body_quat_w[:, indexes]),
+    quat_to_mat(command.robot.data.body_link_quat_w[:, command.root_body_index]),
+    quat_to_mat(command.body_quat_w[:, indexes]), quat_to_mat(command.body_quat_w[:, 0]),
+    std=std, tolerance=tolerance,
+  )
 
 
 def self_collision_cost(

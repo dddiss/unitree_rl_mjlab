@@ -84,7 +84,7 @@ def unitree_g1_flat_tracking_env_cfg(
   motion_cmd = cfg.commands["motion"]
   assert isinstance(motion_cmd, MotionCommandCfg)
   if cfg.scene.terrain.terrain_type == "generator":
-    motion_cmd.terrain_reset = TerrainResetCfg()
+    motion_cmd.terrain_reset = TerrainResetCfg(randomize_xy=not play)
     cfg.scene.sensors += (PbfmTerrainHeightSensorCfg(
       name=motion_cmd.terrain_reset.sensor_name,
       frame=ObjRef(type="body", name="pelvis", entity="robot"),

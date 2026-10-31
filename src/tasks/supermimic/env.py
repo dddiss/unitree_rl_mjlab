@@ -7,7 +7,8 @@ from .mdp.functional import FunctionalMDP, MdpConfig
 from .mdp.foot_rewards import FOOT_REWARD_NAMES
 from .mdp.kinematics import G1Kinematics
 from .mdp.logging_metrics import capture_step_metrics
-from .mdp.state import read_state, flatten_state
+from .mdp.state import read_state, flatten_state, state_in_reference_frame
+from .terrain.reward_context import tolerance_by_terrain_column
 
 
 class SuperMimicEnv(ManagerBasedRlEnv):
@@ -16,6 +17,7 @@ class SuperMimicEnv(ManagerBasedRlEnv):
     if cfg.auto_reset:
       raise ValueError("SuperMimic requires auto_reset=False")
     self._functional_mdp = self._context = self._reward_terms = None
+    self._terrain_tolerance_by_type = None
     self.last_transition = None
     self.last_step_metrics = None
     self._depth_camera = None
@@ -56,6 +58,17 @@ class SuperMimicEnv(ManagerBasedRlEnv):
                       com.expand(self.num_envs, -1)), -1)
 
   @property
+  def terrain_tolerance(self):
+    """Per-environment reward flag; read current assignments after any reset."""
+    terrain = self.scene.terrain
+    if self._terrain_tolerance_by_type is None:
+      flags = tolerance_by_terrain_column(None if terrain is None else terrain.cfg)
+      self._terrain_tolerance_by_type = torch.tensor(flags, dtype=torch.bool, device=self.device)
+    if terrain is None or terrain.cfg.terrain_type == "plane":
+      return self._terrain_tolerance_by_type.expand(self.num_envs)
+    return self._terrain_tolerance_by_type[terrain.terrain_types]
+
+  @property
   def functional_mdp(self):
     if self._functional_mdp is None:
       cmd = self.command_manager.get_term("motion")
@@ -63,7 +76,8 @@ class SuperMimicEnv(ManagerBasedRlEnv):
       kin = G1Kinematics(self.sim.mj_model, robot.indexing.joint_ids.tolist(),
                          robot.indexing.body_ids[cmd.body_indexes].tolist(),
                          int(robot.indexing.body_ids[cmd.root_body_index]), self.device)
-      cfg = MdpConfig.from_env_cfg(self.cfg.rewards, self.cfg.terminations, self.step_dt)
+      cfg = MdpConfig.from_env_cfg(self.cfg.rewards, self.cfg.terminations, self.step_dt,
+                                  body_names=cmd.cfg.body_names)
       self._functional_mdp = FunctionalMDP(cmd.motion, kin, robot.data.default_joint_pos[0],
                                            cmd.body_indexes, cmd.root_body_index,
                                            robot.data.soft_joint_pos_limits[0], cfg)
@@ -73,7 +87,9 @@ class SuperMimicEnv(ManagerBasedRlEnv):
     if self._reward_terms is None:
       cmd = self.command_manager.get_term("motion")
       self._reward_terms = self.functional_mdp.reward_terms(
-        read_state(self), cmd.time_steps, self.action_manager.action, self.action_manager.prev_action)
+        state_in_reference_frame(read_state(self), cmd.reference_xy_offset),
+        cmd.time_steps, self.action_manager.action, self.action_manager.prev_action,
+        terrain_tolerance=self.terrain_tolerance)
     return self._reward_terms
 
   @torch.no_grad()
@@ -111,6 +127,8 @@ class SuperMimicEnv(ManagerBasedRlEnv):
     transition = {
       "s": flatten_state(read_state(self)).clone(), "f": cmd.time_steps.clone(),
       "a_prev": self.action_manager.action.clone(), "ep_step": self.episode_length_buf.clone(),
+      "terrain_tolerance": self.terrain_tolerance.clone(),
+      "reference_xy_offset": cmd.reference_xy_offset.clone(),
     }
     if getattr(self, "_depth_camera", None) is not None:
       transition["depth"] = self.depth_image.clone()

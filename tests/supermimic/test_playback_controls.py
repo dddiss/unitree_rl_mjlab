@@ -108,6 +108,7 @@ def make_playback_env(motion, num_envs=2):
       cmd.motion = motion
       cmd._all_env_ids = torch.arange(num_envs)
       cmd.time_steps = torch.zeros(num_envs, dtype=torch.long)
+      cmd.reference_xy_offset = torch.zeros(num_envs, 2)
       cmd._initialization_frames = torch.zeros_like(cmd.time_steps)
       cmd._requested_frames = torch.full_like(cmd.time_steps, -1)
       cmd.start_bin = torch.zeros_like(cmd.time_steps)

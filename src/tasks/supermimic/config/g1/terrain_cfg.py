@@ -35,35 +35,35 @@ def unitree_g1_terrain_cfg(mode: str | None = None) -> TerrainEntityCfg:
   size = (8.0, 8.0)
   terrains = {
     "flat": TerrainBoxFlatCfg(proportion=0.15),
-    "slope": NeutralHfPyramidSlopedTerrainCfg(
-      proportion=0.15,
-      slope_range=(math.tan(math.radians(5)), math.tan(math.radians(8))),
-      platform_width=1.5, inverted=True, border_width=0.5,
-      horizontal_scale=0.1, vertical_scale=0.005,
-    ),
-    "stairs_up": TerrainSeparatedPyramidStairsCfg(
-      proportion=0.20, direction="up", step_height_range=(0.10, 0.20),
-      step_width=0.30, platform_width=0.80, num_steps=10, border_width=0.5,
-    ),
+    # "slope": NeutralHfPyramidSlopedTerrainCfg(
+    #   proportion=0.15,
+    #   slope_range=(math.tan(math.radians(5)), math.tan(math.radians(8))),
+    #   platform_width=1.5, inverted=True, border_width=0.5,
+    #   horizontal_scale=0.1, vertical_scale=0.005,
+    # ),
+    # "stairs_up": TerrainSeparatedPyramidStairsCfg(
+    #   proportion=0.20, direction="up", step_height_range=(0.10, 0.20),
+    #   step_width=0.30, platform_width=0.80, num_steps=10, border_width=0.5,
+    # ),
     "stairs_down": TerrainSeparatedPyramidStairsCfg(
       proportion=0.20, direction="down", step_height_range=(0.10, 0.20),
       step_width=0.30, platform_width=0.80, num_steps=10, border_width=0.5,
     ),
-    "rough": NeutralHfPerlinNoiseTerrainCfg(
-      proportion=0.15, height_range=(0.03, 0.05), octaves=2,
-      persistence=0.25, lacunarity=2.0, scale=20.0,
-      horizontal_scale=0.1, resolution=0.1, border_width=0.5,
-      flat_patch_sampling=spawn_patch_sampling(
-        patch_radius=0.45, patch_center_range=1.25, patch_size=size,
-      ),
-    ),
-    "platforms": ScatteredBoxPlatformsTerrainCfg(
-      proportion=0.15, easy_height_range=(0.05, 0.10),
-      hard_height_range=(0.10, 0.18), center_width=1.2, border_width=0.5,
-      gap_width=0.25, min_platform_width=0.60, raised_fraction=1.0,
-      row_count_range=(5, 7), column_count_range=(4, 7),
-      spawn_patch_margin=0.25, num_spawn_patches=12,
-    ),
+    # "rough": NeutralHfPerlinNoiseTerrainCfg(
+    #   proportion=0.15, height_range=(0.03, 0.05), octaves=2,
+    #   persistence=0.25, lacunarity=2.0, scale=20.0,
+    #   horizontal_scale=0.1, resolution=0.1, border_width=0.5,
+    #   flat_patch_sampling=spawn_patch_sampling(
+    #     patch_radius=0.45, patch_center_range=1.25, patch_size=size,
+    #   ),
+    # ),
+    # "platforms": ScatteredBoxPlatformsTerrainCfg(
+    #   proportion=0.15, easy_height_range=(0.05, 0.10),
+    #   hard_height_range=(0.10, 0.18), center_width=1.2, border_width=0.5,
+    #   gap_width=0.25, min_platform_width=0.60, raised_fraction=1.0,
+    #   row_count_range=(5, 7), column_count_range=(4, 7),
+    #   spawn_patch_margin=0.25, num_spawn_patches=12,
+    # ),
   }
   if mode != "mixed":
     if mode not in terrains:

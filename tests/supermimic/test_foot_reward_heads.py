@@ -204,7 +204,7 @@ def test_actor_cost_bptt_keeps_wm_frozen_and_short_motion_bootstrap(mdp, visual,
   c = alg.cfg
   mdp.cfg.weights.update(feet_stumble=-2., feet_at_plane=-3.)
   # Isolate cost-head gradients; bootstrap is constant V=1, no analytic rewards.
-  monkeypatch.setattr(mdp, 'reward', lambda s, f, a, prev: torch.zeros_like(f, dtype=torch.float32))
+  monkeypatch.setattr(mdp, 'reward', lambda s, f, a, prev, **kwargs: torch.zeros_like(f, dtype=torch.float32))
   monkeypatch.setattr(mdp, 'soft_termination', lambda s, f: torch.zeros_like(f, dtype=torch.float32))
   with torch.no_grad():
     for p in alg.critic.net.parameters():

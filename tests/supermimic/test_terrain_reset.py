@@ -1,5 +1,7 @@
 """Height placement, local-reset isolation, and compiled collision queries."""
 import ast
+import json
+import math
 from types import SimpleNamespace as NS
 
 import mujoco
@@ -102,7 +104,7 @@ def test_heightfield_bounds_include_elevation_and_static_body_transform():
   assert lower == pytest.approx(-2.1) and upper == pytest.approx(-1.3)
 
 
-def test_probe_changes_only_selected_root_height_without_advancing_history():
+def test_probe_changes_only_selected_root_height_without_advancing_history(capsys):
   pattern = RobotCentricGridPatternCfg()
   offsets, _ = pattern.generate_rays(None, 'cpu')
   n = len(offsets)
@@ -135,6 +137,89 @@ def test_probe_changes_only_selected_root_height_without_advancing_history():
   torch.testing.assert_close(placed[:, 3:], root[:, 3:])
   torch.testing.assert_close(all_states[1], before[1])
   assert torch.equal(rng, torch.random.get_rng_state())
+  assert capsys.readouterr().err == ''
+
+
+@pytest.fixture
+def failed_reset_rays():
+  pattern = RobotCentricGridPatternCfg()
+  offsets, _ = pattern.generate_rays(None, 'cpu')
+  center = reference_ray_index(offsets)
+  ids = torch.tensor([3, 1, 4])  # Subset row indices differ from environment IDs.
+  root = torch.zeros(3, 13)
+  root[:, :3] = torch.tensor([[12., -7., .8], [1., 2., .9], [-4., 8., 1.]])
+  hit = torch.zeros(5, len(offsets), 3)
+  distances = torch.full((5, len(offsets)), 5.)
+  distances[[0, 3, 4], center] = -1.  # Environment 0 is not being reset.
+  distances[1, 0] = -1.  # A noncentral miss does not fail environment 1.
+  ray_origins = torch.zeros_like(hit)
+  ray_origins[3, center] = torch.tensor([12.125, -6.75, 5.25])
+  ray_origins[4, center] = torch.tensor([-4., 8., 5.])
+  updates, writes = [], []
+  sensor = NS(cfg=NS(pattern=pattern), probe_world_z=5.,
+              update=updates.append, _cached_world_origins=ray_origins,
+              data=NS(hit_pos_w=hit, distances=distances))
+  class Scene(dict):
+    env_origins = torch.zeros(5, 3)
+    def write_data_to_sim(self): pass
+  motion = NS(clip_id=torch.cat((torch.zeros(50), torch.ones(10))).long(),
+              clip_start=torch.tensor([0, 50]),
+              motion_names=('dance', 'walk'),
+              motion_files=('/motions/dance.npz', '/motions/walk.npz'))
+  command = NS(motion=motion, _initialization_frames=torch.tensor([0, 7, 3, 53, 59]),
+               time_steps=torch.tensor([1, 8, 4, 54, 59]))
+  env = NS(scene=Scene(reset_ground=sensor),
+           sim=NS(forward=lambda: None, sense=lambda: None),
+           command_manager=NS(get_term=lambda _: command))
+  robot = NS(write_root_state_to_sim=lambda state, env_ids: writes.append(state.clone()))
+  return NS(env=env, robot=robot, ids=ids, root=root, sensor=sensor, center=center,
+            command=command, updates=updates, writes=writes)
+
+
+@pytest.mark.parametrize('distance,hit_z', [(-1., 0.), (float('nan'), 0.),
+                                          (float('inf'), 0.), (5., float('nan'))])
+def test_failed_center_rays_print_exact_motion_frames_and_sensor_data(
+  failed_reset_rays, capsys, distance, hit_z,
+):
+  case = failed_reset_rays
+  case.sensor.data.distances[3, case.center] = distance
+  case.sensor.data.hit_pos_w[3, case.center, 2] = hit_z
+  root_before = case.root.clone()
+  frames_before = case.command.time_steps.clone()
+  rng = torch.random.get_rng_state()
+  with pytest.raises(RuntimeError, match='Reset XY is outside the collision terrain'):
+    place_on_terrain(case.env, case.robot, case.ids, case.root, TerrainResetCfg())
+  output = capsys.readouterr()
+  assert output.out == ''
+  prefix = '[TerrainReset] center ray failed: '
+  lines = output.err.splitlines()
+  assert len(lines) == 2 and all(line.startswith(prefix) for line in lines)
+  records = [json.loads(line[len(prefix):]) for line in lines]
+  assert [row['env_id'] for row in records] == [3, 4]
+  first, last = records
+  assert first['motion_id'] == 1 and first['motion_name'] == 'walk'
+  assert first['motion_file'] == '/motions/walk.npz'
+  assert first['init_frame_global_k'] == 53 and first['init_frame_local_k'] == 3
+  assert first['target_frame_global_f'] == 54
+  assert last['init_frame_global_k'] == 59 and last['init_frame_local_k'] == 9
+  assert last['target_frame_global_f'] == 59  # Last-frame playback clamps f.
+  assert first['reset_xy_w'] == [12., -7.]
+  assert first['ray_origin_w'] == [12.125, -6.75, 5.25]
+  assert math.isnan(first['ray_distance']) if math.isnan(distance) else first['ray_distance'] == distance
+  assert math.isnan(first['ray_hit_z_w']) if math.isnan(hit_z) else first['ray_hit_z_w'] == hit_z
+  assert last['reset_xy_w'] == [-4., 8.] and last['ray_distance'] == -1.
+  assert case.updates == [0.] and len(case.writes) == 1  # No retry or fallback reset.
+  torch.testing.assert_close(case.root, root_before)
+  torch.testing.assert_close(case.command.time_steps, frames_before)
+  assert torch.equal(rng, torch.random.get_rng_state())
+
+
+def test_ray_diagnostic_error_preserves_original_reset_exception(failed_reset_rays, capsys):
+  case = failed_reset_rays
+  del case.env.command_manager
+  with pytest.raises(RuntimeError, match='Reset XY is outside the collision terrain'):
+    place_on_terrain(case.env, case.robot, case.ids, case.root, TerrainResetCfg())
+  assert 'Could not collect ray diagnostics' in capsys.readouterr().err
 
 
 @pytest.mark.parametrize('terrain', [False, True])

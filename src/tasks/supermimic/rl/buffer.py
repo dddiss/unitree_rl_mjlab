@@ -7,7 +7,8 @@ FIELDS = {"s": (STATE_DIM, torch.float32), "s1": (STATE_DIM, torch.float32),
           "a": (29, torch.float32), "a_prev": (29, torch.float32),
           "r": (None, torch.float32), "f": (None, torch.long),
           "ep_step": (None, torch.long), "terminated": (None, torch.bool),
-          "truncated": (None, torch.bool)}
+          "truncated": (None, torch.bool), "terrain_tolerance": (None, torch.bool),
+          "reference_xy_offset": (2, torch.float32)}
 
 
 class ReplayBuffer:
@@ -112,8 +113,9 @@ class ReplayBuffer:
     back = torch.minimum(torch.minimum(back, step[:, None]), age[:, None])
     rows = self._row(age[:, None] - back)
     keys = ("s", "a_prev", "f")
-    start = {k: self.data[k][row, envs] for k in keys}
-    hist = {k: self.data[k][rows, envs[:, None]] for k in keys}
+    # Snapshot per transition, not a lookup of the environment's latest terrain.
+    start = {k: self.data[k][row, envs] for k in (*keys, "terrain_tolerance", "reference_xy_offset")}
+    hist = {k: self.data[k][rows, envs[:, None]] for k in (*keys, "reference_xy_offset")}
     start["xi"] = self.xi[envs]
     hist["xi"] = self.xi[envs, None].expand(-1, history, -1)
     if self.depth is not None:

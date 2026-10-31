@@ -61,7 +61,8 @@ class TensorEnv:
     terminal=torch.zeros(2,dtype=torch.bool)
     truncated=f>=m.motion.clip_end[m.motion.clip_id[f]]
     self.last_transition=dict(s=flatten_state(state),s1=flatten_state(state1),a=a.clone(),a_prev=self.action_manager.action.clone(),
-                             f=f,r=m.reward(state1,f,a,self.action_manager.action),ep_step=steps,terminated=terminal,truncated=truncated)
+                             f=f,r=m.reward(state1,f,a,self.action_manager.action),ep_step=steps,terminated=terminal,truncated=truncated,
+                             terrain_tolerance=torch.zeros(2,dtype=torch.bool),reference_xy_offset=torch.zeros(2,2))
     self.last_step_metrics=dict(
       tracking={name:torch.zeros(2) for name in TRACKING_METRICS},
       reward={key:value*m.cfg.weights[key]*self.step_dt

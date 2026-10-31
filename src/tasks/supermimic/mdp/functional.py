@@ -4,11 +4,17 @@ Adapted from vibed (THIRD_PARTY_NOTICES.md). f is the CURRENT target,
 not vibed's previous reference index. No environment origins are stored here.
 """
 from dataclasses import dataclass, field
+import math
 
 import torch
 
 from .rotations import mat_to_6d, quat_to_mat, rot_angle_sq, yaw_mat
 from .state import GOAL_FRAME_DIM, invariant_features
+from .rewards import (
+  root_relative_body_position_reward, body_orientation_tolerance_reward,
+  motion_root_relative_body_position_error_exp, motion_body_orientation_tolerance_error_exp,
+  terrain_tolerance_radius,
+)
 
 REWARD_WEIGHTS = {
   "motion_global_root_pos": 0.5, "motion_global_root_ori": 0.5,
@@ -31,9 +37,12 @@ class MdpConfig:
   term_height: float | None = 0.25
   term_tilt: float | None = 0.8
   step_dt: float = 0.02
+  # New manager-configured terms; legacy body rewards remain available unchanged.
+  body_position_rewards: dict[str, dict] = field(default_factory=dict)
+  body_orientation_rewards: dict[str, dict] = field(default_factory=dict)
 
   @classmethod
-  def from_env_cfg(cls, rewards, terminations, step_dt):
+  def from_env_cfg(cls, rewards, terminations, step_dt, *, body_names=()):
     """Mirror enabled manager terms without requiring every optional component."""
     cfg = cls(weights={k: v.weight for k, v in rewards.items() if v is not None},
               step_dt=step_dt)
@@ -49,6 +58,25 @@ class MdpConfig:
     for key, attribute in (("anchor_pos", "term_height"), ("anchor_ori", "term_tilt")):
       term = terminations.get(key)
       setattr(cfg, attribute, None if term is None else term.params["threshold"])
+    for name, term in rewards.items():
+      if term is None:
+        continue
+      for function, destination in (
+        (motion_root_relative_body_position_error_exp, cfg.body_position_rewards),
+        (motion_body_orientation_tolerance_error_exp, cfg.body_orientation_rewards),
+      ):
+        if getattr(term, "func", None) is not function:
+          continue
+        selected = tuple(term.params["body_names"])
+        if not selected or any(body not in body_names for body in selected):
+          raise ValueError(f"{name}: body_names must select tracked robot bodies")
+        if body_names[0] in selected:
+          raise ValueError(f"{name}: exclude the root; it has a separate tracking reward")
+        std, tolerance = term.params["std"], term.params.get("tolerance", 0.0)
+        if not math.isfinite(std) or std <= 0 or not math.isfinite(tolerance) or tolerance < 0:
+          raise ValueError(f"{name}: std must be positive and tolerance nonnegative, both finite")
+        destination[name] = dict(indices=tuple(i for i, b in enumerate(body_names) if b in selected),
+                                 std=std, tolerance=tolerance)
     return cfg
 
 
@@ -75,7 +103,9 @@ class FunctionalMDP:
 
   def validate_imagination_rewards(self, learned_rewards=()):
     unsupported = [name for name, weight in self.cfg.weights.items()
-                   if weight != 0 and name not in REWARD_WEIGHTS and name not in learned_rewards]
+                   if weight != 0 and name not in REWARD_WEIGHTS and name not in learned_rewards
+                   and name not in self.cfg.body_position_rewards
+                   and name not in self.cfg.body_orientation_rewards]
     if unsupported:
       raise ValueError(
         f"No imagined reward implementation for {unsupported}. "
@@ -132,7 +162,7 @@ class FunctionalMDP:
     return (anchor.unsqueeze(-2) + (delta.unsqueeze(-3) @ (bp - rp.unsqueeze(-2)).unsqueeze(-1)).squeeze(-1),
             delta.unsqueeze(-3) @ br)
 
-  def reward_terms(self, state, f, action, a_prev):
+  def reward_terms(self, state, f, action, a_prev, *, terrain_tolerance=None):
     c, m = self.cfg, self.motion
     p, r, _, _, q, _ = state
     bp, br, bv, bw = self.kin.forward(*state)
@@ -140,7 +170,7 @@ class FunctionalMDP:
     ref_bp, ref_br = self.aligned_reference(state, f)
     rv = m.body_lin_vel_w[f][..., self.body_indexes, :]
     rw = m.body_ang_vel_w[f][..., self.body_indexes, :]
-    return {
+    terms = {
       "motion_global_root_pos": torch.exp(-(rp - p).square().sum(-1) / c.root_pos_std**2),
       "motion_global_root_ori": torch.exp(-rot_angle_sq(rr, r) / c.root_ori_std**2),
       "motion_body_pos": torch.exp(-(ref_bp - bp).square().sum(-1).mean(-1) / c.body_pos_std**2),
@@ -150,9 +180,27 @@ class FunctionalMDP:
       "action_rate_l2": (action - a_prev).square().sum(-1),
       "joint_limit": (torch.relu(q - self.soft_hi) + torch.relu(self.soft_lo - q)).sum(-1),
     }
+    # Only dispatch/configuration lives here; the new formulas live in rewards.py
+    # and are shared by the measured manager adapters and imagined FK states.
+    if c.body_position_rewards or c.body_orientation_rewards:
+      reference_pos = m.body_pos_w[f][..., self.body_indexes, :]
+      reference_rot = quat_to_mat(m.body_quat_w[f][..., self.body_indexes, :])
+      for name, params in c.body_position_rewards.items():
+        ids = params["indices"]
+        terms[name] = root_relative_body_position_reward(
+          bp[..., ids, :], p, r, reference_pos[..., ids, :], rp, rr,
+          std=params["std"], tolerance=terrain_tolerance_radius(params["tolerance"], terrain_tolerance),
+        )
+      for name, params in c.body_orientation_rewards.items():
+        ids = params["indices"]
+        terms[name] = body_orientation_tolerance_reward(
+          br[..., ids, :, :], r, reference_rot[..., ids, :, :], rr,
+          std=params["std"], tolerance=terrain_tolerance_radius(params["tolerance"], terrain_tolerance),
+        )
+    return terms
 
-  def reward(self, state, f, action, a_prev):
-    terms = self.reward_terms(state, f, action, a_prev)
+  def reward(self, state, f, action, a_prev, *, terrain_tolerance=None):
+    terms = self.reward_terms(state, f, action, a_prev, terrain_tolerance=terrain_tolerance)
     return sum(self.cfg.weights.get(k, 0.0) * value for k, value in terms.items()) * self.cfg.step_dt
 
   def termination_errors(self, state, f):

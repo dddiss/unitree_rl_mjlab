@@ -208,7 +208,7 @@ class TrainingLogger:
           id=uuid.uuid4().hex, resume="never", reinit="create_new",
           save_code=False, sync_tensorboard=False,
           settings=wandb.Settings(
-            console="off", disable_code=True, disable_git=True,
+            console="auto", disable_code=True, disable_git=True,
             x_disable_stats=True, x_disable_meta=True,
           ),
         )

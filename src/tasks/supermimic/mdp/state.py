@@ -34,6 +34,19 @@ def normalize_xi(xi):
                     xi[..., 1:30] / 0.01, xi[..., 30:] / 0.05), -1)
 
 
+def state_in_reference_frame(state, xy_offset):
+  """Undo an episode's constant XY translation without rotating or detaching.
+
+  Replay/WM supervision keep the original environment-relative state. Rewards
+  and imagined rollouts use this translated frame to compare with the unmodified
+  motion library. The WM's inputs and local increments are XY-invariant.
+  """
+  if xy_offset is None:
+    return state
+  shift = torch.cat((xy_offset, torch.zeros_like(xy_offset[..., :1])), dim=-1)
+  return (state[0] - shift, *state[1:])
+
+
 def read_state(env):
   """Caller must forward the simulation after integration or state writes."""
   cmd = env.command_manager.get_term("motion")

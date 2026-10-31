@@ -9,7 +9,8 @@ def test_successor_sharing_terminal_pending_and_wrap():
     b.add(dict(s=torch.zeros(2,71),s1=torch.ones(2,71),a=torch.zeros(2,29),a_prev=torch.zeros(2,29),
                r=torch.ones(2),f=torch.ones(2,dtype=torch.long),ep_step=torch.tensor(steps),
                terminated=torch.tensor(done),truncated=torch.zeros(2,dtype=torch.bool),
-               depth=image(values),depth_next=image(next_values)))
+               depth=image(values),depth_next=image(next_values),terrain_tolerance=torch.zeros(2,dtype=torch.bool),
+               reference_xy_offset=torch.zeros(2,2)))
   add([10,20],[11,21],[0,0])
   assert b.depth.next_frames(torch.tensor([0,0]),torch.arange(2))[:,0,0].tolist()==[11,21]
   add([11,21],[12,22],[1,1],(True,False))
@@ -34,7 +35,8 @@ def test_sampled_visual_windows_keep_real_terminal_targets():
   for t in range(4):
     b.add(dict(s=torch.zeros(1,71),s1=torch.ones(1,71),a=torch.zeros(1,29),a_prev=torch.zeros(1,29),
                r=torch.ones(1),f=torch.ones(1,dtype=torch.long),ep_step=torch.tensor([t%2]),
-               terminated=torch.tensor([t%2==1]),truncated=torch.tensor([False]),
+               terminated=torch.tensor([t%2==1]),truncated=torch.tensor([False]),terrain_tolerance=torch.zeros(1,dtype=torch.bool),
+               reference_xy_offset=torch.zeros(1,2),
                depth=torch.full((1,18,32),10*t,dtype=torch.uint8),
                depth_next=torch.full((1,18,32),10*(t+1) if t%2==0 else 199,dtype=torch.uint8)))
   w=b.sample_windows(20,2,strict=True)

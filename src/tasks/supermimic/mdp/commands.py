@@ -67,6 +67,8 @@ class MotionCommand(CommandTerm):
     self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
     # Retain k separately: a target clamped at the clip end cannot recover it.
     self._initialization_frames = torch.zeros_like(self.time_steps)
+    # Constant per episode, in world-aligned XY; the shared motion bank is immutable.
+    self.reference_xy_offset = torch.zeros(self.num_envs, 2, device=self.device)
     self.start_bin = torch.zeros_like(self.time_steps)
     self._requested_frames = torch.full_like(self.time_steps, -1)
     self.body_pos_relative_w = torch.zeros(
@@ -106,6 +108,10 @@ class MotionCommand(CommandTerm):
   def motion_ids(self) -> torch.Tensor:
     return self.motion.clip_id[self.time_steps]
 
+  @property
+  def reference_origin_w(self) -> torch.Tensor:
+    return self._env.scene.env_origins + torch.nn.functional.pad(self.reference_xy_offset, (0, 1))
+
   def get_reference(self, frame_ids: torch.Tensor) -> MotionReference:
     """Reference for one frame per env, restricted to tracked bodies in world space."""
     bodies = self.body_indexes
@@ -113,7 +119,7 @@ class MotionCommand(CommandTerm):
     return MotionReference(
       self.motion.joint_pos[frame_ids],
       self.motion.joint_vel[frame_ids],
-      self.motion.body_pos_w[frames, bodies] + self._env.scene.env_origins[:, None, :],
+      self.motion.body_pos_w[frames, bodies] + self.reference_origin_w[:, None, :],
       self.motion.body_quat_w[frames, bodies],
       self.motion.body_lin_vel_w[frames, bodies],
       self.motion.body_ang_vel_w[frames, bodies],
@@ -135,7 +141,7 @@ class MotionCommand(CommandTerm):
   def body_pos_w(self) -> torch.Tensor:
     return (
       self.motion.body_pos_w[self.time_steps[:, None], self.body_indexes]
-      + self._env.scene.env_origins[:, None, :]
+      + self.reference_origin_w[:, None, :]
     )
 
   @property
@@ -154,7 +160,7 @@ class MotionCommand(CommandTerm):
   def anchor_pos_w(self) -> torch.Tensor:
     return (
       self.motion.body_pos_w[self.time_steps, self.robot_anchor_body_index]
-      + self._env.scene.env_origins
+      + self.reference_origin_w
     )
 
   @property
@@ -262,9 +268,12 @@ class MotionCommand(CommandTerm):
 
     root_state = torch.cat([root_pos, root_ori, root_lin_vel, root_ang_vel], dim=-1)
     if self.cfg.terrain_reset is not None:
-      root_state = place_on_terrain(
+      placed = place_on_terrain(
         self._env, self.robot, env_ids, root_state, self.cfg.terrain_reset,
       )
+      if self.cfg.terrain_reset.randomize_xy:
+        self.reference_xy_offset[env_ids] = placed[:, :2] - root_state[:, :2]
+      root_state = placed
     self.robot.write_root_state_to_sim(root_state, env_ids=env_ids)
     self.robot.reset(env_ids=env_ids)
 
@@ -296,6 +305,7 @@ class MotionCommand(CommandTerm):
     frames = torch.where(exact, requested, frames)
     self._requested_frames[env_ids] = -1
     self._initialization_frames[env_ids] = frames
+    self.reference_xy_offset[env_ids] = 0.0
     # Initialize the robot at k, but expose k+1 as the first control target.
     # Explicit playback requests may select the last frame, so clamp per clip.
     end = self.motion.clip_end[self.motion.clip_id[frames]]
@@ -486,7 +496,7 @@ class MotionCommand(CommandTerm):
         frame = self.time_steps[batch]
         root_pos = (
           self.motion.body_pos_w[frame, self.root_body_index]
-          + self._env.scene.env_origins[batch]
+          + self.reference_origin_w[batch]
         )
         qpos[free_joint_q_adr[0:3]] = root_pos.cpu().numpy()
         qpos[free_joint_q_adr[3:7]] = (
@@ -652,7 +662,7 @@ class MotionCommandCfg(CommandTermCfg):
   # "uniform": uniform bins, then frames. "start": uniform clips, first frame.
   sampling_mode: Literal["uniform", "start", "return_based"] = "return_based"
   gamma: float = 0.99
-  # None retains the original plane reset. Geometry placement changes only Z.
+  # None retains the original plane reset. XY randomization is training-only.
   terrain_reset: TerrainResetCfg | None = None
 
   @dataclass
