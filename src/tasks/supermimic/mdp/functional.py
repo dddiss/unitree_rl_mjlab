@@ -88,6 +88,8 @@ class FunctionalMDP:
     self.body_indexes = torch.as_tensor(body_indexes, device=motion.device, dtype=torch.long)
     self.root_body_index = int(root_body_index)
     self.cfg = cfg or MdpConfig(step_dt=motion.step_dt)
+    # Reference-XY ray query used only for height termination (None = plane).
+    self.termination_ground = None
     if soft_limits is None:
       mid, half = (kin.q_lo + kin.q_hi) / 2, (kin.q_hi - kin.q_lo) * 0.45
       self.soft_lo, self.soft_hi = mid - half, mid + half
@@ -203,12 +205,29 @@ class FunctionalMDP:
     terms = self.reward_terms(state, f, action, a_prev, terrain_tolerance=terrain_tolerance)
     return sum(self.cfg.weights.get(k, 0.0) * value for k, value in terms.items()) * self.cfg.step_dt
 
-  def termination_errors(self, state, f):
-    rp, rr, _, _ = self.reference_root(f)
-    return (rp[..., 2] - state[0][..., 2]).abs(), (rr[..., 2, 2] - state[1][..., 2, 2]).abs()
+  @torch.no_grad()
+  def termination_height_offset(self, f, env_origin=None, xy_offset=None):
+    """Reference ground in the same environment-relative Z frame as state.
 
-  def termination(self, state, f):
-    z, tilt = self.termination_errors(state, f)
+    Reference XY is fixed by the sampled episode, never by a predicted state.
+    Query future frames before BPTT, without requiring recorded future rows.
+    """
+    if self.termination_ground is None:
+      ground = torch.zeros_like(f, dtype=torch.float32)
+    else:
+      if env_origin is None or xy_offset is None:
+        raise ValueError("Terrain termination requires the sampled episode's origin and XY offset")
+      xy = self.motion.body_pos_w[f, self.root_body_index, :2] + env_origin[..., :2] + xy_offset
+      ground = self.termination_ground(xy)
+    return ground if env_origin is None else ground - env_origin[..., 2]
+
+  def termination_errors(self, state, f, *, height_offset=None):
+    rp, rr, _, _ = self.reference_root(f)
+    target_z = rp[..., 2] if height_offset is None else rp[..., 2] + height_offset
+    return (target_z - state[0][..., 2]).abs(), (rr[..., 2, 2] - state[1][..., 2, 2]).abs()
+
+  def termination(self, state, f, *, height_offset=None):
+    z, tilt = self.termination_errors(state, f, height_offset=height_offset)
     done = torch.zeros_like(z, dtype=torch.bool)
     if self.cfg.term_height is not None:
       done = done | (z > self.cfg.term_height)
@@ -216,8 +235,8 @@ class FunctionalMDP:
       done = done | (tilt > self.cfg.term_tilt)
     return done
 
-  def soft_termination(self, state, f):
-    z, tilt = self.termination_errors(state, f)
+  def soft_termination(self, state, f, *, height_offset=None):
+    z, tilt = self.termination_errors(state, f, height_offset=height_offset)
     alive = torch.ones_like(z)
     if self.cfg.term_height is not None:
       alive = alive * (1 - torch.sigmoid((z - self.cfg.term_height) / 0.02))

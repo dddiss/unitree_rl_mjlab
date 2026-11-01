@@ -53,7 +53,7 @@ def analytic_learner(mdp, monkeypatch, frames, failure, **config):
     candidates.append(pos)
     return (pos,*s[1:]), a, history, alg.next_target(frame), goal
 
-  def reward(s, frame, a, previous):
+  def reward(s, frame, a, previous, **kwargs):
     return 2 + s[0][:,0], torch.tensor(failure).repeat(cfg.horizon)
 
   bootstrap = []

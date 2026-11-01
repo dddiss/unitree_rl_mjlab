@@ -27,7 +27,9 @@ def bad_anchor_pos_z_only(
 ) -> torch.Tensor:
   from .state import read_state
   cmd = env.command_manager.get_term(command_name)
-  return env.functional_mdp.termination_errors(read_state(env), cmd.time_steps)[0] > threshold
+  mdp = env.functional_mdp
+  offset = mdp.termination_height_offset(cmd.time_steps, env.scene.env_origins, cmd.reference_xy_offset)
+  return mdp.termination_errors(read_state(env), cmd.time_steps, height_offset=offset)[0] > threshold
 
 
 def bad_anchor_ori(

@@ -102,6 +102,7 @@ class PbfmTerrainHeightSensor(TerrainHeightSensor):
     def __init__(self, cfg: PbfmTerrainHeightSensorCfg) -> None:
         super().__init__(cfg)
         self._padding_regions: tuple[tuple[float, float, float, float, float], ...] = ()
+        self._height_query_buffers = {}
 
     def initialize(self, mj_model, model, data, device: str) -> None:
         lower, upper = terrain_vertical_bounds(mj_model)
@@ -154,3 +155,71 @@ class PbfmTerrainHeightSensor(TerrainHeightSensor):
             self._padding_regions,
             max_distance=self.cfg.max_distance,
         )
+
+    @torch.no_grad()
+    def query_height_at_xy(self, xy: torch.Tensor) -> torch.Tensor:
+        """Exact collision height at arbitrary reference world XY, without reset.
+
+        The generated terrain is static and identical across simulation worlds.
+        Pack arbitrary replay/reference batches into the existing nworld ray
+        context; these slots are unrelated to the episode's environment ID.
+        Dedicated buffers leave robot state and normal sensor readings intact.
+        """
+        shape = xy.shape[:-1]
+        points = xy.reshape(-1, 2)
+        count = len(points)
+        if not count:
+            return torch.empty(shape, dtype=torch.float32, device=xy.device)
+        num_worlds = self._data.nworld
+        rays_per_world = (count + num_worlds - 1) // num_worlds
+        buffers = self._height_query_buffers.get(rays_per_world)
+        if buffers is None:
+            origins = torch.empty(num_worlds, rays_per_world, 3, device=self._device)
+            origins[..., 2] = self.probe_world_z
+            directions = torch.zeros_like(origins)
+            directions[..., 2] = -1
+            distances = torch.empty(num_worlds, rays_per_world, device=self._device)
+            geom_ids = torch.empty_like(distances, dtype=torch.int32)
+            normals = torch.empty_like(origins)
+            exclude = torch.full((rays_per_world,), -1, dtype=torch.int32, device=self._device)
+            buffers = origins, directions, distances, geom_ids, normals, exclude
+            self._height_query_buffers[rays_per_world] = buffers
+        origins, directions, distances, geom_ids, normals, exclude = buffers
+        origins.view(-1, 3)[:count, :2].copy_(points)
+        origins.view(-1, 3)[count:, :2].copy_(points[0])
+        self._cast_height_rays(*buffers)
+        distances.masked_fill_(~torch.isfinite(distances) | (distances > self.cfg.max_distance), -1)
+        hit_positions = origins + directions * distances.clamp_min(0)[..., None]
+        repair_padding_ray_misses(distances, hit_positions, normals, origins,
+                                  self._padding_regions, max_distance=self.cfg.max_distance)
+        heights = hit_positions[..., 2].reshape(-1)[:count]
+        valid = (distances.reshape(-1)[:count] >= 0) & torch.isfinite(heights)
+        if not bool(valid.all()):
+            bad = (~valid).nonzero().flatten()[:8]
+            raise RuntimeError(
+                "Reference ground ray missed collision terrain: "
+                f"query_shape={tuple(shape)}, flat_indices={bad.tolist()}, "
+                f"reference_xy_w={points[bad].tolist()}, ray_origin_z={self.probe_world_z}, "
+                f"distances={distances.reshape(-1)[bad].tolist()}"
+            )
+        return heights.reshape(shape)
+
+    def _cast_height_rays(self, origins, directions, distances, geom_ids, normals, exclude):
+        """Same MuJoCo Warp rays API/context as RayCastSensor.raycast_kernel."""
+        from contextlib import nullcontext
+        import warp as wp
+        from mujoco_warp import rays
+
+        assert self._ctx is not None
+        stream = (wp.ScopedStream(wp.stream_from_torch(torch.cuda.current_stream(self._device)))
+                  if self._wp_device.is_cuda else nullcontext())
+        with wp.ScopedDevice(self._wp_device), stream:
+            rays(
+                m=self._model.struct, d=self._data.struct,
+                pnt=wp.from_torch(origins, dtype=wp.vec3),
+                vec=wp.from_torch(directions, dtype=wp.vec3),
+                geomgroup=self._geomgroup, flg_static=True,
+                bodyexclude=wp.from_torch(exclude), dist=wp.from_torch(distances),
+                geomid=wp.from_torch(geom_ids), normal=wp.from_torch(normals, dtype=wp.vec3),
+                rc=self._ctx.render_context,
+            )

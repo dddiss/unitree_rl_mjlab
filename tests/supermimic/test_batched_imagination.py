@@ -150,11 +150,11 @@ def test_batched_update_matches_original_stepwise_update(mdp):
   reward_term = actual._reward_term
   critic_input = actual._critic_input
 
-  def capture_reward(state, f, action, a_prev):
+  def capture_reward(state, f, action, a_prev, **kwargs):
     reward_calls.append((f.detach().clone(), action.detach().clone(), a_prev.detach().clone()))
     assert state[0].shape == (cfg.horizon * cfg.pi_batch, 3)
     assert all(t.requires_grad for t in state)
-    return reward_term(state, f, action, a_prev)
+    return reward_term(state, f, action, a_prev, **kwargs)
 
   def capture_critic(state, f, xi_n, goal, a_prev):
     critic_calls.append((len(f), torch.is_grad_enabled()))

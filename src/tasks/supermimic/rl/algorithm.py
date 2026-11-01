@@ -215,12 +215,12 @@ class SuperMimicAlgorithm:
     # One mean/backward/optimizer step for the original complete minibatch.
     return self._critic_error(self._critic_forward(x, depth_latent), target)
 
-  def reward_term(self, state, f, action, a_prev, foot_costs=None, *, terrain_tolerance=None):
+  def reward_term(self, state, f, action, a_prev, foot_costs=None, *, terrain_tolerance=None, height_offset=None):
     reward = self.mdp.reward(state, f, action, a_prev, terrain_tolerance=terrain_tolerance)
     if foot_costs is not None:
       for i, name in enumerate(self.foot_reward_names):
         reward = reward + self.mdp.cfg.weights[name] * foot_costs[..., i] * self.mdp.cfg.step_dt
-    return reward, self.mdp.soft_termination(state, f)
+    return reward, self.mdp.soft_termination(state, f, height_offset=height_offset)
 
   def next_target(self, f):
     m = self.mdp.motion
@@ -271,6 +271,14 @@ class SuperMimicAlgorithm:
     motion = self.mdp.motion
     lengths = (motion.clip_end[motion.clip_id[f]] - f + 1).clamp(max=c.horizon)
     valid = torch.arange(c.horizon, device=self.device)[:, None] < lengths[None]
+    height_offset = None
+    if self.mdp.cfg.term_height is not None:
+      # Query all targets using the sampled episode's placement, independent
+      # of predicted XY and of subsequently collected/reset replay rows.
+      target_frames = torch.minimum(f[None] + torch.arange(c.horizon, device=self.device)[:, None],
+                                    motion.clip_end[motion.clip_id[f]][None])
+      height_offset = self.mdp.termination_height_offset(
+        target_frames, start.get("env_origin"), start.get("reference_xy_offset")).reshape(-1)
 
     def flat(rows):
       return torch.stack(rows).flatten(0, 1)
@@ -320,6 +328,8 @@ class SuperMimicAlgorithm:
       reward_kwargs = {} if terrain_tolerance is None else {
         "terrain_tolerance": terrain_tolerance.unsqueeze(0).expand(c.horizon, -1).reshape(-1),
       }
+      if height_offset is not None:
+        reward_kwargs["height_offset"] = height_offset
       r, d = self._reward_term(*reward_inputs, **reward_kwargs)
       r, d = r.reshape(c.horizon, batch_size), d.reshape(c.horizon, batch_size)
       # Motion end is a truncation, not a failure: stop rewards there while

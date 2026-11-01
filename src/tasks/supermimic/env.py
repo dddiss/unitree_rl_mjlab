@@ -81,6 +81,10 @@ class SuperMimicEnv(ManagerBasedRlEnv):
       self._functional_mdp = FunctionalMDP(cmd.motion, kin, robot.data.default_joint_pos[0],
                                            cmd.body_indexes, cmd.root_body_index,
                                            robot.data.soft_joint_pos_limits[0], cfg)
+      terrain = self.scene.terrain
+      if cfg.term_height is not None and terrain is not None and terrain.cfg.terrain_type == "generator":
+        sensor = self.scene[cmd.cfg.terrain_reset.sensor_name]
+        self._functional_mdp.termination_ground = sensor.query_height_at_xy
     return self._functional_mdp
 
   def shared_reward_terms(self):
@@ -129,6 +133,7 @@ class SuperMimicEnv(ManagerBasedRlEnv):
       "a_prev": self.action_manager.action.clone(), "ep_step": self.episode_length_buf.clone(),
       "terrain_tolerance": self.terrain_tolerance.clone(),
       "reference_xy_offset": cmd.reference_xy_offset.clone(),
+      "env_origin": self.scene.env_origins.clone(),
     }
     if getattr(self, "_depth_camera", None) is not None:
       transition["depth"] = self.depth_image.clone()

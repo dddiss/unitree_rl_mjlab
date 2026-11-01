@@ -35,6 +35,8 @@ reset XY/pose/velocity/joint sampling. The ground probe starts above the compile
 map's highest collision bound to cover reference positions outside their initial
 tile; the final height rule is unchanged. P-BFM's region sampling, random heading,
 lying resets and terrain observations are not imported.
+The existing terrain ray context and padding repair also serve direct reference-XY
+height queries for termination, without moving the robot or smoothing the ground.
 
 `src/tasks/supermimic/mdp/foot_rewards.py` and
 `src/tasks/supermimic/terrain/foot_sensor.py` additionally adapt that revision's

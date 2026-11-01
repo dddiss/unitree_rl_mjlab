@@ -74,7 +74,7 @@ def test_step_captures_state_and_target_before_command_advance(visual, foot_supp
       events.append('depth')
       return e.state[:,0,None,None].to(torch.uint8).expand(-1,18,32).clone()
     e._depth_camera=NS(read=read_depth)
-  e.scene=NS(write_data_to_sim=lambda:None,update=lambda dt:None)
+  e.scene=NS(write_data_to_sim=lambda:None,update=lambda dt:None,env_origins=torch.tensor([[1.,2.,.3],[4.,5.,.6]]))
   e.metrics_manager=NS(compute_substep=lambda:None,compute=lambda:None)
   def term(): events.append('termination');return torch.tensor([True,False])
   e.termination_manager=NS(compute=term,terminated=torch.tensor([True,False]),time_outs=torch.zeros(2,dtype=torch.bool))
@@ -129,6 +129,8 @@ def test_step_captures_state_and_target_before_command_advance(visual, foot_supp
   assert tr['terrain_tolerance'].tolist() == [False, True]
   cmd.reference_xy_offset.zero_()
   assert tr['reference_xy_offset'].tolist()==[[1.,2.],[3.,4.]]
+  e.scene.env_origins.zero_()
+  torch.testing.assert_close(tr['env_origin'], torch.tensor([[1.,2.,.3],[4.,5.,.6]]))
   e.terrain_tolerance.logical_not_()
   assert tr['terrain_tolerance'].tolist() == [False, True]
   if foot_support:

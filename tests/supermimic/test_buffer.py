@@ -9,7 +9,8 @@ def transition(f, step, done=False):
               a=torch.zeros(n,29),a_prev=torch.zeros(n,29),f=torch.tensor(f),
               r=torch.ones(n),ep_step=torch.full((n,),step),
               terminated=torch.full((n,),done),truncated=torch.zeros(n,dtype=torch.bool),
-              terrain_tolerance=torch.zeros(n,dtype=torch.bool),reference_xy_offset=torch.zeros(n,2))
+              terrain_tolerance=torch.zeros(n,dtype=torch.bool),reference_xy_offset=torch.zeros(n,2),
+              env_origin=torch.zeros(n,3))
 
 
 def test_windows_and_histories_do_not_cross_reset(mdp):

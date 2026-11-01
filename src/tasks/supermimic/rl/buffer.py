@@ -8,7 +8,7 @@ FIELDS = {"s": (STATE_DIM, torch.float32), "s1": (STATE_DIM, torch.float32),
           "r": (None, torch.float32), "f": (None, torch.long),
           "ep_step": (None, torch.long), "terminated": (None, torch.bool),
           "truncated": (None, torch.bool), "terrain_tolerance": (None, torch.bool),
-          "reference_xy_offset": (2, torch.float32)}
+          "reference_xy_offset": (2, torch.float32), "env_origin": (3, torch.float32)}
 
 
 class ReplayBuffer:
@@ -114,7 +114,7 @@ class ReplayBuffer:
     rows = self._row(age[:, None] - back)
     keys = ("s", "a_prev", "f")
     # Snapshot per transition, not a lookup of the environment's latest terrain.
-    start = {k: self.data[k][row, envs] for k in (*keys, "terrain_tolerance", "reference_xy_offset")}
+    start = {k: self.data[k][row, envs] for k in (*keys, "terrain_tolerance", "reference_xy_offset", "env_origin")}
     hist = {k: self.data[k][rows, envs[:, None]] for k in (*keys, "reference_xy_offset")}
     start["xi"] = self.xi[envs]
     hist["xi"] = self.xi[envs, None].expand(-1, history, -1)

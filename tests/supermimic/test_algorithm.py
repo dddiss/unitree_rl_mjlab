@@ -29,7 +29,7 @@ def filled_buffer(mdp,cfg):
     tr=dict(s=make(f-1),s1=make(f),a=torch.zeros(2,29),a_prev=torch.zeros(2,29),f=f,
             r=torch.ones(2)*.1,ep_step=torch.full((2,),step),terminated=torch.zeros(2,dtype=torch.bool),
             truncated=torch.zeros(2,dtype=torch.bool),terrain_tolerance=torch.zeros(2,dtype=torch.bool),
-            reference_xy_offset=torch.zeros(2,2))
+            reference_xy_offset=torch.zeros(2,2),env_origin=torch.zeros(2,3))
     b.add(tr);transitions.append(tr)
   return b,transitions
 
