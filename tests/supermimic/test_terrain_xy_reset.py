@@ -11,7 +11,6 @@ from supermimic.mdp.state import state_in_reference_frame, unflatten_state
 from supermimic.rl.algorithm import SuperMimicAlgorithm
 from supermimic.rl.buffer import ReplayBuffer
 from supermimic.terrain import reset as terrain_reset
-from supermimic.terrain.pattern import RobotCentricGridPatternCfg
 from supermimic.terrain.reset import TerrainResetCfg, place_on_terrain, terrain_tile_xy_bounds
 from test_algorithm import filled_buffer, small_config
 from test_buffer import transition
@@ -28,10 +27,9 @@ def test_factory_enables_xy_only_for_training_on_generated_tiles(play, kind):
             if isinstance(n, ast.FunctionDef) and n.name == 'unitree_g1_flat_tracking_env_cfg')
   branch = next(n for n in fn.body if isinstance(n, ast.If) and 'TerrainResetCfg(' in ast.unparse(n))
   cmd = NS(terrain_reset=None)
-  cfg = NS(scene=NS(terrain=NS(terrain_type=kind), sensors=()))
+  cfg = NS(scene=NS(terrain=NS(terrain_type=kind, terrain_generator=NS(border_width=17.)), sensors=()))
   namespace = dict(play=play, motion_cmd=cmd, cfg=cfg, TerrainResetCfg=TerrainResetCfg,
-                   PbfmTerrainHeightSensorCfg=lambda **kw: kw, ObjRef=lambda **kw: kw,
-                   RobotCentricGridPatternCfg=RobotCentricGridPatternCfg)
+                   mark_terrain_padding_ray_group=lambda spec: None)
   exec(compile(ast.Module(body=[branch], type_ignores=[]), str(path), 'exec'), namespace)
   if kind == 'plane':
     assert cmd.terrain_reset is None
@@ -45,31 +43,31 @@ def placement_fixture():
                terrain_levels=torch.tensor([1, 0, 1]), terrain_types=torch.tensor([0, 1, 1]))
   # Deliberately off-center origins: bounds must follow grid cells, not origins.
   origins = torch.tensor([[5., -5., .1], [-3., 6., .2], [6., 6., .3]])
-  sensor = NS(cfg=NS(pattern=RobotCentricGridPatternCfg()), update=lambda dt: None)
   class Scene(dict):
     pass
-  scene = Scene(reset_ground=sensor)
+  scene = Scene()
   scene.terrain, scene.env_origins = terrain, origins
   env = NS(scene=scene)
   ids = torch.tensor([2, 0])
   root = torch.randn(2, 13)
   root[:, :2] = torch.tensor([[100., -100.], [-100., 100.]])
   root[:, 2] = origins[ids, 2] + .8
+  root[:, 3:7] = torch.tensor([1., 0., 0., 0.])
   return env, ids, root
 
 
 def test_random_xy_retries_only_misses_and_preserves_height_rule_and_velocities(monkeypatch):
   env, ids, root = placement_fixture()
   calls = []
-  def probe(env, robot, selected, state, sensor):
+  def probe(env, state, offsets):
+    selected = ids if not calls else ids[1:]
     calls.append((selected.clone(), state.clone()))
-    hit = torch.zeros(3, 273, 3)
-    hit[:, :, 2] = torch.tensor([.2, .4, .6])[:, None]
-    distance = 5. - hit[..., 2]
+    height = torch.tensor([.2, .4, .6])[selected, None].expand(-1, 273)
+    valid = torch.ones_like(height, dtype=torch.bool)
     if len(calls) == 1:
-      distance[0] = -1  # Only environment 0 retries; env 2 keeps its first XY.
-    return NS(distances=distance, hit_pos_w=hit)
-  monkeypatch.setattr(terrain_reset, '_probe_ground', probe)
+      valid[1] = False
+    return height, valid
+  monkeypatch.setattr(terrain_reset, '_sample_ground', probe)
   placed = place_on_terrain(env, None, ids, root, TerrainResetCfg(randomize_xy=True))
   assert [call[0].tolist() for call in calls] == [[2, 0], [0]]
   torch.testing.assert_close(placed[0, :2], calls[0][1][0, :2])
@@ -86,15 +84,15 @@ def test_random_xy_retries_only_misses_and_preserves_height_rule_and_velocities(
 def test_random_xy_exhausted_retries_still_raises(monkeypatch, capsys):
   env, ids, root = placement_fixture()
   calls = []
-  def probe(env, robot, selected, state, sensor):
-    calls.append(selected.clone())
-    return NS(distances=torch.full((3, 273), -1.), hit_pos_w=torch.zeros(3, 273, 3))
-  monkeypatch.setattr(terrain_reset, '_probe_ground', probe)
+  def probe(env, state, offsets):
+    calls.append(state.clone())
+    return torch.full((len(state), 273), float('nan')), torch.zeros(len(state), 273, dtype=torch.bool)
+  monkeypatch.setattr(terrain_reset, '_sample_ground', probe)
   with pytest.raises(RuntimeError, match='Reset XY is outside'):
     place_on_terrain(env, None, ids, root, TerrainResetCfg(randomize_xy=True, xy_max_attempts=3))
   assert len(calls) == 3
   # Even missing diagnostic metadata does not hide the original height error.
-  assert 'Could not collect ray diagnostics' in capsys.readouterr().err
+  assert 'Could not collect height-map diagnostics' in capsys.readouterr().err
 
 
 def test_command_moves_whole_reference_but_not_velocity_or_other_environment(mdp):

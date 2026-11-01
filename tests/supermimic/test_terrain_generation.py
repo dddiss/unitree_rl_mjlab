@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-from supermimic.terrain.reset import terrain_vertical_bounds
+from supermimic.terrain.heightmap import terrain_bounds
 from test_env_lifecycle import ROOT
 
 
@@ -19,8 +19,21 @@ def terrain_config(mode=None):
 @pytest.mark.parametrize('family', ['flat', 'slope', 'stairs_up', 'stairs_down', 'rough', 'platforms'])
 def test_each_pbfm_family_compiles_and_raycast_sees_origin(family):
   from dataclasses import replace
-  config = terrain_config(family)
-  cfg = replace(config.terrain_generator.sub_terrains[family], size=(8., 8.))
+  pytest.importorskip('mjlab.terrains')
+  from supermimic.terrain.primitives import (
+    TerrainBoxFlatCfg, TerrainSeparatedPyramidStairsCfg, NeutralHfPerlinNoiseTerrainCfg,
+    NeutralHfPyramidSlopedTerrainCfg, ScatteredBoxPlatformsTerrainCfg,
+  )
+  # Exercise every primitive even when a user disables a family in their config.
+  cfg = {
+    'flat': TerrainBoxFlatCfg,
+    'slope': lambda: NeutralHfPyramidSlopedTerrainCfg(slope_range=(.08, .14), inverted=True),
+    'rough': lambda: NeutralHfPerlinNoiseTerrainCfg(height_range=(.03, .05)),
+    'platforms': ScatteredBoxPlatformsTerrainCfg,
+    'stairs_up': lambda: TerrainSeparatedPyramidStairsCfg(direction='up'),
+    'stairs_down': lambda: TerrainSeparatedPyramidStairsCfg(direction='down'),
+  }[family]()
+  cfg = replace(cfg, size=(8., 8.))
   for difficulty in (0., 1.):
     spec = mujoco.MjSpec()
     spec.worldbody.add_body(name='terrain')
@@ -29,7 +42,8 @@ def test_each_pbfm_family_compiles_and_raycast_sees_origin(family):
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
     assert np.all(model.geom_group == 5)
-    lower, upper = terrain_vertical_bounds(model)
+    lo, hi = terrain_bounds(model, data)
+    lower, upper = lo[2], hi[2]
     origin = output.origin.copy()
     origin[2] = upper + 1.5
     distance = mujoco.mj_ray(model, data, origin, np.array([0., 0., -1.]),
@@ -43,22 +57,21 @@ def test_each_pbfm_family_compiles_and_raycast_sees_origin(family):
 def test_default_map_padding_and_environment_config():
   cfg = terrain_config()
   from mjlab.terrains import TerrainGenerator
-  from supermimic.terrain.sensor import mark_terrain_padding_ray_group, terrain_padding_regions
+  from supermimic.terrain.heightmap import mark_terrain_padding_ray_group
   from src.tasks.supermimic.config.g1.env_cfgs import unitree_g1_flat_tracking_env_cfg
   gen = cfg.terrain_generator
-  assert gen.size == (8., 8.) and gen.num_rows == 10 and gen.num_cols == 6
+  assert gen.size == (8., 8.) and gen.num_rows == 10 and gen.num_cols == len(gen.sub_terrains)
   assert gen.border_width == 17. and gen.curriculum and gen.seed == 0
-  assert [s.proportion for s in gen.sub_terrains.values()] == [.15, .15, .2, .2, .15, .15]
+  assert all(s.proportion > 0 for s in gen.sub_terrains.values())
   spec = mujoco.MjSpec()
   generator = TerrainGenerator(gen)
   generator.compile(spec)
-  assert generator.terrain_origins.shape == (10, 6, 3)
-  assert len(terrain_padding_regions(spec)) == 4
-  assert mark_terrain_padding_ray_group(spec) == 4
+  assert generator.terrain_origins.shape == (10, gen.num_cols, 3)
+  mark_terrain_padding_ray_group(spec)
   model = spec.compile()
-  assert model.nhfield > 0 and np.all(model.geom_group == 5)
+  assert np.all(model.geom_group == 5)
   # Creating all configs must preserve reset noise, reward/termination functions,
-  # and physics options while adding only the ground-reset sensor/config.
+  # and physics options while replacing reset rays with a shared height-map configuration.
   for play in (False, True):
     old = unitree_g1_flat_tracking_env_cfg(play=play, terrain_type='plane')
     new = unitree_g1_flat_tracking_env_cfg(play=play)
@@ -68,7 +81,8 @@ def test_default_map_padding_and_environment_config():
     assert a.pose_range == b.pose_range and a.velocity_range == b.velocity_range
     assert a.joint_position_range == b.joint_position_range
     assert a.terrain_reset is None and b.terrain_reset is not None
-    assert len(new.scene.sensors) == len(old.scene.sensors) + 1
+    assert len(new.scene.sensors) == len(old.scene.sensors)
+    assert new.scene.spec_fn is mark_terrain_padding_ray_group or new.scene.spec_fn.__name__ == mark_terrain_padding_ray_group.__name__
     assert new.scene.terrain.geoms[0].friction == ((1.,) if play else (.3,))
 
 

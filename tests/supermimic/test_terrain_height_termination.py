@@ -1,8 +1,6 @@
 """Reference-ground targets agree in real steps and counterfactual rollouts."""
 import ast
-from contextlib import nullcontext
 from pathlib import Path
-import sys
 from types import SimpleNamespace as NS
 
 import mujoco
@@ -13,128 +11,11 @@ import torch
 from supermimic.mdp.state import unflatten_state
 from supermimic.rl.algorithm import SuperMimicAlgorithm
 from supermimic.rl.buffer import ReplayBuffer
-from supermimic.terrain.reset import terrain_vertical_bounds
+from supermimic.terrain.heightmap import TerrainHeightMap
 from test_algorithm import filled_buffer, small_config
 from test_buffer import transition
 
 ROOT = Path(__file__).resolve().parents[2]
-
-
-def step_model():
-  return mujoco.MjModel.from_xml_string('''<mujoco><worldbody>
-    <body name="terrain">
-      <geom type="box" group="5" pos="0 0 -.05" size="1 1 .05"/>
-      <geom type="box" group="5" pos=".5 0 .15" size=".5 1 .15"/>
-    </body>
-    <body name="robot" pos="0 0 2"><freejoint/>
-      <geom type="box" group="4" size=".3 .3 .3"/>
-    </body>
-  </worldbody></mujoco>''')
-
-
-def sensor_class():
-  """Exercise production query/repair methods without GPU-only mjlab imports."""
-  path = ROOT / 'src/tasks/supermimic/terrain/sensor.py'
-  tree = ast.parse(path.read_text())
-  nodes = [n for n in tree.body if (isinstance(n, ast.FunctionDef) and n.name == 'repair_padding_ray_misses')
-           or (isinstance(n, ast.ClassDef) and n.name == 'PbfmTerrainHeightSensor')]
-  class Base:
-    def __init__(self, cfg):
-      self.cfg = cfg
-  ns = dict(torch=torch, TerrainHeightSensor=Base)
-  future = ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0)
-  exec(compile(ast.fix_missing_locations(ast.Module(body=[future, *nodes], type_ignores=[])),
-               str(path), 'exec'), ns)
-  return ns['PbfmTerrainHeightSensor']
-
-
-def cpu_sensor(model=None, nworld=3):
-  model = step_model() if model is None else model
-  data = mujoco.MjData(model)
-  mujoco.mj_kinematics(model, data)
-  low, high = terrain_vertical_bounds(model)
-  sensor = sensor_class()(NS(max_distance=high+1.5-low+1))
-  sensor.probe_world_z = high + 1.5
-  sensor._device = 'cpu'
-  sensor._data = NS(nworld=nworld)
-  mask = np.array([0, 0, 0, 0, 0, 1], dtype=np.uint8)
-  def native_rays(origins, directions, distances, geom_ids, normals, exclude):
-    for i in range(origins.shape[0]):
-      for j in range(origins.shape[1]):
-        gid = np.empty(1, dtype=np.int32)
-        distances[i,j] = mujoco.mj_ray(model, data, origins[i,j].double().numpy(),
-                                      directions[i,j].double().numpy(), mask, True, int(exclude[j]), gid)
-        geom_ids[i,j] = int(gid[0])
-    normals.zero_()
-  sensor._cast_height_rays = native_rays
-  return sensor, data
-
-
-def test_direct_query_no_smoothing_or_interpolation_at_step_edge():
-  sensor, data = cpu_sensor()
-  rng = torch.random.get_rng_state()
-  old_qpos, old_xpos = data.qpos.copy(), data.xpos.copy()
-  # Exact sides of the edge, much closer than the removed 2.5 cm raster cells.
-  xy = torch.tensor([[[-.0001, 0.], [.0001, 0.]], [[-.01, 0.], [.01, 0.]]], requires_grad=True)
-  heights = sensor.query_height_at_xy(xy)
-  torch.testing.assert_close(heights, torch.tensor([[0., .3], [0., .3]]), atol=2e-7, rtol=0)
-  assert not heights.requires_grad
-  assert torch.equal(rng, torch.random.get_rng_state())
-  np.testing.assert_array_equal(data.qpos, old_qpos)
-  np.testing.assert_array_equal(data.xpos, old_xpos)
-  # The robot at Z=2 is excluded by the same ground-only group filter.
-  assert sensor.query_height_at_xy(torch.tensor([[.1, 0.]])).item() == pytest.approx(.3, abs=2e-7)
-
-
-def test_query_reuses_existing_warp_context_without_overwriting_sensor_or_result(monkeypatch):
-  sensor, _ = cpu_sensor()
-  native = sensor._cast_height_rays
-  del sensor._cast_height_rays  # Run the production Warp adapter, with a CPU ray backend.
-  sensor._model = NS(struct=object())
-  sensor._data.struct = object()
-  sensor._ctx = NS(render_context=object())
-  sensor._wp_device = NS(is_cuda=False)
-  sensor._geomgroup = object()
-  sensor._distances = torch.full((3, 273), 9.)
-  sensor._hit_pos_w = torch.full((3, 273, 3), 7.)
-  calls = []
-  def rays(**kw):
-    assert kw['m'] is sensor._model.struct and kw['d'] is sensor._data.struct
-    assert kw['rc'] is sensor._ctx.render_context and kw['geomgroup'] is sensor._geomgroup
-    assert kw['flg_static'] is True
-    calls.append(kw['pnt'].shape)
-    native(kw['pnt'], kw['vec'], kw['dist'], kw['geomid'], kw['normal'], kw['bodyexclude'])
-  monkeypatch.setitem(sys.modules, 'mujoco_warp', NS(rays=rays))
-  monkeypatch.setitem(sys.modules, 'warp', NS(vec3=object(), from_torch=lambda x, **kw: x,
-                                            ScopedDevice=lambda _: nullcontext()))
-  first = sensor.query_height_at_xy(torch.tensor([[.5, 0.]]))
-  ptr = sensor._height_query_buffers[1][0].data_ptr()
-  second = sensor.query_height_at_xy(torch.tensor([[-.5, 0.]]))
-  assert first.item() == pytest.approx(.3) and second.item() == pytest.approx(0.)
-  assert sensor._height_query_buffers[1][0].data_ptr() == ptr
-  many = sensor.query_height_at_xy(torch.tensor([.5, 0.]).expand(2, 4, 2))
-  torch.testing.assert_close(many, torch.full((2, 4), .3))
-  assert calls == [torch.Size([3, 1, 3]), torch.Size([3, 1, 3]), torch.Size([3, 3, 3])]
-  assert sensor._distances.eq(9).all() and sensor._hit_pos_w.eq(7).all()
-  assert sensor.query_height_at_xy(torch.empty(0, 2)).shape == (0,)
-
-
-def test_query_repairs_only_known_border_misses_and_rejects_unknown_ground():
-  sensor, _ = cpu_sensor()
-  sensor._padding_regions = ((1., 2., -1., 1., .1),)
-  # Native geometry ends at X=1; emulate a missed hit on a known padding box.
-  heights = sensor.query_height_at_xy(torch.tensor([[1.5, 0.], [-.5, 0.]]))
-  torch.testing.assert_close(heights, torch.tensor([.1, 0.]), atol=2e-7, rtol=0)
-  with pytest.raises(RuntimeError, match='Reference ground ray missed.*flat_indices=\\[1\\].*reference_xy_w='):
-    sensor.query_height_at_xy(torch.tensor([[-.5, 0.], [2.1, 0.]]))
-
-
-def test_direct_query_preserves_negative_world_heights():
-  model = step_model()
-  model.body_pos[model.body('terrain').id, 2] = -2.
-  sensor, _ = cpu_sensor(model)
-  heights = sensor.query_height_at_xy(torch.tensor([[-.5, 0.], [.5, 0.]]))
-  torch.testing.assert_close(heights, torch.tensor([-2., -1.7]), atol=2e-7, rtol=0)
 
 
 class SlopedGround:
@@ -221,10 +102,9 @@ def test_current_target_not_advanced_target_and_default_threshold(mdp):
   state = (*mdp.reference_root(f), mdp.motion.joint_pos[f], mdp.motion.joint_vel[f])
   # Reference crosses a step between f and f+1, so a premature query is visible.
   mid = (mdp.motion.body_pos_w[1, 0, 0] + mdp.motion.body_pos_w[2, 0, 0]) / 2
-  model = step_model()
-  model.geom_pos[1, 0] += float(mid)
-  sensor, _ = cpu_sensor(model)
-  mdp.termination_ground = sensor.query_height_at_xy
+  heightmap = TerrainHeightMap(torch.tensor([[0.], [.3]]),
+                               (float(mid)-.1, -1.), (float(mid)+.1, 1.))
+  mdp.termination_ground = heightmap.height
   origin, offset = torch.zeros(1, 3), torch.zeros(1, 2)
   now = mdp.termination_height_offset(f, origin, offset)
   later = mdp.termination_height_offset(f+1, origin, offset)
@@ -318,27 +198,3 @@ def test_imagination_queries_future_targets_from_sampled_placement_without_futur
   expected_frames = torch.minimum(sampled['f'][None] + torch.arange(cfg.horizon)[:, None],
                                   mdp.motion.clip_end[mdp.motion.clip_id[sampled['f']]][None])
   torch.testing.assert_close(frames, expected_frames)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason='Requires Linux NVIDIA GPU and mujoco-warp')
-def test_cuda_direct_query_matches_cpu_and_preserves_simulation_state():
-  import mujoco_warp as mjwarp
-  import warp as wp
-  model = step_model()
-  cpu, data = cpu_sensor(model)
-  gpu = sensor_class()(cpu.cfg)
-  gpu.probe_world_z = cpu.probe_world_z
-  gpu._device, gpu._wp_device = 'cuda:0', wp.get_device('cuda:0')
-  with wp.ScopedDevice('cuda:0'), wp.ScopedStream(wp.stream_from_torch(torch.cuda.current_stream())):
-    m = mjwarp.put_model(model)
-    d = mjwarp.put_data(model, data, nworld=3)
-    rc = mjwarp.create_render_context(model, nworld=3, cam_active=[], enabled_geom_groups=[5],
-                                      use_textures=False, use_shadows=False)
-  gpu._model, gpu._data = NS(struct=m), NS(struct=d, nworld=3)
-  gpu._ctx = NS(render_context=rc)
-  gpu._geomgroup = wp.types.vector(length=6, dtype=float)(0, 0, 0, 0, 0, -1)
-  before = wp.to_torch(d.qpos).clone()
-  xy = torch.tensor([[[-.0001, 0.], [.0001, 0.]], [[-.95, .95], [.95, -.95]]])
-  actual = gpu.query_height_at_xy(xy.cuda())
-  torch.testing.assert_close(actual.cpu(), cpu.query_height_at_xy(xy), atol=2e-6, rtol=1e-4)
-  torch.testing.assert_close(wp.to_torch(d.qpos), before, atol=0, rtol=0)

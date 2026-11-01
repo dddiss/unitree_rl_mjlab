@@ -27,16 +27,18 @@ SuperMimic integration are additions here, not claims about P-BFM's algorithm.
 The files in `src/tasks/supermimic/terrain/` and
 `src/tasks/supermimic/config/g1/terrain_cfg.py` additionally adapt the same
 revision's G1 six-family terrain primitives, `terrain_ufo_v0` generation defaults,
-273-ray reset grid, generator-padding ray handling, and local-ground/adaptive-lift
+273-point reset grid, generator-padding geom grouping, and local-ground/adaptive-lift
 reset rule. They carry the same CC BY-NC 4.0 attribution and license above.
 Changes: retained only the G1 mixed-terrain families, used project-local Python
 configuration without Hydra, and applied height placement to SuperMimic's existing
-reset XY/pose/velocity/joint sampling. The ground probe starts above the compiled
-map's highest collision bound to cover reference positions outside their initial
-tile; the final height rule is unchanged. P-BFM's region sampling, random heading,
+reset XY/pose/velocity/joint sampling. Startup raster rays start above the compiled
+map's highest collision bound and cover the entire map including its border;
+the final height rule is unchanged. P-BFM's region sampling, random heading,
 lying resets and terrain observations are not imported.
-The existing terrain ray context and padding repair also serve direct reference-XY
-height queries for termination, without moving the robot or smoothing the ground.
+Reset and reference-XY termination heights now use a project-local startup height
+map. It samples collision geometry, rechecks missed samples with native CPU MuJoCo,
+and uses containing-cell lookups without smoothing. Runtime reset probes and
+padding-miss repair were removed; the adaptive-lift rule is retained.
 
 `src/tasks/supermimic/mdp/foot_rewards.py` and
 `src/tasks/supermimic/terrain/foot_sensor.py` additionally adapt that revision's

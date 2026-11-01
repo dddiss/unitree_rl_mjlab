@@ -11,9 +11,8 @@ from src.tasks.supermimic.mdp import MotionCommandCfg
 
 from src.tasks.supermimic.tracking_env_cfg import make_tracking_env_cfg
 from .terrain_cfg import unitree_g1_terrain_cfg
-from ...terrain.pattern import RobotCentricGridPatternCfg
 from ...terrain.reset import TerrainResetCfg
-from ...terrain.sensor import PbfmTerrainHeightSensorCfg
+from ...terrain.heightmap import mark_terrain_padding_ray_group
 from mjlab.sensor import ObjRef
 
 
@@ -85,12 +84,8 @@ def unitree_g1_flat_tracking_env_cfg(
   assert isinstance(motion_cmd, MotionCommandCfg)
   if cfg.scene.terrain.terrain_type == "generator":
     motion_cmd.terrain_reset = TerrainResetCfg(randomize_xy=not play)
-    cfg.scene.sensors += (PbfmTerrainHeightSensorCfg(
-      name=motion_cmd.terrain_reset.sensor_name,
-      frame=ObjRef(type="body", name="pelvis", entity="robot"),
-      pattern=RobotCentricGridPatternCfg(), ray_alignment="yaw",
-      include_geom_groups=(5,), reduction="none",
-    ),)
+    if cfg.scene.terrain.terrain_generator.border_width > 0:
+      cfg.scene.spec_fn = mark_terrain_padding_ray_group
   motion_cmd.anchor_body_name = "pelvis"
   motion_cmd.body_names = (
     "pelvis",

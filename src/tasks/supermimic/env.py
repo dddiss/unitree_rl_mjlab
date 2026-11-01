@@ -9,6 +9,7 @@ from .mdp.kinematics import G1Kinematics
 from .mdp.logging_metrics import capture_step_metrics
 from .mdp.state import read_state, flatten_state, state_in_reference_frame
 from .terrain.reward_context import tolerance_by_terrain_column
+from .terrain.heightmap import TerrainHeightMap
 
 
 class SuperMimicEnv(ManagerBasedRlEnv):
@@ -34,6 +35,17 @@ class SuperMimicEnv(ManagerBasedRlEnv):
       self._depth_camera = DepthCamera(depth_camera, self.scene, self.device)
     self._context = self.read_context().clone()
     self.reset_version = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+
+  def load_managers(self):
+    # Managers probe observations/terminations during construction. Build the
+    # shared map first, before any reset, replay collection or imagined rollout.
+    self.terrain_height_map = None
+    terrain = self.scene.terrain
+    reset_cfg = self.cfg.commands["motion"].terrain_reset
+    if terrain is not None and terrain.cfg.terrain_type == "generator":
+      self.terrain_height_map = TerrainHeightMap.from_model(
+        self.sim.mj_model, self.device, resolution=reset_cfg.heightmap_resolution)
+    super().load_managers()
 
   @property
   def depth_image(self):
@@ -83,8 +95,7 @@ class SuperMimicEnv(ManagerBasedRlEnv):
                                            robot.data.soft_joint_pos_limits[0], cfg)
       terrain = self.scene.terrain
       if cfg.term_height is not None and terrain is not None and terrain.cfg.terrain_type == "generator":
-        sensor = self.scene[cmd.cfg.terrain_reset.sensor_name]
-        self._functional_mdp.termination_ground = sensor.query_height_at_xy
+        self._functional_mdp.termination_ground = self.terrain_height_map.height
     return self._functional_mdp
 
   def shared_reward_terms(self):

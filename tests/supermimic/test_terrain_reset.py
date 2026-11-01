@@ -9,19 +9,19 @@ import numpy as np
 import pytest
 import torch
 
-from supermimic.terrain.pattern import RobotCentricGridPatternCfg, reference_ray_index
+from supermimic.terrain.pattern import ResetFootprintCfg, reference_point_index
 from supermimic.terrain.reset import (
-  TerrainResetCfg, place_on_terrain, reset_height, terrain_vertical_bounds,
+  TerrainResetCfg, place_on_terrain, reset_height,
 )
 from test_env_lifecycle import ROOT, methods
+from supermimic.terrain.heightmap import TerrainHeightMap, terrain_bounds
 
 
 def test_pbfm_grid_and_height_rule():
-  pattern = RobotCentricGridPatternCfg()
-  offsets, directions = pattern.generate_rays(None, 'cpu')
-  center = reference_ray_index(offsets)
+  pattern = ResetFootprintCfg()
+  offsets = pattern.sample_offsets('cpu')
+  center = reference_point_index(offsets)
   assert pattern.shape == (21, 13) and len(offsets) == 273
-  assert directions[:, 2].eq(-1).all()
   heights = torch.tensor([0., 1.2, -1.5, 0.]).unsqueeze(1).repeat(1, 273)
   valid = torch.ones_like(heights, dtype=torch.bool)
   clearance = torch.tensor([0.8, 0.82, 0.79, 0.8])
@@ -49,10 +49,11 @@ def test_height_matches_actual_mujoco_surface_and_bounds():
   </worldbody></mujoco>''')
   data = mujoco.MjData(model)
   mujoco.mj_forward(model, data)
-  lower, upper = terrain_vertical_bounds(model)
+  lo, hi = terrain_bounds(model, data)
+  lower, upper = lo[2], hi[2]
   assert lower == pytest.approx(-.2) and upper == pytest.approx(.3)
-  pattern = RobotCentricGridPatternCfg()
-  offsets, _ = pattern.generate_rays(None, 'cpu')
+  pattern = ResetFootprintCfg()
+  offsets = pattern.sample_offsets('cpu')
   ground = []
   mask = np.array([0, 0, 0, 0, 0, 1], dtype=np.uint8)
   for xy in offsets[:, :2].numpy():
@@ -62,36 +63,9 @@ def test_height_matches_actual_mujoco_surface_and_bounds():
     ground.append(pos[2] - distance)
   ground = torch.tensor([ground], dtype=torch.float32)
   result = reset_height(torch.tensor([.8]), ground, torch.ones_like(ground, dtype=torch.bool),
-                        offsets, reference_ray_index(offsets), TerrainResetCfg())
+                        offsets, reference_point_index(offsets), TerrainResetCfg())
   # Adjacent step raises the placement to top(.3) + .8 + margin(.05).
   assert result.item() == pytest.approx(1.15)
-
-
-def test_padding_only_repairs_misses_on_actual_border_and_does_not_touch_robot():
-  # Run the actual sensor helpers without importing the optional Warp runtime.
-  path = ROOT / 'src/tasks/supermimic/terrain/sensor.py'
-  helpers = [node for node in ast.parse(path.read_text()).body if isinstance(node, ast.FunctionDef)]
-  ns = {'mujoco': mujoco, 'torch': torch}
-  exec(compile(ast.Module(helpers, type_ignores=[]), str(path), 'exec'), ns)
-  spec = mujoco.MjSpec()
-  body = spec.worldbody.add_body(name='terrain')
-  for x, y, z in ((-3, 0, 0), (3, 0, 0), (0, -3, 0), (0, 3, 0)):
-    body.add_geom(type=mujoco.mjtGeom.mjGEOM_BOX, size=(1, 1, .1), pos=(x, y, z-.1), group=0)
-  robot = spec.worldbody.add_body(name='robot')
-  robot.add_geom(type=mujoco.mjtGeom.mjGEOM_SPHERE, size=(.1, 0, 0), group=0)
-  regions = ns['terrain_padding_regions'](spec)
-  assert ns['mark_terrain_padding_ray_group'](spec) == 4
-  assert all(g.group == 5 for g in body.geoms)
-  assert robot.geoms[0].group == 0
-  origins = torch.tensor([[[-3., 0., 2.], [-3., 0., 2.], [10., 0., 2.]]])
-  distance = torch.tensor([[-1., 1.7, -1.]])
-  hit = torch.ones_like(origins)*8
-  normal = torch.zeros_like(origins)
-  ns['repair_padding_ray_misses'](distance, hit, normal, origins, regions, max_distance=5.)
-  torch.testing.assert_close(distance, torch.tensor([[2., 1.7, -1.]]))
-  torch.testing.assert_close(hit[0, 0], torch.tensor([-3., 0., 0.]))
-  assert hit[0, 1:].eq(8).all()
-  torch.testing.assert_close(normal[0, 0], torch.tensor([0., 0., 1.]))
 
 
 def test_heightfield_bounds_include_elevation_and_static_body_transform():
@@ -100,130 +74,75 @@ def test_heightfield_bounds_include_elevation_and_static_body_transform():
                   userdata=[0., .5, .8, 1.])
   body = spec.worldbody.add_body(name='terrain', pos=(3., 2., -2.))
   body.add_geom(type=mujoco.mjtGeom.mjGEOM_HFIELD, hfieldname='height', group=5)
-  lower, upper = terrain_vertical_bounds(spec.compile())
+  model = spec.compile()
+  data = mujoco.MjData(model)
+  mujoco.mj_forward(model, data)
+  lo, hi = terrain_bounds(model, data)
+  lower, upper = lo[2], hi[2]
   assert lower == pytest.approx(-2.1) and upper == pytest.approx(-1.3)
 
 
-def test_probe_changes_only_selected_root_height_without_advancing_history(capsys):
-  pattern = RobotCentricGridPatternCfg()
-  offsets, _ = pattern.generate_rays(None, 'cpu')
-  n = len(offsets)
-  all_states = torch.randn(3, 13)
-  before = all_states.clone()
+def test_lookup_changes_only_selected_height_without_writing_simulator(capsys):
   ids = torch.tensor([0, 2])
-  root = all_states[ids].clone()
   origins = torch.tensor([[10., 20., -1.], [10., 20., 0.], [10., 20., 2.]])
+  root = torch.randn(2, 13)
+  root[:, :2] = torch.tensor([[-3., 0.], [3., 0.]])
   root[:, 2] = origins[ids, 2] + torch.tensor([.81, .79])
-  sensor = NS(cfg=NS(pattern=pattern), probe_world_z=5., update=lambda dt: None)
-  events = []
-  class Scene(dict):
-    env_origins = origins
-    def write_data_to_sim(self): events.append('write')
-  scene = Scene(reset_ground=sensor)
-  def write(state, env_ids):
-    events.append('root');all_states[env_ids] = state
-  def sense():
-    events.append('sense')
-    hit = torch.zeros(3, n, 3)
-    hit[:, :, 2] = torch.tensor([.2, .5, 1.2])[:, None]
-    sensor.data = NS(hit_pos_w=hit, distances=5. - hit[:, :, 2])
-  env = NS(scene=scene, sim=NS(forward=lambda: events.append('forward'), sense=sense))
-  robot = NS(write_root_state_to_sim=write)
+  root[:, 3:7] = torch.tensor([1., 0., 0., 0.])
+  heightmap = TerrainHeightMap(torch.tensor([[.2], [1.2]]), (-10., -10.), (10., 10.))
+  env = NS(scene=NS(env_origins=origins), terrain_height_map=heightmap)
   rng = torch.random.get_rng_state()
-  placed = place_on_terrain(env, robot, ids, root, TerrainResetCfg())
-  assert events == ['root', 'write', 'forward', 'sense']
+  placed = place_on_terrain(env, object(), ids, root, TerrainResetCfg())
   torch.testing.assert_close(placed[:, 2], torch.tensor([1.01, 1.99]))
   torch.testing.assert_close(placed[:, :2], root[:, :2])
   torch.testing.assert_close(placed[:, 3:], root[:, 3:])
-  torch.testing.assert_close(all_states[1], before[1])
   assert torch.equal(rng, torch.random.get_rng_state())
   assert capsys.readouterr().err == ''
 
 
-@pytest.fixture
-def failed_reset_rays():
-  pattern = RobotCentricGridPatternCfg()
-  offsets, _ = pattern.generate_rays(None, 'cpu')
-  center = reference_ray_index(offsets)
-  ids = torch.tensor([3, 1, 4])  # Subset row indices differ from environment IDs.
+def test_out_of_map_reset_diagnostic_contains_environment_and_reference(capsys):
+  ids = torch.tensor([3, 1, 4])
   root = torch.zeros(3, 13)
   root[:, :3] = torch.tensor([[12., -7., .8], [1., 2., .9], [-4., 8., 1.]])
-  hit = torch.zeros(5, len(offsets), 3)
-  distances = torch.full((5, len(offsets)), 5.)
-  distances[[0, 3, 4], center] = -1.  # Environment 0 is not being reset.
-  distances[1, 0] = -1.  # A noncentral miss does not fail environment 1.
-  ray_origins = torch.zeros_like(hit)
-  ray_origins[3, center] = torch.tensor([12.125, -6.75, 5.25])
-  ray_origins[4, center] = torch.tensor([-4., 8., 5.])
-  updates, writes = [], []
-  sensor = NS(cfg=NS(pattern=pattern), probe_world_z=5.,
-              update=updates.append, _cached_world_origins=ray_origins,
-              data=NS(hit_pos_w=hit, distances=distances))
-  class Scene(dict):
-    env_origins = torch.zeros(5, 3)
-    def write_data_to_sim(self): pass
+  root[:, 3] = 1
   motion = NS(clip_id=torch.cat((torch.zeros(50), torch.ones(10))).long(),
-              clip_start=torch.tensor([0, 50]),
-              motion_names=('dance', 'walk'),
+              clip_start=torch.tensor([0, 50]), motion_names=('dance', 'walk'),
               motion_files=('/motions/dance.npz', '/motions/walk.npz'))
   command = NS(motion=motion, _initialization_frames=torch.tensor([0, 7, 3, 53, 59]),
                time_steps=torch.tensor([1, 8, 4, 54, 59]))
-  env = NS(scene=Scene(reset_ground=sensor),
-           sim=NS(forward=lambda: None, sense=lambda: None),
+  heightmap = TerrainHeightMap(torch.zeros(2, 2), (-3., -3.), (3., 3.))
+  env = NS(scene=NS(env_origins=torch.zeros(5, 3)), terrain_height_map=heightmap,
            command_manager=NS(get_term=lambda _: command))
-  robot = NS(write_root_state_to_sim=lambda state, env_ids: writes.append(state.clone()))
-  return NS(env=env, robot=robot, ids=ids, root=root, sensor=sensor, center=center,
-            command=command, updates=updates, writes=writes)
+  before = root.clone()
+  with pytest.raises(RuntimeError, match='Reset XY is outside'):
+    place_on_terrain(env, object(), ids, root, TerrainResetCfg())
+  records = [json.loads(line.split(': ', 1)[1]) for line in capsys.readouterr().err.splitlines()]
+  assert [r['env_id'] for r in records] == [3, 4]
+  assert records[0]['motion_name'] == 'walk'
+  assert records[0]['init_frame_global_k'] == 53 and records[0]['init_frame_local_k'] == 3
+  assert records[0]['target_frame_global_f'] == 54
+  assert records[0]['reset_xy_w'] == [12., -7.]
+  torch.testing.assert_close(root, before)
 
 
-@pytest.mark.parametrize('distance,hit_z', [(-1., 0.), (float('nan'), 0.),
-                                          (float('inf'), 0.), (5., float('nan'))])
-def test_failed_center_rays_print_exact_motion_frames_and_sensor_data(
-  failed_reset_rays, capsys, distance, hit_z,
-):
-  case = failed_reset_rays
-  case.sensor.data.distances[3, case.center] = distance
-  case.sensor.data.hit_pos_w[3, case.center, 2] = hit_z
-  root_before = case.root.clone()
-  frames_before = case.command.time_steps.clone()
-  rng = torch.random.get_rng_state()
-  with pytest.raises(RuntimeError, match='Reset XY is outside the collision terrain'):
-    place_on_terrain(case.env, case.robot, case.ids, case.root, TerrainResetCfg())
-  output = capsys.readouterr()
-  assert output.out == ''
-  prefix = '[TerrainReset] center ray failed: '
-  lines = output.err.splitlines()
-  assert len(lines) == 2 and all(line.startswith(prefix) for line in lines)
-  records = [json.loads(line[len(prefix):]) for line in lines]
-  assert [row['env_id'] for row in records] == [3, 4]
-  first, last = records
-  assert first['motion_id'] == 1 and first['motion_name'] == 'walk'
-  assert first['motion_file'] == '/motions/walk.npz'
-  assert first['init_frame_global_k'] == 53 and first['init_frame_local_k'] == 3
-  assert first['target_frame_global_f'] == 54
-  assert last['init_frame_global_k'] == 59 and last['init_frame_local_k'] == 9
-  assert last['target_frame_global_f'] == 59  # Last-frame playback clamps f.
-  assert first['reset_xy_w'] == [12., -7.]
-  assert first['ray_origin_w'] == [12.125, -6.75, 5.25]
-  assert math.isnan(first['ray_distance']) if math.isnan(distance) else first['ray_distance'] == distance
-  assert math.isnan(first['ray_hit_z_w']) if math.isnan(hit_z) else first['ray_hit_z_w'] == hit_z
-  assert last['reset_xy_w'] == [-4., 8.] and last['ray_distance'] == -1.
-  assert case.updates == [0.] and len(case.writes) == 1  # No retry or fallback reset.
-  torch.testing.assert_close(case.root, root_before)
-  torch.testing.assert_close(case.command.time_steps, frames_before)
-  assert torch.equal(rng, torch.random.get_rng_state())
-
-
-def test_ray_diagnostic_error_preserves_original_reset_exception(failed_reset_rays, capsys):
-  case = failed_reset_rays
-  del case.env.command_manager
-  with pytest.raises(RuntimeError, match='Reset XY is outside the collision terrain'):
-    place_on_terrain(case.env, case.robot, case.ids, case.root, TerrainResetCfg())
-  assert 'Could not collect ray diagnostics' in capsys.readouterr().err
+@pytest.mark.parametrize('pitch', [0., math.pi/2, -math.pi/2])
+def test_reset_footprint_uses_heading_and_vertical_pitch_fallback(pitch):
+  from supermimic.terrain.reset import _sample_ground
+  from supermimic.mdp.rotations import axis_angle_to_mat, mat_to_quat
+  # 90 degree heading: a local-forward sample must go world +Y, even at vertical pitch.
+  yaw = axis_angle_to_mat(torch.tensor([0., 0., 1.]), torch.tensor(math.pi/2))
+  tilt = axis_angle_to_mat(torch.tensor([0., 1., 0.]), torch.tensor(pitch))
+  root = torch.zeros(1, 13); root[:, :2] = torch.tensor([2., 3.])
+  root[:, 3:7] = mat_to_quat(yaw @ tilt)
+  class Map:
+    def sample(self, xy):
+      torch.testing.assert_close(xy, torch.tensor([[[2., 4.], [1., 3.]]]), atol=1e-6, rtol=0)
+      return torch.zeros(1, 2), torch.ones(1, 2, dtype=torch.bool)
+  _sample_ground(NS(terrain_height_map=Map()), root, torch.tensor([[1.,0.,0.],[0.,1.,0.]]))
 
 
 @pytest.mark.parametrize('terrain', [False, True])
-def test_command_writes_clipped_joints_before_probe_and_final_state_after(terrain):
+def test_command_writes_clipped_joints_before_placement_and_final_state_after(terrain):
   events = []
   def place(env, robot, ids, state, cfg):
     events.append('probe')
