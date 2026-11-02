@@ -1,8 +1,8 @@
 import numpy as np
 import torch
 import mujoco
-from supermimic.mdp.rotations import mat_to_quat,quat_to_mat,so3_exp,so3_log
-from supermimic.mdp.state import flatten_state,unflatten_state
+from supermimic.tools.rotations import mat_to_quat, quat_to_mat, so3_exp, so3_log
+from supermimic.core.state import flatten_state, unflatten_state
 
 
 def test_fk_against_mujoco(robot):

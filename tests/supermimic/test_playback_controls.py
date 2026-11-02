@@ -9,7 +9,7 @@ from types import SimpleNamespace as NS
 import pytest
 import torch
 
-from supermimic.rl.evaluation import PlaybackEnv
+from supermimic.playback.evaluation import PlaybackEnv
 from test_env_lifecycle import ROOT, methods
 
 

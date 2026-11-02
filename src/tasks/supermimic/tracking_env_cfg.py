@@ -9,8 +9,6 @@ Based on https://github.com/HybridRobotics/whole_body_tracking
 Commit: f8e20c880d9c8ec7172a13d3a88a65e3a5a88448
 """
 
-import math
-
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp import dr
 from mjlab.envs.mdp.actions import JointPositionActionCfg
@@ -137,17 +135,6 @@ def make_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
   # Rewards
   ##
 
-  # Pelvis has its own root rewards and must not dilute body-relative errors.
-  # Lower-body tolerances apply only to non-flat terrain families; plane and
-  # the generated flat column use zero tolerance in both real and imagined steps.
-  upper_bodies = (
-    "torso_link", "left_shoulder_roll_link", "left_elbow_link", "left_wrist_yaw_link",
-    "right_shoulder_roll_link", "right_elbow_link", "right_wrist_yaw_link",
-  )
-  lower_bodies = (
-    "left_hip_roll_link", "left_knee_link", "left_ankle_roll_link",
-    "right_hip_roll_link", "right_knee_link", "right_ankle_roll_link",
-  )
   rewards: dict[str, RewardTermCfg] = {
     "motion_global_root_pos": RewardTermCfg(
       func=mdp.motion_global_anchor_position_error_exp,
@@ -159,29 +146,15 @@ def make_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
       weight=0.5,
       params={"command_name": "motion", "std": 0.4},
     ),
-    "motion_upper_body_pos": RewardTermCfg(
-      func=mdp.motion_root_relative_body_position_error_exp,
+    "motion_body_pos": RewardTermCfg(
+      func=mdp.motion_relative_body_position_error_exp,
       weight=1.0,
-      params={"command_name": "motion", "std": 0.3,
-              "body_names": upper_bodies, "tolerance": 0.0},
+      params={"command_name": "motion", "std": 0.3},
     ),
-    "motion_lower_body_pos": RewardTermCfg(
-      func=mdp.motion_root_relative_body_position_error_exp,
+    "motion_body_ori": RewardTermCfg(
+      func=mdp.motion_relative_body_orientation_error_exp,
       weight=1.0,
-      params={"command_name": "motion", "std": 0.3,
-              "body_names": lower_bodies, "tolerance": 0.05},  # metres per body
-    ),
-    "motion_upper_body_ori": RewardTermCfg(
-      func=mdp.motion_body_orientation_tolerance_error_exp,
-      weight=1.0,
-      params={"command_name": "motion", "std": 0.4,
-              "body_names": upper_bodies, "tolerance": 0.0},
-    ),
-    "motion_lower_body_ori": RewardTermCfg(
-      func=mdp.motion_body_orientation_tolerance_error_exp,
-      weight=1.0,
-      params={"command_name": "motion", "std": 0.4,
-              "body_names": lower_bodies, "tolerance": math.radians(10.0)},
+      params={"command_name": "motion", "std": 0.4},
     ),
     "motion_body_lin_vel": RewardTermCfg(
       func=mdp.motion_global_body_linear_velocity_error_exp,
@@ -199,18 +172,6 @@ def make_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
       weight=-2.0,
       params={"asset_cfg": SceneEntityCfg("robot", joint_names=(".*",))},
     ),
-    # Measured P-BFM costs supervise two outputs of one WM head even at weight=0.
-    # Keep these reward weights unchanged; use negative weights to penalize.
-    "feet_stumble": RewardTermCfg(
-      func=mdp.feet_stumble, weight=-10.0,
-      params={"sensor_name": "foot_collision_contacts", "horizontal_ratio": 1.0,
-              "force_threshold": 20.0, "force_scale": 100.0, "max_penalty": 1.0},
-    ),
-    "feet_at_plane": RewardTermCfg(
-      func=mdp.feet_at_plane, weight=0.0,
-      params={"sensor_name": "foot_height_scanners", "contact_sensor_name": "foot_support_contacts",
-              "height_tolerance": 0.03, "transition_width": 0.005, "contact_threshold": 1.0},
-    ),
   }
 
   ##
@@ -218,7 +179,7 @@ def make_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
   ##
 
   terminations: dict[str, TerminationTermCfg] = {
-    "time_out": TerminationTermCfg(func=mdp.time_out, time_out=True),
+    "time_out": TerminationTermCfg(func=mdp.episode_time_out, time_out=True),
     "motion_end": TerminationTermCfg(
       func=mdp.motion_clip_end,
       time_out=True,
@@ -272,8 +233,8 @@ def make_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
       azimuth=120.0,
     ),
     sim=SimulationCfg(
-      nconmax=128,
-      njmax=512,
+      nconmax=35,
+      njmax=250,
       mujoco=MujocoCfg(
         timestep=0.005,
         iterations=10,

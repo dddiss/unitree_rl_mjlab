@@ -7,7 +7,7 @@ from types import ModuleType, SimpleNamespace as NS
 import pytest
 import torch
 
-from supermimic.rl.evaluation import PlaybackEnv
+from supermimic.playback.evaluation import PlaybackEnv
 from test_env_lifecycle import ROOT
 from test_playback_controls import make_playback_env, open_gui
 
@@ -179,12 +179,10 @@ def test_factory_keeps_training_and_evaluation_fixed_unless_play_opts_in(monkeyp
   cfg = NS(scene=NS(num_envs=0), commands={'motion': NS()},
            viewer=NS(geom_group=(1, 1, 1, 0, 0, 0)))
   env_cfgs = ModuleType('supermimic.config.g1.env_cfgs')
-  env_cfgs.unitree_g1_flat_tracking_env_cfg = lambda **kwargs: cfg
+  env_cfgs.unitree_g1_terrain_env_cfg = lambda **kwargs: cfg
   environment = ModuleType('supermimic.env')
   environment.SuperMimicEnv = lambda cfg, **kwargs: NS(cfg=cfg, **kwargs)
-  camera = ModuleType('supermimic.perception.camera')
-  camera.DepthCameraCfg = NS
-  for module in (env_cfgs, environment, camera):
+  for module in (env_cfgs, environment):
     monkeypatch.setitem(sys.modules, module.__name__, module)
   kwargs = {'randomize_terrain_on_reset': True} if opt_in else {}
   env = make_env('motion.npz', evaluation=evaluation, device='cpu', **kwargs)
@@ -197,7 +195,8 @@ def test_factory_keeps_training_and_evaluation_fixed_unless_play_opts_in(monkeyp
 
 
 @pytest.mark.parametrize('mode', ['native', 'viser', 'video'])
-def test_play_cli_enables_random_terrain_for_single_environment(monkeypatch, mode):
+@pytest.mark.parametrize('task', ['Unitree-G1-SuperMimic', 'Unitree-G1-SuperMimic-Terrain'])
+def test_play_cli_enables_random_terrain_for_single_environment(monkeypatch, mode, task):
   events = []
   cmd = NS(motion=NS(motion_names=('dance',), clip_start=torch.tensor([0])),
            request_frames=lambda frames: events.append(('request', frames.tolist())))
@@ -210,8 +209,8 @@ def test_play_cli_enables_random_terrain_for_single_environment(monkeypatch, mod
     options.update(kwargs)
     return env
   config.make_env = make_env
-  evaluation = ModuleType('src.tasks.supermimic.rl.evaluation')
-  evaluation.read_checkpoint_config = lambda _: NS(depth_enabled=True)
+  evaluation = ModuleType('src.tasks.supermimic.playback.evaluation')
+  evaluation.read_checkpoint_config = lambda _: NS(task_id=task)
   evaluation.load_policy = lambda *args: (object(), NS(), {})
   evaluation.PlaybackEnv = PlaybackEnv
   def record_clips(*args):
@@ -230,8 +229,8 @@ def test_play_cli_enables_random_terrain_for_single_environment(monkeypatch, mod
   for module in (config, evaluation, runner, viewers):
     monkeypatch.setitem(sys.modules, module.__name__, module)
   # Load the real playback adapters against our viewer test doubles.
-  playback_viewers = ModuleType('src.tasks.supermimic.playback_viewer')
-  implementations = runpy.run_path(str(ROOT / 'src/tasks/supermimic/playback_viewer.py'))
+  playback_viewers = ModuleType('src.tasks.supermimic.playback.playback_viewer')
+  implementations = runpy.run_path(str(ROOT / 'src/tasks/supermimic/playback/playback_viewer.py'))
   for name in ('NativePlayViewer', 'ViserPlayViewer'):
     setattr(playback_viewers, name, implementations[name])
   monkeypatch.setitem(sys.modules, playback_viewers.__name__, playback_viewers)
@@ -243,7 +242,7 @@ def test_play_cli_enables_random_terrain_for_single_environment(monkeypatch, mod
   runpy.run_path(str(script))['main']()
   assert options['num_envs'] == 1
   assert options['evaluation'] and options['randomize_terrain_on_reset']
-  assert options['depth_enabled']
+  assert options['task_id'] == task and 'depth_enabled' not in options
   assert options['viewer_geom_group'] == (1, 1, 1, 0, 1, 1)
   assert events == ([('video',), ('close',)] if mode == 'video' else
                     [('request', [0]), ('reset',), ('viewer',), ('close',)])

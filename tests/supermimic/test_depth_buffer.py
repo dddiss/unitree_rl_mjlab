@@ -1,5 +1,36 @@
 import torch
-from supermimic.rl.buffer import ReplayBuffer
+from supermimic.rl.buffer import DepthReplay, ReplayBuffer
+from test_buffer import transition
+
+
+def test_optional_depth_storage_preserves_state_sampling_and_rng():
+  args = (4, 2, torch.zeros(2, 33), torch.tensor([9]), torch.zeros(10, dtype=torch.long), 32)
+  plain = ReplayBuffer(*args)
+  visual = ReplayBuffer(*args, depth_history_length=4)
+  assert plain.depth is None
+  assert isinstance(visual.depth, DepthReplay)
+  for t in range(6):
+    tr = transition([t + 1] * 2, t % 3, done=t % 3 == 2)
+    plain.add(tr)  # Nonvisual transitions need no image fields.
+    visual.add({**tr,
+                "depth": torch.full((2, 18, 32), t, dtype=torch.uint8),
+                "depth_next": torch.full((2, 18, 32), 199 if t % 3 == 2 else t + 1,
+                                         dtype=torch.uint8)})
+
+  # Ring wrap and episode boundaries must produce identical state samples.
+  for sample in (lambda b: (b.sample_windows(20, 2, strict=True),),
+                 lambda b: b.sample_starts(20, 4)):
+    torch.manual_seed(17)
+    expected = sample(plain)
+    expected_rng = torch.random.get_rng_state()
+    torch.manual_seed(17)
+    actual = sample(visual)
+    assert torch.equal(torch.random.get_rng_state(), expected_rng)
+    for plain_sample, visual_sample in zip(expected, actual):
+      assert "depth_history" not in plain_sample and "depth_next" not in plain_sample
+      for key, value in plain_sample.items():
+        assert torch.equal(value, visual_sample[key]), key
+    assert "depth_history" in actual[0]
 
 
 def test_successor_sharing_terminal_pending_and_wrap():

@@ -1,13 +1,13 @@
 """Family-conditioned rewards retain their collected context through replay."""
+import ast
 from types import SimpleNamespace as NS
 
 import pytest
 import torch
 
-from supermimic.mdp.rotations import so3_exp, mat_to_quat, quat_to_mat
+from supermimic.tools.rotations import so3_exp, mat_to_quat, quat_to_mat
 from supermimic.mdp.rewards import terrain_tolerance_radius
 from supermimic.rl.buffer import ReplayBuffer
-from supermimic.terrain.reward_context import tolerance_by_terrain_column
 from conftest import ROOT, BODIES
 from test_body_tracking_rewards import apply_config
 from test_env_lifecycle import methods
@@ -16,8 +16,13 @@ from test_foot_reward_heads import training_case
 
 
 def terrain_env(names=None):
-  ns = methods(ROOT / 'src/tasks/supermimic/env.py', 'SuperMimicEnv',
-               {'terrain_tolerance'}, {'torch': torch, 'tolerance_by_terrain_column': tolerance_by_terrain_column})
+  # Execute the real helper/property without importing GPU-only mjlab modules.
+  path = ROOT / 'src/tasks/supermimic/env.py'
+  helper = next(n for n in ast.parse(path.read_text()).body
+                if isinstance(n, ast.FunctionDef) and n.name == 'tolerance_by_terrain_column')
+  ns = {'torch': torch}
+  exec(compile(ast.Module(body=[helper], type_ignores=[]), str(path), 'exec'), ns)
+  ns = methods(path, 'SuperMimicEnv', {'terrain_tolerance'}, ns)
   class Env:
     terrain_tolerance = ns['terrain_tolerance']
   env = Env()

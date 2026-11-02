@@ -1,11 +1,12 @@
 """G1 defaults for the independent SuperMimic learner."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 from typing import Literal
 
 
 @dataclass
 class SuperMimicConfig:
+  """Common learner configuration and defaults for the nonvisual G1 task."""
   num_envs: int = 4096
   iterations: int = 320_000
   buffer_steps: int = 1000
@@ -20,20 +21,17 @@ class SuperMimicConfig:
   pi_clip: float = 1.0 / 32  # Actor global gradient norm, after loss / horizon.
   pi_clip_value: float = 0.1 / 32  # Actor per-element gradient bound.
   lr: float = 2e-4
-  depth_enabled: bool = True
-  depth_frames: int = 8
-  depth_skip: int = 5
-  depth_latent_dim: int = 256
-  depth_frame_dim: int = 256
-  depth_checkpoint: bool = False  # Recompute visual activations during BPTT to save memory.
-  depth_batch_size: int = 256  # Bound perception/decoder workspace; does not change learner batches.
+  task_id: str = "Unitree-G1-SuperMimic"
+  world_model_class: str = ".world_model:WorldModel"
+  actor_class: str = ".policy:Policy"
+  critic_class: str = ".critic:Critic"
+  world_model_kwargs: dict = field(default_factory=dict)
+  actor_kwargs: dict = field(default_factory=dict)
+  critic_kwargs: dict = field(default_factory=dict)
+  # Extra learned rewards use their component default unless overridden here.
+  reward_loss_weights: dict[str, float] = field(default_factory=dict)
+  depth_enabled: bool = False  # Network/checkpoint metadata; training derives this from task sensors.
   state_loss_weight: float = 1.0  # Existing scaled state MSE.
-  latent_loss_weight: float = 1.0  # Predicted h vs stop-gradient real-history h, mean over features.
-  depth_loss_weight: float = 1.0  # Normalized pixel MSE. All losses sum valid steps / batch.
-  feet_stumble_loss_weight: float = 1.0  # Raw measured cost MSE; independent of reward weight.
-  feet_at_plane_loss_weight: float = 0.0  # Raw measured cost MSE; sum valid steps / batch.
-  wm_perception_lr: float = 2e-4  # Shared CNN+GRU; updated by the WM optimizer only.
-  depth_decoder_lr: float = 2e-4
   gamma: float = 0.99
   lam: float = 0.95
   action_noise: float = 0.1  # Gaussian std for environments with exploration noise.
@@ -62,6 +60,11 @@ class SuperMimicConfig:
   critic_hidden: tuple[int, ...] = (256, 128)
 
   def __post_init__(self):
+    if not self.task_id:
+      raise ValueError("task_id must not be empty")
+    for name, weight in self.reward_loss_weights.items():
+      if not math.isfinite(weight) or weight < 0:
+        raise ValueError(f"{name}: reward prediction loss weight must be finite and nonnegative")
     for name in ("num_envs", "buffer_steps", "horizon", "goal_frames", "hist", "wm_window",
                  "wm_batches", "wm_batch", "pi_batch", "critic_epochs", "critic_minibatches",
                  "warmup_steps", "lr_decay_iters", "ckpt_every", "log_every"):
@@ -69,16 +72,8 @@ class SuperMimicConfig:
         raise ValueError(f"{name} must be positive")
     if self.buffer_steps < self.wm_window:
       raise ValueError("buffer_steps must cover wm_window")
-    for name in ("depth_frames", "depth_skip", "depth_latent_dim", "depth_frame_dim", "depth_batch_size"):
-      if getattr(self, name) < 1:
-        raise ValueError(f"{name} must be positive")
-    for name in ("wm_perception_lr", "depth_decoder_lr"):
-      if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
-        raise ValueError(f"{name} must be finite and positive")
-    for name in ("state_loss_weight", "latent_loss_weight", "depth_loss_weight",
-                 "feet_stumble_loss_weight", "feet_at_plane_loss_weight"):
-      if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
-        raise ValueError(f"{name} must be finite and nonnegative")
+    if not math.isfinite(self.state_loss_weight) or self.state_loss_weight < 0:
+      raise ValueError("state_loss_weight must be finite and nonnegative")
     for name in ("pi_clip", "pi_clip_value"):
       if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
         raise ValueError(f"{name} must be finite and positive")
@@ -103,29 +98,50 @@ class SuperMimicConfig:
     if self.run_name in (".", "..") or "/" in self.run_name or "\\" in self.run_name:
       raise ValueError("run_name must be a single directory name")
 
+
+@dataclass
+class TerrainSuperMimicConfig(SuperMimicConfig):
+  """Terrain task extensions: shared perception and measured reward prediction."""
+  task_id: str = "Unitree-G1-SuperMimic-Terrain"
+  depth_enabled: bool = True
+  perception_class: str = ".depth_encoder:DepthEncoder"
+  depth_decoder_class: str = ".depth_decoder:DepthDecoder"
+  depth_frames: int = 8
+  depth_skip: int = 5
+  depth_latent_dim: int = 256
+  depth_frame_dim: int = 256
+  depth_checkpoint: bool = False  # Recompute visual activations during BPTT to save memory.
+  depth_batch_size: int = 256  # Bound perception/decoder workspace; does not change learner batches.
+  latent_loss_weight: float = 1.0  # Predicted h vs stop-gradient real-history h, mean over features.
+  depth_loss_weight: float = 1.0  # Normalized pixel MSE. All losses sum valid steps / batch.
+  feet_stumble_loss_weight: float = 1.0  # Raw measured cost MSE; independent of reward weight.
+  feet_at_plane_loss_weight: float = 0.0  # Raw measured cost MSE; sum valid steps / batch.
+  wm_perception_lr: float = 2e-4  # Shared CNN+GRU; updated by the WM optimizer only.
+  depth_decoder_lr: float = 2e-4
+
+  def __post_init__(self):
+    super().__post_init__()
+    for name in ("depth_frames", "depth_skip", "depth_latent_dim", "depth_frame_dim", "depth_batch_size"):
+      if getattr(self, name) < 1:
+        raise ValueError(f"{name} must be positive")
+    for name in ("wm_perception_lr", "depth_decoder_lr"):
+      if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
+        raise ValueError(f"{name} must be finite and positive")
+    for name in ("latent_loss_weight", "depth_loss_weight",
+                 "feet_stumble_loss_weight", "feet_at_plane_loss_weight"):
+      if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
+        raise ValueError(f"{name} must be finite and nonnegative")
+
   @property
   def depth_history_length(self):
     return (self.depth_frames - 1) * self.depth_skip + 1
 
 
-def migrate_legacy_run_name(config: dict) -> dict:
-  """Read old checkpoint names without keeping a second naming option."""
-  config = dict(config)
-  legacy_name = config.pop("wandb_name", None)
-  if "run_name" not in config and legacy_name:
-    config["run_name"] = legacy_name
-  return config
-
-
-def unitree_g1_supermimic_runner_cfg() -> SuperMimicConfig:
+def unitree_g1_runner_cfg() -> SuperMimicConfig:
+  """Main's plane task uses the shared learner defaults directly."""
   return SuperMimicConfig()
 
 
-def migrate_checkpoint_config(config: dict) -> dict:
-  """Old checkpoints predate vision; never reinterpret their weights as visual."""
-  config = migrate_legacy_run_name(config)
-  config.setdefault("depth_enabled", False)
-  # Older policies remain playable; these rates belonged to independent encoders.
-  config.pop("actor_perception_lr", None)
-  config.pop("critic_perception_lr", None)
-  return config
+def unitree_g1_terrain_runner_cfg() -> TerrainSuperMimicConfig:
+  """Terrain task inherits common defaults and adds its own configuration."""
+  return TerrainSuperMimicConfig()

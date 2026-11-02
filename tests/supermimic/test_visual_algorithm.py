@@ -1,6 +1,7 @@
 import copy
 import pytest
 import torch
+from supermimic.config.g1.rl_cfg import TerrainSuperMimicConfig
 from supermimic.rl.algorithm import SuperMimicAlgorithm
 from supermimic.rl.buffer import ReplayBuffer
 from supermimic.perception.history import select_history
@@ -9,10 +10,10 @@ from test_algorithm import small_config, filled_buffer
 
 
 def visual_config(**kw):
-  opts=dict(depth_enabled=True,depth_frames=2,depth_skip=1,depth_latent_dim=16,
+  opts=dict(task_id='Unitree-G1-SuperMimic-Terrain',depth_enabled=True,depth_frames=2,depth_skip=1,depth_latent_dim=16,
             depth_frame_dim=16,depth_checkpoint=False,pi_batch=2,wm_batch=2)
   opts.update(kw)
-  return small_config(**opts)
+  return small_config(config_type=TerrainSuperMimicConfig, **opts)
 
 
 def visual_buffer(mdp,cfg):

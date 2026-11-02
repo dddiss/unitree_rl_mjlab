@@ -93,6 +93,15 @@ def sdk(monkeypatch):
   return result
 
 
+def test_arbitrary_reward_prediction_loss_keeps_csv_and_wandb_in_sync(tmp_path, sdk):
+  logger = TrainingLogger(tmp_path, Config(), ['iteration', 'wm_new_contact_loss'])
+  logger.log({'iteration': 50, 'wm_new_contact_loss': .125})
+  logger.close()
+  _, rows = read_csv(tmp_path/'train_log.csv')
+  assert float(rows[0]['wm_new_contact_loss']) == .125
+  assert sdk.runs[0].rows[0]['Loss/wm_new_contact_loss'] == .125
+
+
 def test_csv_mode_does_not_import_wandb(tmp_path, monkeypatch):
   original = builtins.__import__
 
@@ -147,7 +156,7 @@ def test_wandb_matches_csv_and_omits_missing_metrics(tmp_path, sdk):
   assert sdk.runs[0].rows == [{"iteration": 50, "loss": .125}]
   assert csv_rows == [{"iteration": "50", "loss": "0.125", "empty": "", "missing": ""}]
   assert sdk.runs[0].axes == [(("iteration",), {}), (("*",), {"step_metric": "iteration"})]
-  assert sdk.settings[0] == dict(console="off", disable_code=True, disable_git=True,
+  assert sdk.settings[0] == dict(console="auto", disable_code=True, disable_git=True,
                                 x_disable_stats=True, x_disable_meta=True)
 
 

@@ -1,21 +1,21 @@
 import pytest
 import torch
-from supermimic.mdp.functional import FunctionalMDP
-from supermimic.mdp.kinematics import G1Kinematics
-from supermimic.mdp.motion_lib import MotionLibrary
-from supermimic.mdp.state import flatten_state,unflatten_state
-from supermimic.mdp.rotations import mat_to_6d,so3_exp
+from supermimic.core.functional import FunctionalMDP
+from supermimic.tools.kinematics import G1Kinematics
+from supermimic.motion.motion_lib import MotionLibrary
+from supermimic.core.state import flatten_state, unflatten_state
+from supermimic.tools.rotations import mat_to_6d, so3_exp
 from supermimic.rl.algorithm import SuperMimicAlgorithm
 from supermimic.rl.buffer import ReplayBuffer
 from supermimic.config.g1.rl_cfg import SuperMimicConfig
 
 
-def small_config(**kwargs):
+def small_config(config_type=SuperMimicConfig, **kwargs):
   values=dict(depth_enabled=False,num_envs=2,buffer_steps=16,wm_window=2,wm_batch=4,wm_batches=1,pi_batch=4,
               horizon=3,hist=2,goal_frames=2,critic_epochs=1,critic_minibatches=2,
               wm_hidden=(24,24),policy_hidden=(24,24),critic_hidden=(24,),amp='none',compile=False,logger='csv')
   values.update(kwargs)
-  return SuperMimicConfig(**values)
+  return config_type(**values)
 
 
 def filled_buffer(mdp,cfg):

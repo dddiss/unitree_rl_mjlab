@@ -1,6 +1,7 @@
 """CSV, optional W&B and terminal logging for the SuperMimic learner."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 from contextlib import contextmanager
 import csv
 from dataclasses import asdict, is_dataclass
@@ -86,10 +87,12 @@ def format_terminal_summary(
   lines.append("-" * width)
   for key in ("wm_loss", "wm_err_last", "pi_loss", "v_loss"):
     add(WANDB_METRIC_NAMES[key], value(row.get(key), ".6f"))
-  for key in ("wm_latent_loss", "wm_depth_loss", "wm_feet_stumble_loss",
-              "wm_feet_at_plane_loss", "wm_total_loss"):
+  visual_fields = ("wm_latent_loss", "wm_depth_loss")
+  reward_fields = tuple(key for key in row if key.startswith("wm_") and key.endswith("_loss")
+                       and key not in (*visual_fields, "wm_total_loss", "wm_loss"))
+  for key in (*visual_fields, *reward_fields, "wm_total_loss"):
     if key in row:
-      add(WANDB_METRIC_NAMES[key], value(row.get(key), ".6f"))
+      add("Loss/" + key, value(row.get(key), ".6f"))
   add("Training/lr", value(row.get("lr"), ".3e"))
   add("Episode/length_steps", value(row.get("episode_length"), ".2f", " steps"))
 
@@ -242,7 +245,8 @@ class TrainingLogger:
       if not isinstance(value, Real):
         raise TypeError(f"{name}: training log values must be numeric scalars or blank")
       values[name] = value
-      payload[WANDB_METRIC_NAMES.get(name, name)] = value
+      metric_name = WANDB_METRIC_NAMES.get(name, "Loss/" + name if name.startswith("wm_") and name.endswith("_loss") else name)
+      payload[metric_name] = value
     self._writer.writerow(values)
     self._file.flush()
     if self._run is not None:
@@ -259,3 +263,141 @@ class TrainingLogger:
           self._run.finish(exit_code=exit_code)
     finally:
       self._file.close()
+
+
+# Step snapshots are captured before command advance/reset.
+TRACKING_METRICS = (
+  "error_anchor_pos", "error_anchor_rot", "error_anchor_lin_vel", "error_anchor_ang_vel",
+  "error_body_pos", "error_body_rot", "error_body_lin_vel", "error_body_ang_vel",
+  "error_joint_pos", "error_joint_vel",
+)
+
+
+@torch.no_grad()
+def capture_step_metrics(
+  command,
+  raw_reward_terms: Mapping[str, torch.Tensor],
+  reward_weights: Mapping[str, float],
+  termination_terms: Mapping[str, torch.Tensor],
+  step_dt: float,
+  *,
+  reward_contributions: Mapping[str, torch.Tensor] | None = None,
+) -> dict[str, dict[str, torch.Tensor]]:
+  """Capture per-environment values before advancing targets or resetting.
+
+  The command already has post-physics relative body poses. Its metric update
+  only refreshes diagnostic tensors; it neither advances frames nor samples.
+  All returned tensors own their storage, so later command/reset writes cannot
+  change a transition's log values. Reward scaling matches mjlab 1.6.0's
+  default RewardManager, including zeroing non-finite weighted contributions.
+  """
+  command._update_metrics()
+  return {
+    "tracking": {name: command.metrics[name].detach().clone() for name in TRACKING_METRICS},
+    # The environment supplies the mjlab 1.6 manager's already weighted/sanitized
+    # cache. This also covers measured terms absent from the analytic MDP and
+    # zero-weight terms whose sensor/function was deliberately not evaluated.
+    "reward": ({name: value.detach().clone() for name, value in reward_contributions.items()}
+               if reward_contributions is not None else {
+      name: torch.nan_to_num(raw_reward_terms[name].detach() * weight * step_dt,
+                             nan=0.0, posinf=0.0, neginf=0.0)
+      for name, weight in reward_weights.items()
+    }),
+    "termination": {name: value.detach().clone() for name, value in termination_terms.items()},
+  }
+
+
+LEGACY_FIELDS = (
+  "iteration", "wall_h", "sim_steps", "env_steps", "lr",
+  "wm_loss", "wm_err_last", "pi_loss", "v_loss", "pi_gradnorm",
+  "imag_survival", "imag_reward", "policy_skipped", "sim_reward",
+  "episode_length", "episode_return", "failure_fraction",
+)
+SAMPLING_FIELDS = ("Sampling/entropy", "Sampling/top1_prob", "Sampling/top1_bin")
+PERFORMANCE_FIELDS = (
+  "Performance/collection_s", "Performance/wm_update_s", "Performance/policy_critic_update_s",
+  "Performance/iterations_per_s", "Performance/transitions_per_s",
+)
+
+
+class IntervalMetrics:
+  """Accumulate on device, transferring scalar reductions only when logging.
+
+  Episode sums belong to the runner and survive interval boundaries. This
+  object only receives completed episodes, so unequal completion batches do
+  not bias their means. A reset can match multiple termination reasons.
+  """
+  def __init__(self, reward_names, termination_names, step_dt, device):
+    self.reward_names = tuple(reward_names)
+    self.termination_names = tuple(termination_names)
+    self.step_dt = step_dt
+    self.step_fields = tuple(f"Tracking/{key}" for key in TRACKING_METRICS) + tuple(
+      f"Reward/{key}" for key in self.reward_names)
+    self.fields = self.step_fields + tuple(
+      f"Termination/{key}_fraction" for key in self.termination_names
+    ) + ("Episode/completed", "Episode/return_raw", "Episode/length_seconds")
+    self.step_sums = torch.zeros(len(self.step_fields), dtype=torch.float64, device=device)
+    self.reason_counts = torch.zeros(len(self.termination_names), dtype=torch.long, device=device)
+    self.episode_sums = torch.zeros(2, dtype=torch.float64, device=device)
+    self.sample_count = self.completed = 0
+
+  @torch.no_grad()
+  def add_step(self, snapshot):
+    values = [snapshot["tracking"][key] for key in TRACKING_METRICS]
+    values += [snapshot["reward"][key] for key in self.reward_names]
+    self.step_sums.add_(torch.stack([v.sum(dtype=torch.float64) for v in values]))
+    self.sample_count += values[0].numel()
+    if self.termination_names:
+      self.reason_counts.add_(torch.stack([
+        snapshot["termination"][key].sum(dtype=torch.long) for key in self.termination_names]))
+
+  @torch.no_grad()
+  def add_episodes(self, returns, steps):
+    self.completed += returns.numel()
+    self.episode_sums.add_(torch.stack((returns.sum(dtype=torch.float64),
+                                      steps.sum(dtype=torch.float64) * self.step_dt)))
+
+  def values(self):
+    step_sums, reason_counts, episode_sums = (
+      self.step_sums.cpu().tolist(), self.reason_counts.cpu().tolist(), self.episode_sums.cpu().tolist())
+    row = {key: value / self.sample_count if self.sample_count else ""
+           for key, value in zip(self.step_fields, step_sums)}
+    # Undo dt scaling only for display; snapshots and training rewards retain it.
+    if self.sample_count:
+      for name in self.reward_names:
+        row[f"Reward/{name}"] /= self.step_dt
+    for key, count in zip(self.termination_names, reason_counts):
+      row[f"Termination/{key}_fraction"] = count / self.completed if self.completed else ""
+    row["Episode/completed"] = self.completed
+    row["Episode/return_raw"] = episode_sums[0] / self.completed if self.completed else ""
+    row["Episode/length_seconds"] = episode_sums[1] / self.completed if self.completed else ""
+    return row
+
+  def clear(self):
+    self.step_sums.zero_()
+    self.reason_counts.zero_()
+    self.episode_sums.zero_()
+    self.sample_count = self.completed = 0
+
+
+@torch.no_grad()
+def sampling_metrics(command):
+  """Describe the actual reset distribution without sampling/updating its EMA."""
+  motion = command.motion
+  mode = command.cfg.sampling_mode
+  if mode == "return_based":
+    probabilities = command.sampler.probabilities(update_history=False)
+  elif mode == "uniform":
+    probabilities = torch.full((motion.num_bins,), 1 / motion.num_bins, device=motion.device)
+  elif mode == "start":
+    # Start mode samples clips uniformly, assigning mass only to their first bin.
+    probabilities = torch.zeros(motion.num_bins, device=motion.device)
+    bins = motion.frame_bin[motion.clip_start]
+    probabilities.scatter_add_(0, bins, torch.full_like(bins, 1 / motion.num_clips, dtype=torch.float32))
+  else:
+    raise ValueError(f"Unknown sampling_mode: {mode}")
+  entropy = (-(probabilities * probabilities.clamp_min(torch.finfo(probabilities.dtype).tiny).log()).sum()
+             / math.log(motion.num_bins)) if motion.num_bins > 1 else probabilities.new_tensor(1.0)
+  top = probabilities.argmax()
+  entropy_value, top_probability = torch.stack((entropy, probabilities[top])).cpu().tolist()
+  return dict(zip(SAMPLING_FIELDS, (entropy_value, top_probability, int(top))))

@@ -1,4 +1,6 @@
 *.egg-info
+__pycache__/
+*.py[cod]
 .idea
 outputs
 logs

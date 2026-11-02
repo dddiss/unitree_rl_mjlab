@@ -1,6 +1,7 @@
-"""P-BFM reset clearance, using the startup collision height map.
+"""P-BFM reset footprint and clearance, using the startup collision height map.
 
 Height rule adapted from RoboParty/P-BFM envs/mjlab/reset.py (CC BY-NC 4.0).
+273-point reset grid adapted from RoboParty/P-BFM (2aa985ac50162e446532d1e7231f81902c221e49).
 See ../perception/LICENSE-P-BFM and THIRD_PARTY_NOTICES.md.
 """
 from __future__ import annotations
@@ -11,7 +12,48 @@ import sys
 
 import torch
 
-from .pattern import ResetFootprintCfg, reference_point_index
+def reference_point_index(offsets: torch.Tensor, *, atol: float = 1e-6) -> int:
+  """Return the unique point at robot-local ``(x, y) == (0, 0)``."""
+  if offsets.ndim != 2 or offsets.shape[1] < 2:
+    raise ValueError(f"sample offsets must have shape [N, >=2], got {tuple(offsets.shape)}")
+  at_origin = torch.all(torch.isclose(offsets[:, :2], torch.zeros_like(offsets[:, :2]), atol=atol, rtol=0.0), dim=-1)
+  matches = torch.nonzero(at_origin, as_tuple=False).flatten()
+  if matches.numel() != 1:
+    raise RuntimeError(f"expected exactly one terrain point at local (0, 0), found {matches.numel()}")
+  return int(matches.item())
+
+
+@dataclass
+class ResetFootprintCfg:
+  """273-point asymmetric XY grid for reset placement, not a policy observation."""
+
+  x_min: float = -0.4
+  x_max: float = 1.6
+  y_min: float = -0.6
+  y_max: float = 0.6
+  resolution: float = 0.1
+
+  @property
+  def shape(self) -> tuple[int, int]:
+    return (
+      int(round((self.x_max - self.x_min) / self.resolution)) + 1,
+      int(round((self.y_max - self.y_min) / self.resolution)) + 1,
+    )
+
+  @property
+  def dimension(self) -> int:
+    nx, ny = self.shape
+    return nx * ny
+
+  def sample_offsets(self, device: str) -> torch.Tensor:
+    nx, ny = self.shape
+    x = torch.linspace(self.x_min, self.x_max, nx, device=device, dtype=torch.float32)
+    y = torch.linspace(self.y_min, self.y_max, ny, device=device, dtype=torch.float32)
+    grid_x, grid_y = torch.meshgrid(x, y, indexing="ij")
+    offsets = torch.stack(
+      (grid_x.reshape(-1), grid_y.reshape(-1), torch.zeros(nx * ny, device=device)), dim=-1
+    )
+    return offsets
 
 
 @dataclass(frozen=True)
@@ -62,7 +104,7 @@ def terrain_tile_xy_bounds(terrain, env_ids, margin):
 
 def _sample_ground(env, root_state, offsets):
   # Match the former yaw-aligned footprint, including reset orientation noise.
-  from ..mdp.rotations import quat_to_mat
+  from ..tools.rotations import quat_to_mat
   rotation = quat_to_mat(root_state[:, 3:7])
   forward = rotation[:, :2, 0]
   norm = forward.norm(dim=-1, keepdim=True)

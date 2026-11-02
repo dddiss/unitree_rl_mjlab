@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import torch
 
-from supermimic.mdp.state import unflatten_state
+from supermimic.core.state import unflatten_state
 from supermimic.rl.algorithm import SuperMimicAlgorithm
 from supermimic.rl.buffer import ReplayBuffer
 from supermimic.terrain.heightmap import TerrainHeightMap

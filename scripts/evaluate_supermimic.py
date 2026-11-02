@@ -86,7 +86,8 @@ def evaluate_noise_modes(env, policy, cfg, ck, checkpoint, folder, args, evaluat
           raise ValueError(f"{report}: different diagnostic settings; use another --output-dir")
       else:
         options = {k: v for k, v in settings.items() if k != "noise_mode"}
-        result = evaluate(env, policy, cfg, report.with_suffix("") if args.record else None, **options)
+        result = evaluate(env, policy, cfg, report.with_suffix("") if args.record else None,
+                          progress_desc=f"Evaluate {checkpoint.name} | mode={mode} seed={seed}", **options)
         result.update(iteration=ck["iteration"], checkpoint=str(checkpoint), evaluation=settings)
         _write_json(report, result)
         mode_updated = True
@@ -118,13 +119,13 @@ def evaluate_noise_modes(env, policy, cfg, ck, checkpoint, folder, args, evaluat
 def main():
   args = parse_args()
   from src.tasks.supermimic.config import make_env
-  from src.tasks.supermimic.mdp.motion_lib import _resolve_motion_files
-  from src.tasks.supermimic.rl.evaluation import load_policy, read_checkpoint_config, evaluate
+  from src.tasks.supermimic.motion.motion_lib import _resolve_motion_files
+  from src.tasks.supermimic.playback.evaluation import load_policy, read_checkpoint_config, evaluate
   files = _resolve_motion_files(args.motion_file)
   base = Path(args.run_dir) if args.run_dir else Path(args.checkpoint_file).parent
   folder = Path(args.output_dir) if args.output_dir else base / "evaluation"
   folder.mkdir(parents=True, exist_ok=True)
-  env, depth_enabled = None, None
+  env, environment_key = None, None
   diagnostic = (args.noise_mode != "none" or args.seeds is not None
                 or args.action_noise is not None or args.action_clip is not None)
   try:
@@ -135,19 +136,21 @@ def main():
         if not diagnostic and args.run_dir and report.exists():
           continue
         saved_cfg = read_checkpoint_config(checkpoint)
-        if env is None or depth_enabled != saved_cfg.depth_enabled:
+        saved_key = saved_cfg.task_id
+        if env is None or environment_key != saved_key:
           if env is not None:
             env.close()
             env = None
-          depth_enabled = saved_cfg.depth_enabled
+          environment_key = saved_key
           env = make_env(files, num_envs=len(files), device=args.device, evaluation=True,
-                         depth_enabled=depth_enabled)
+                         task_id=saved_cfg.task_id)
         if diagnostic:
           policy, cfg, ck = load_policy(checkpoint, env)
           evaluate_noise_modes(env, policy, cfg, ck, checkpoint, folder, args, evaluate)
           continue
         policy, cfg, ck = load_policy(checkpoint, env)
-        result = evaluate(env, policy, cfg, folder / checkpoint.stem if args.record else None)
+        result = evaluate(env, policy, cfg, folder / checkpoint.stem if args.record else None,
+                          progress_desc=f"Evaluate {checkpoint.name}")
         result.update(iteration=ck["iteration"], checkpoint=str(checkpoint))
         temporary = report.with_suffix(".json.tmp")
         temporary.write_text(json.dumps(result, indent=2))

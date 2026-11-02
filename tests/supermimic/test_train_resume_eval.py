@@ -1,19 +1,23 @@
 """Checkpoint/collection/evaluation integration with a deterministic tensor environment."""
+from io import StringIO
+import re
 from types import SimpleNamespace as NS
 import torch
 import pytest
-from supermimic.mdp.state import flatten_state,read_state
-from supermimic.mdp.rotations import mat_to_6d,mat_to_quat,so3_exp
-from supermimic.mdp.sampling import ReturnBasedSampler
-from supermimic.mdp.motion_lib import MotionLibrary
-from supermimic.mdp.logging_metrics import TRACKING_METRICS
+from supermimic.core.state import flatten_state, read_state
+from supermimic.tools.rotations import mat_to_6d, mat_to_quat, so3_exp
+from supermimic.motion.sampling import ReturnBasedSampler
+from supermimic.motion.motion_lib import MotionLibrary
+from supermimic.rl.logging import TRACKING_METRICS
 from supermimic.rl.runner import SuperMimicRunner,PolicyController
-from supermimic.rl.evaluation import evaluate,load_policy
+from supermimic.playback.evaluation import evaluate,load_policy,read_checkpoint_config
+from supermimic.playback import evaluation as evaluation_module
 from test_algorithm import small_config
 
 
 class TensorEnv:
   """Controlled transitions; only the physics is fake, runner/algorithm are real."""
+  depth_enabled=False
   device='cpu';num_envs=2;step_dt=.02;max_episode_length=500
   def __init__(self,mdp):
     self.functional_mdp=mdp;self.context=torch.zeros(2,33);self.context[:,0]=.75
@@ -388,30 +392,81 @@ def test_runner_applies_configured_cap_to_actual_reset_distribution(mdp,tmp_path
   torch.testing.assert_close(p.sum(),torch.tensor(1.))
 
 
-def test_evaluation_scores_each_clip_once(mdp):
+@pytest.fixture
+def evaluation_progress(monkeypatch):
+  stream, bars = StringIO(), []
+  real_tqdm = evaluation_module.tqdm
+  def capture(**kwargs):
+    bar = real_tqdm(file=stream, **kwargs)
+    bars.append(bar)
+    bar.snapshots = []
+    update = bar.update
+    def record_update(amount=1):
+      result = update(amount)
+      bar.snapshots.append((bar.n, bar.postfix))
+      return result
+    bar.update = record_update
+    return bar
+  monkeypatch.setattr(evaluation_module, 'tqdm', capture)
+  return NS(stream=stream, bars=bars)
+
+
+def test_evaluation_scores_each_clip_once(mdp, evaluation_progress):
   cfg=small_config()
   class ZeroPolicy:
     def __call__(self,h,g):return torch.zeros(h.shape[0],29)
-  result=evaluate(TensorEnv(mdp),ZeroPolicy(),cfg)
+  result=evaluate(TensorEnv(mdp),ZeroPolicy(),cfg,progress_desc='Evaluate ckpt_002000.pt')
   assert result['n_failed']==0
   assert [v['steps'] for v in result['per_clip']]==[50,6]
   # Zero joint angles have a small soft-limit penalty in this actual G1 XML.
   violation=(torch.relu(-mdp.soft_hi)+torch.relu(mdp.soft_lo)).sum().item()
   expected=(5-2*violation)/5
   assert result['norm_return']==pytest.approx(expected,abs=1e-5)
+  bar, = evaluation_progress.bars
+  assert bar.n == bar.total == 2 and bar.disable
+  output = evaluation_progress.stream.getvalue()
+  assert 'Evaluate ckpt_002000.pt' in output and '2/2 clips' in output
+  assert 'failed=0' in bar.postfix and 'control_step=50' in bar.postfix
+  assert re.search(r'\[\d+(?::\d{2}){1,2}\]', output)  # Elapsed wall-clock time.
 
 
-def test_failed_clip_uses_full_length_denominator(mdp):
+def test_failed_clip_uses_full_length_denominator(mdp, evaluation_progress):
   class EarlyFailure(TensorEnv):
     def step(self,a):
       result=super().step(a)
       self.last_transition['terminated'][0]=True
       self.pending[0]=True
       return result
-  result=evaluate(EarlyFailure(mdp),lambda h,g:torch.zeros(2,29),small_config())
+  result=evaluate(EarlyFailure(mdp),lambda h,g:torch.zeros(2,29),small_config(),
+                  progress_desc='Evaluate ckpt_004000.pt')
   assert result['n_failed']==1 and result['per_clip'][0]['steps']==1
   clip=result['per_clip'][0]
   assert clip['normalized_return']==pytest.approx(clip['return']/(50*.1))
+  bar, = evaluation_progress.bars
+  # The first row fails/resets repeatedly while the second finishes its clip.
+  assert bar.n == bar.total == 2 and bar.disable
+  assert 'failed=1' in bar.postfix and 'control_step=6' in bar.postfix
+
+
+def test_evaluation_progress_refreshes_control_steps_without_completed_clips(mdp, evaluation_progress, monkeypatch):
+  ticks = iter(i * .25 for i in range(200))
+  monkeypatch.setattr(evaluation_module, 'monotonic', lambda: next(ticks))
+  evaluate(TensorEnv(mdp),lambda h,g:torch.zeros(2,29),small_config(),progress_desc='Evaluate long clips')
+  bar, = evaluation_progress.bars
+  assert any(n == 0 and 'control_step=2' in postfix for n, postfix in bar.snapshots)
+  assert all(0 <= n <= 2 for n, _ in bar.snapshots)
+  assert len(bar.snapshots) < 50  # Counts are read at display intervals, not every control step.
+  assert bar.n == 2 and 'control_step=50' in bar.postfix
+
+
+@pytest.mark.parametrize('error_type', [RuntimeError, KeyboardInterrupt])
+def test_evaluation_progress_closes_on_error(mdp, evaluation_progress, error_type):
+  def broken_policy(history, goal):
+    raise error_type('evaluation interrupted')
+  with pytest.raises(error_type, match='evaluation interrupted'):
+    evaluate(TensorEnv(mdp),broken_policy,small_config(),progress_desc='Evaluate ckpt_006000.pt')
+  bar, = evaluation_progress.bars
+  assert bar.n == 0 and bar.disable
 
 
 def test_history_partial_reset(mdp):
@@ -473,24 +528,36 @@ def test_evaluation_loader_restores_new_policy_dimensions(mdp,tmp_path):
   torch.testing.assert_close(actual,expected)
 
 
-def test_legacy_run_name_loads_for_evaluation_and_resume(mdp,tmp_path):
+def test_run_name_loads_for_evaluation_and_resume(mdp,tmp_path):
   cfg=small_config(run_name="original",log_dir=str(tmp_path/'run'))
   runner=SuperMimicRunner(TensorEnv(mdp),cfg,cfg.log_dir)
   checkpoint=tmp_path/'run/last.pt'
   runner.save(checkpoint)
-  saved=torch.load(checkpoint,weights_only=False)
-  saved['config'].pop('run_name')
-  saved['config'].pop('log_dir')
-  saved['config']['wandb_name']='legacy-experiment'
-  torch.save(saved,checkpoint)
   _,loaded_cfg,_=load_policy(checkpoint,TensorEnv(mdp))
-  assert loaded_cfg.run_name=='legacy-experiment'
+  assert loaded_cfg.run_name=='original' and loaded_cfg.log_dir==cfg.log_dir
   resumed_cfg=small_config(run_name='resumed',log_dir=str(tmp_path/'resumed'))
   resumed=SuperMimicRunner(TensorEnv(mdp),resumed_cfg,resumed_cfg.log_dir)
   resumed.load(checkpoint)
   assert resumed.cfg.run_name=='resumed' and resumed.log_dir==tmp_path/'resumed'
   for name,value in runner.algorithm.policy.state_dict().items():
     torch.testing.assert_close(resumed.algorithm.policy.state_dict()[name],value)
+
+
+@pytest.mark.parametrize('field', ['wandb_name', 'actor_perception_lr', 'critic_perception_lr'])
+def test_removed_checkpoint_config_fields_are_not_migrated(mdp,tmp_path,field):
+  cfg=small_config()
+  runner=SuperMimicRunner(TensorEnv(mdp),cfg,tmp_path/'run')
+  checkpoint=tmp_path/'checkpoint.pt'
+  runner.save(checkpoint)
+  saved=torch.load(checkpoint,weights_only=False)
+  saved['config'][field]='obsolete'
+  torch.save(saved,checkpoint)
+  with pytest.raises(TypeError,match=field):
+    read_checkpoint_config(checkpoint)
+  with pytest.raises(TypeError,match=field):
+    load_policy(checkpoint,TensorEnv(mdp))
+  with pytest.raises(TypeError,match=field):
+    runner.load(checkpoint)
 
 
 @pytest.mark.parametrize('legacy',[False,True])

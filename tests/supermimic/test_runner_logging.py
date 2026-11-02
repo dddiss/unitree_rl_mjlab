@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import torch
 
-from supermimic.rl.metrics import LEGACY_FIELDS
+from supermimic.rl.logging import LEGACY_FIELDS
 from supermimic.rl import runner as runner_module
 from supermimic.rl.runner import SuperMimicRunner
 from test_algorithm import small_config

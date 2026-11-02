@@ -58,7 +58,7 @@ def test_default_map_padding_and_environment_config():
   cfg = terrain_config()
   from mjlab.terrains import TerrainGenerator
   from supermimic.terrain.heightmap import mark_terrain_padding_ray_group
-  from src.tasks.supermimic.config.g1.env_cfgs import unitree_g1_flat_tracking_env_cfg
+  from src.tasks.supermimic.config.g1.env_cfgs import unitree_g1_terrain_env_cfg
   gen = cfg.terrain_generator
   assert gen.size == (8., 8.) and gen.num_rows == 10 and gen.num_cols == len(gen.sub_terrains)
   assert gen.border_width == 17. and gen.curriculum and gen.seed == 0
@@ -73,8 +73,8 @@ def test_default_map_padding_and_environment_config():
   # Creating all configs must preserve reset noise, reward/termination functions,
   # and physics options while replacing reset rays with a shared height-map configuration.
   for play in (False, True):
-    old = unitree_g1_flat_tracking_env_cfg(play=play, terrain_type='plane')
-    new = unitree_g1_flat_tracking_env_cfg(play=play)
+    old = unitree_g1_terrain_env_cfg(play=play, terrain_type='plane')
+    new = unitree_g1_terrain_env_cfg(play=play)
     assert old.rewards == new.rewards and old.terminations == new.terminations
     assert old.sim == new.sim and old.events == new.events
     a, b = old.commands['motion'], new.commands['motion']
@@ -90,7 +90,7 @@ def test_default_map_padding_and_environment_config():
 def test_real_terrain_partial_reset_preserves_other_envs(mdp):
   sys.path.insert(0, str(ROOT))
   from src.tasks.supermimic.config import make_env
-  env = make_env(mdp.motion.motion_files, num_envs=4, evaluation=True, depth_enabled=True)
+  env = make_env(mdp.motion.motion_files, num_envs=4, evaluation=True)
   try:
     env.reset()
     cmd = env.command_manager.get_term('motion')

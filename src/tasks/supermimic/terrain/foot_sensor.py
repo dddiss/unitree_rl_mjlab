@@ -7,7 +7,7 @@ import torch
 import warp as wp
 from mjlab.sensor.raycast_sensor import RayCastSensor, RayCastSensorCfg
 
-from ..mdp.foot_rewards import fixed_sole_weights
+from ..mdp.rewards import fixed_sole_weights
 
 
 @dataclass

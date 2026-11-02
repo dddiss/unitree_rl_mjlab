@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from supermimic.mdp.sampling import EpisodeBinReturns, ReturnBasedSampler
+from supermimic.motion.sampling import EpisodeBinReturns, ReturnBasedSampler
 from supermimic.config.g1.rl_cfg import SuperMimicConfig
 
 

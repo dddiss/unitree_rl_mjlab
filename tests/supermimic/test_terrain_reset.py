@@ -9,9 +9,8 @@ import numpy as np
 import pytest
 import torch
 
-from supermimic.terrain.pattern import ResetFootprintCfg, reference_point_index
 from supermimic.terrain.reset import (
-  TerrainResetCfg, place_on_terrain, reset_height,
+  ResetFootprintCfg, reference_point_index, TerrainResetCfg, place_on_terrain, reset_height,
 )
 from test_env_lifecycle import ROOT, methods
 from supermimic.terrain.heightmap import TerrainHeightMap, terrain_bounds
@@ -128,7 +127,7 @@ def test_out_of_map_reset_diagnostic_contains_environment_and_reference(capsys):
 @pytest.mark.parametrize('pitch', [0., math.pi/2, -math.pi/2])
 def test_reset_footprint_uses_heading_and_vertical_pitch_fallback(pitch):
   from supermimic.terrain.reset import _sample_ground
-  from supermimic.mdp.rotations import axis_angle_to_mat, mat_to_quat
+  from supermimic.tools.rotations import axis_angle_to_mat, mat_to_quat
   # 90 degree heading: a local-forward sample must go world +Y, even at vertical pitch.
   yaw = axis_angle_to_mat(torch.tensor([0., 0., 1.]), torch.tensor(math.pi/2))
   tilt = axis_angle_to_mat(torch.tensor([0., 1., 0.]), torch.tensor(pitch))

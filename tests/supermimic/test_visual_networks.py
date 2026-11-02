@@ -1,13 +1,27 @@
 import copy
+from dataclasses import replace
 import pytest
 import torch
-from supermimic.rl.networks import Policy, WorldModel, Critic
-from supermimic.rl.depth_encoder import DepthEncoder, WindowGRU
-from supermimic.config.g1.rl_cfg import SuperMimicConfig
+from supermimic.networks import Policy, WorldModel, Critic
+from supermimic.networks.depth_encoder import DepthEncoder, WindowGRU
+from supermimic.config.g1.rl_cfg import unitree_g1_runner_cfg, unitree_g1_terrain_runner_cfg
+
+
+def test_base_architecture_has_no_perception_modules():
+  cfg=unitree_g1_runner_cfg()
+  w=WorldModel((16,),depth_cfg=cfg)
+  p=Policy(93,640,hidden=(16,),depth_cfg=cfg)
+  v=Critic(847,(16,),depth_cfg=cfg)
+  assert p.dec[0].in_features==962
+  assert w.net[0].in_features==133 and v.net[0].in_features==847
+  assert not any(hasattr(m,'depth_encoder') for m in (w,p,v))
+  assert not hasattr(w,'depth_decoder') and w.foot_head is None
+  with torch.no_grad():
+    assert p(torch.zeros(1,10,93),torch.zeros(1,640)).shape==(1,29)
 
 
 def test_default_architecture_with_shared_encoder():
-  cfg=SuperMimicConfig()
+  cfg=unitree_g1_terrain_runner_cfg()
   w=WorldModel((16,),depth_cfg=cfg)
   p=Policy(93,640,hidden=(16,),depth_cfg=cfg,depth_encoder=w.depth_encoder)
   v=Critic(847,(16,),depth_cfg=cfg,depth_encoder=w.depth_encoder)
@@ -91,7 +105,7 @@ def test_visual_encoder_compiles_fullgraph_with_checkpoint_and_input_gradients()
 def test_cuda_inductor_visual_critic_forward_and_gradients_match_eager():
   """Exercise the real CUDA compiler, not just CPU AOT tracing, when available."""
   torch.manual_seed(23)
-  cfg=SuperMimicConfig(depth_frame_dim=16,depth_latent_dim=16,depth_batch_size=4)
+  cfg=replace(unitree_g1_terrain_runner_cfg(),depth_frame_dim=16,depth_latent_dim=16,depth_batch_size=4)
   model=Critic(17,(16,),depth_cfg=cfg).cuda()
   compiled=torch.compile(model,fullgraph=True,dynamic=True)
   try:

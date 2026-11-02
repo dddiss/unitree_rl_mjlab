@@ -8,14 +8,16 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from ..mdp.state import read_state, OBS_DIM
-from ..mdp.sampling import EpisodeBinReturns
+from ..core.state import read_state, OBS_DIM
+from ..motion.sampling import EpisodeBinReturns
+from ..tools.registry import runner_cfg_from_dict
 from .algorithm import SuperMimicAlgorithm
 from .buffer import ReplayBuffer
-from .logging import TrainingLogger, format_terminal_summary
-from .metrics import LEGACY_FIELDS, PERFORMANCE_FIELDS, SAMPLING_FIELDS, IntervalMetrics, sampling_metrics
+from .logging import (
+  TrainingLogger, format_terminal_summary, LEGACY_FIELDS, PERFORMANCE_FIELDS,
+  SAMPLING_FIELDS, IntervalMetrics, sampling_metrics,
+)
 from ..perception.history import DepthHistory, select_history
-from ..config.g1.rl_cfg import SuperMimicConfig, migrate_checkpoint_config
 
 VISUAL_FIELDS = ("wm_latent_loss", "wm_depth_loss", "wm_total_loss")
 
@@ -94,14 +96,15 @@ class SuperMimicRunner:
     self.buffer = ReplayBuffer(cfg.buffer_steps, env.num_envs, env.context,
                                self.motion.clip_end, self.motion.clip_id, cfg.horizon,
                                cfg.depth_history_length if cfg.depth_enabled else 0,
-                               foot_reward_names=self.algorithm.foot_reward_names)
+                               reward_schema=self.algorithm.reward_schema)
     self.controller = PolicyController(env, self.algorithm.policy, cfg, noise=True, update_norm=True)
     self.iteration = self.sim_steps = self.env_steps = 0
     self.step_acc = self.wall_offset = 0.0
     self._started = time.monotonic()
     self.episode_return = torch.zeros(env.num_envs, device=env.device)
-    max_episode_steps = (env.max_episode_length
-                         if "time_out" in env.termination_manager.active_terms else None)
+    has_time_limit = getattr(env, "has_episode_time_limit",
+                             "time_out" in env.termination_manager.active_terms)
+    max_episode_steps = env.max_episode_length if has_time_limit else None
     self.episode_bins = EpisodeBinReturns(
       self.motion, env.num_envs, cfg.gamma, env.functional_mdp.max_step_reward,
       max_episode_steps=max_episode_steps,
@@ -158,6 +161,7 @@ class SuperMimicRunner:
     checkpoint = {
       "format_version": (5 if self.algorithm.foot_reward_names else
                          3 if self.cfg.depth_enabled else 1), "algorithm": self.algorithm.state_dict(),
+      "network_spec": self.algorithm.network_factory.metadata(self.algorithm.reward_schema),
       "config": asdict(self.cfg), "motions": motion_manifest(self.motion),
       "sampler": self.command.sampler.state_dict(), "iteration": self.iteration,
       "sim_steps": self.sim_steps, "env_steps": self.env_steps, "step_acc": self.step_acc,
@@ -173,24 +177,28 @@ class SuperMimicRunner:
     check_manifest(ck["motions"], motion_manifest(self.motion))
     if ck["config"].get("depth_enabled", False) and ck.get("format_version", 1) < 3:
       raise ValueError("Legacy visual checkpoint predicts image-decoder latents, not shared history h. "
-                       "Start new training; legacy policies remain available for play/evaluation.")
+                       "Start new training with the current configuration.")
     if self.algorithm.foot_reward_names and ck.get("format_version", 1) < 4:
       raise ValueError("This checkpoint has no WM foot-cost heads or their optimizer state. "
-                       "Start new training with foot-cost supervision; the old policy remains playable.")
+                       "Start new training with foot-cost supervision.")
     if self.algorithm.foot_reward_names and ck.get("format_version", 1) == 4:
       raise ValueError("This checkpoint uses independent WM foot-cost MLPs, not the shared MLP. "
-                       "Start new training with the shared head; the old policy remains playable.")
-    saved_cfg = asdict(SuperMimicConfig(**migrate_checkpoint_config(ck["config"])))
+                       "Start new training with the shared head.")
+    saved_cfg = asdict(runner_cfg_from_dict(ck["config"]))
     current_cfg = asdict(self.cfg)
+    if current_cfg["task_id"] != saved_cfg["task_id"]:
+      raise ValueError("Resume configuration changed task_id; use the checkpoint configuration")
     # Scheduling, logging, precision, collection mix, sampling and actor clipping may change without
     # reinterpreting weights. Replay is refilled after loading.
     mutable = {"iterations", "num_envs", "ckpt_every", "log_every", "amp", "compile",
                "buffer_steps", "warmup_steps", "enable_warmup", "logger", "wandb_project",
                "wandb_entity", "wandb_mode", "log_dir", "run_name", "collect_det_frac", "bin_ema",
                "softmax_cap", "pi_clip", "pi_clip_value", "depth_checkpoint", "depth_batch_size"}
-    for key in current_cfg:
-      if key not in mutable and current_cfg[key] != saved_cfg[key]:
+    for key in dict.fromkeys((*current_cfg, *saved_cfg)):
+      if key not in mutable and current_cfg.get(key) != saved_cfg.get(key):
         raise ValueError(f"Resume configuration changed {key}; use the checkpoint configuration")
+    if "network_spec" in ck and ck["network_spec"] != self.algorithm.network_factory.metadata(self.algorithm.reward_schema):
+      raise ValueError("Checkpoint network features/classes/reward target schema differ from this run")
     self.algorithm.load_state_dict(ck["algorithm"])
     self.command.sampler.load_state_dict(ck["sampler"])
     self.iteration, self.sim_steps, self.env_steps = ck["iteration"], ck["sim_steps"], ck["env_steps"]
@@ -312,7 +320,7 @@ class SuperMimicRunner:
   @property
   def wm_auxiliary_fields(self):
     fields = VISUAL_FIELDS if self.cfg.depth_enabled else ()
-    fields += tuple("wm_" + name + "_loss" for name in self.algorithm.foot_reward_names)
+    fields += self.algorithm.reward_schema.log_fields
     if self.algorithm.foot_reward_names and not self.cfg.depth_enabled:
       fields += ("wm_total_loss",)
     return fields

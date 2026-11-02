@@ -6,9 +6,9 @@ import torch
 from torch import nn
 
 from supermimic.config.g1.rl_cfg import SuperMimicConfig
-from supermimic.mdp.state import flatten_state
+from supermimic.core.state import flatten_state
 from supermimic.rl.algorithm import SuperMimicAlgorithm
-from supermimic.rl.networks import RunningNorm
+from supermimic.networks import RunningNorm
 from test_algorithm import small_config
 
 

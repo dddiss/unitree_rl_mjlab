@@ -4,8 +4,127 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from .foot_rewards import clipped_height_clearance, feet_at_plane_penalty, feet_stumble_penalty
-from .rotations import quat_to_mat, rot_angle_sq, yaw_mat
+from ..tools.rotations import quat_to_mat, rot_angle_sq, yaw_mat
+
+# Foot costs adapted from RoboParty/P-BFM; CC BY-NC 4.0.
+# See ../perception/LICENSE-P-BFM and THIRD_PARTY_NOTICES.md.
+# Canonical output/replay order. Values are costs, without reward weights or dt.
+FOOT_REWARD_NAMES = ("feet_stumble", "feet_at_plane")
+
+HEIGHT_SCAN_MIN = -5.0
+HEIGHT_SCAN_MAX = 5.0
+
+def clipped_height_clearance(
+    sample_height: torch.Tensor,
+    hit_height: torch.Tensor,
+    distance: torch.Tensor,
+    *,
+    offset: float = 0.0,
+) -> torch.Tensor:
+    """Return finite sample-to-terrain clearance, filling invalid rays with the clip maximum."""
+
+    clearance = sample_height - hit_height - float(offset)
+    valid = (distance >= 0.0) & torch.isfinite(distance) & torch.isfinite(clearance)
+    clearance = torch.where(valid, clearance, HEIGHT_SCAN_MAX)
+    return clearance.clamp(HEIGHT_SCAN_MIN, HEIGHT_SCAN_MAX)
+
+
+def fixed_sole_weights(
+    local_xy: torch.Tensor,
+    edge_weight: float = 0.1,
+    center_weight: float = 1.0,
+) -> torch.Tensor:
+    """Return a terrain-independent 2-D sole-edge-to-center weight map."""
+
+    if local_xy.ndim != 2 or local_xy.shape[-1] != 2 or local_xy.shape[0] == 0:
+        raise ValueError(f"local_xy must be a non-empty (points, 2) tensor, got {tuple(local_xy.shape)}")
+    if not 0.0 <= edge_weight <= center_weight:
+        raise ValueError(
+            f"Expected 0 <= edge_weight <= center_weight, got {edge_weight} and {center_weight}"
+        )
+
+    def axis_center_profile(values: torch.Tensor) -> torch.Tensor:
+        span = values.max() - values.min()
+        if float(span) <= 0.0:
+            return torch.ones_like(values)
+        fraction = ((values - values.min()) / span).clamp(0.0, 1.0)
+        profile = 1.0 - 2.0 * torch.abs(fraction - 0.5)
+        return profile / profile.max().clamp_min(torch.finfo(values.dtype).eps)
+
+    x_profile = axis_center_profile(local_xy[:, 0])
+    y_profile = axis_center_profile(local_xy[:, 1])
+    center_profile = torch.minimum(x_profile, y_profile)
+    return edge_weight + (center_weight - edge_weight) * center_profile
+
+
+def feet_stumble_penalty(
+    force_history: torch.Tensor,
+    horizontal_ratio: float = 1.0,
+    force_threshold: float = 20.0,
+    force_scale: float = 100.0,
+    max_penalty: float = 1.0,
+) -> torch.Tensor:
+    """Penalize the largest horizontal-dominant foot contact in a policy step."""
+
+    if force_history.ndim != 4 or force_history.shape[-1] != 3:
+        raise ValueError(f"Expected force history shaped (N, contacts, history, 3), got {tuple(force_history.shape)}")
+    if force_scale <= 0.0 or max_penalty <= 0.0:
+        raise ValueError("force_scale and max_penalty must be positive")
+    if force_history.shape[1] == 0 or force_history.shape[2] == 0:
+        return torch.zeros(force_history.shape[0], dtype=force_history.dtype, device=force_history.device)
+    force_xy = torch.linalg.norm(force_history[..., :2], dim=-1)
+    force_z = torch.abs(force_history[..., 2])
+    excess = torch.relu(force_xy - horizontal_ratio * force_z - force_threshold)
+    return torch.clamp(excess / force_scale, max=max_penalty).amax(dim=(1, 2))
+
+
+def _support_deficiency(
+    clearance: torch.Tensor,
+    point_weights: torch.Tensor | None,
+    *,
+    height_tolerance: float,
+    transition_width: float,
+) -> torch.Tensor:
+    width = max(float(transition_width), 1.0e-6)
+    support = torch.sigmoid((height_tolerance - clearance) / width)
+    unsupported = 1.0 - support
+    boundary_eps = 8.0 * torch.finfo(clearance.dtype).eps
+    unsupported = torch.where(
+        clearance > height_tolerance + boundary_eps,
+        unsupported,
+        torch.zeros_like(unsupported),
+    )
+    if point_weights is None:
+        return unsupported.mean(dim=-1)
+    weights = point_weights.to(device=unsupported.device, dtype=unsupported.dtype)
+    return (unsupported * weights).sum(dim=-1) / weights.sum().clamp_min(torch.finfo(unsupported.dtype).eps)
+
+
+def feet_at_plane_penalty(
+    clearance: torch.Tensor,
+    is_contact: torch.Tensor,
+    point_weights: torch.Tensor,
+    *,
+    height_tolerance: float = 0.030,
+    transition_width: float = 0.005,
+) -> torch.Tensor:
+    """Penalize unsupported sole area for both feet on every terrain type."""
+
+    if clearance.ndim != 3 or is_contact.shape != clearance.shape[:2]:
+        raise ValueError(
+            f"Expected clearance=(N, 2, points), is_contact=(N, 2), got "
+            f"{tuple(clearance.shape)}, {tuple(is_contact.shape)}"
+        )
+    if point_weights.ndim != 1 or point_weights.numel() != clearance.shape[-1]:
+        raise ValueError(f"Expected one weight per terrain point, got {tuple(point_weights.shape)}")
+    weighted = _support_deficiency(
+        clearance,
+        point_weights,
+        height_tolerance=height_tolerance,
+        transition_width=transition_width,
+    )
+    return torch.sum(weighted * is_contact.to(weighted.dtype), dim=1)
+
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
@@ -218,3 +337,93 @@ def feet_at_plane(
   )
   return feet_at_plane_penalty(clearance, is_contact, sensor.point_weights,
                                height_tolerance=height_tolerance, transition_width=transition_width)
+
+
+# Components below own the differentiable counterpart of each measured term.
+# Register new terms here (or in another imported module), not in Algorithm.
+from ..core.components import Prediction, reward_component
+import math
+
+
+def _root_position(ctx, std):
+  return torch.exp(-(ctx.reference_root[0] - ctx.state[0]).square().sum(-1) / std**2)
+
+
+def _root_orientation(ctx, std):
+  return torch.exp(-rot_angle_sq(ctx.reference_root[1], ctx.state[1]) / std**2)
+
+
+def _body_position(ctx, std, body_names=None):
+  return torch.exp(-(ctx.aligned_reference[0] - ctx.bodies[0]).square().sum(-1).mean(-1) / std**2)
+
+
+def _body_orientation(ctx, std, body_names=None):
+  return torch.exp(-rot_angle_sq(ctx.aligned_reference[1], ctx.bodies[1]).mean(-1) / std**2)
+
+
+def _body_linear_velocity(ctx, std, body_names=None):
+  return torch.exp(-(ctx.reference_bodies[2] - ctx.bodies[2]).square().sum(-1).mean(-1) / std**2)
+
+
+def _body_angular_velocity(ctx, std, body_names=None):
+  return torch.exp(-(ctx.reference_bodies[3] - ctx.bodies[3]).square().sum(-1).mean(-1) / std**2)
+
+
+def _action_rate(ctx):
+  return (ctx.action - ctx.previous_action).square().sum(-1)
+
+
+def _joint_limit(ctx):
+  q = ctx.state[4]
+  return (torch.relu(q - ctx.mdp.soft_hi) + torch.relu(ctx.mdp.soft_lo - q)).sum(-1)
+
+
+def _prepare_body_subset(params, body_names):
+  selected = tuple(params["body_names"])
+  if not selected or any(body not in body_names for body in selected):
+    raise ValueError("body_names must select tracked robot bodies")
+  if body_names[0] in selected:
+    raise ValueError("exclude the root; it has a separate tracking reward")
+  std, tolerance = params["std"], params.get("tolerance", 0.0)
+  if not math.isfinite(std) or std <= 0 or not math.isfinite(tolerance) or tolerance < 0:
+    raise ValueError("std must be positive and tolerance nonnegative, both finite")
+  return dict(indices=tuple(i for i, b in enumerate(body_names) if b in selected),
+              std=std, tolerance=tolerance)
+
+
+def _root_relative_position(ctx, indices, std, tolerance=0.0):
+  return root_relative_body_position_reward(
+    ctx.bodies[0][..., indices, :], *ctx.state[:2],
+    ctx.reference_bodies[0][..., indices, :], *ctx.reference_root[:2],
+    std=std, tolerance=terrain_tolerance_radius(tolerance, ctx.terrain_tolerance))
+
+
+def _tolerant_orientation(ctx, indices, std, tolerance=0.0):
+  return body_orientation_tolerance_reward(
+    ctx.bodies[1][..., indices, :, :], ctx.state[1],
+    ctx.reference_bodies[1][..., indices, :, :], ctx.reference_root[1],
+    std=std, tolerance=terrain_tolerance_radius(tolerance, ctx.terrain_tolerance))
+
+
+# Defaults also read old programmatic MdpConfig/flat checkpoints. The live
+# environment resolves by function identity, so term labels can be renamed.
+LEGACY_REWARDS = {
+  "motion_global_root_pos": (motion_global_anchor_position_error_exp, _root_position, "root_pos_std"),
+  "motion_global_root_ori": (motion_global_anchor_orientation_error_exp, _root_orientation, "root_ori_std"),
+  "motion_body_pos": (motion_relative_body_position_error_exp, _body_position, "body_pos_std"),
+  "motion_body_ori": (motion_relative_body_orientation_error_exp, _body_orientation, "body_ori_std"),
+  "motion_body_lin_vel": (motion_global_body_linear_velocity_error_exp, _body_linear_velocity, "body_linvel_std"),
+  "motion_body_ang_vel": (motion_global_body_angular_velocity_error_exp, _body_angular_velocity, "body_angvel_std"),
+  "action_rate_l2": (supermimic_action_rate, _action_rate, None),
+  "joint_limit": (supermimic_joint_limit, _joint_limit, None),
+}
+for _measured, _tensor, _ in LEGACY_REWARDS.values():
+  reward_component(_tensor)(_measured)
+  _measured.use_tensor_measurement = True
+reward_component(_root_relative_position, prepare=_prepare_body_subset)(motion_root_relative_body_position_error_exp)
+reward_component(_tolerant_orientation, prepare=_prepare_body_subset)(motion_body_orientation_tolerance_error_exp)
+
+reward_component(prediction=Prediction(loss_weight_field="feet_stumble_loss_weight"))(feet_stumble)
+reward_component(prediction=Prediction(loss_weight_field="feet_at_plane_loss_weight", loss_weight=0.0),
+                 sense_before_reward=True)(feet_at_plane)
+LEGACY_SENSOR_REWARDS = {"feet_stumble": feet_stumble, "feet_at_plane": feet_at_plane}

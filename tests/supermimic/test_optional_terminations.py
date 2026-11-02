@@ -4,8 +4,8 @@ from types import SimpleNamespace as NS
 import pytest
 import torch
 
-from supermimic.mdp.functional import MdpConfig
-from supermimic.mdp.rotations import so3_exp
+from supermimic.core.functional import MdpConfig
+from supermimic.tools.rotations import so3_exp
 
 
 @pytest.mark.parametrize('height', [True, False])

@@ -5,7 +5,7 @@ from types import MethodType, SimpleNamespace as NS
 
 import torch
 
-from supermimic.mdp.logging_metrics import TRACKING_METRICS, capture_step_metrics
+from supermimic.rl.logging import TRACKING_METRICS, capture_step_metrics
 
 
 def command_at_target():

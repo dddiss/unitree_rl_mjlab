@@ -3,17 +3,35 @@ import torch
 
 from mjlab.envs import ManagerBasedRlEnv
 
-from .mdp.functional import FunctionalMDP, MdpConfig
-from .mdp.foot_rewards import FOOT_REWARD_NAMES
-from .mdp.kinematics import G1Kinematics
-from .mdp.logging_metrics import capture_step_metrics
-from .mdp.state import read_state, flatten_state, state_in_reference_frame
-from .terrain.reward_context import tolerance_by_terrain_column
+from .core.functional import FunctionalMDP, MdpConfig
+from .core.components import prediction_bindings, bind_analytic_manager_terms
+from .tools.kinematics import G1Kinematics
+from .rl.logging import capture_step_metrics
+from .core.state import read_state, flatten_state, state_in_reference_frame
 from .terrain.heightmap import TerrainHeightMap
+from .perception.camera import DepthCamera, DepthPatternCfg
+
+
+def tolerance_by_terrain_column(cfg):
+  """mjlab 1.6 curriculum maps sub_terrains insertion order to columns.
+
+  This identifies the configured family, not whether a particular point on a
+  stair/platform happens to be level. The G1 factory names its flat family flat.
+  """
+  if cfg is None or cfg.terrain_type == "plane":
+    return (False,)
+  if cfg.terrain_type != "generator" or cfg.terrain_generator is None:
+    raise ValueError("Terrain-dependent tolerance requires plane or generated terrain")
+  generator = cfg.terrain_generator
+  if not generator.curriculum:
+    # Random generation can put different families in the same column; mjlab
+    # 1.6 does not expose their per-tile family IDs on TerrainEntity.
+    raise ValueError("Terrain-dependent tolerance requires curriculum=True (one family per column)")
+  return tuple(name != "flat" for name in generator.sub_terrains)
 
 
 class SuperMimicEnv(ManagerBasedRlEnv):
-  def __init__(self, cfg, *, depth_camera=None, collect_foot_rewards=False,
+  def __init__(self, cfg, *, collect_foot_rewards=False,
                randomize_terrain_on_reset=False, **kwargs):
     if cfg.auto_reset:
       raise ValueError("SuperMimic requires auto_reset=False")
@@ -24,14 +42,20 @@ class SuperMimicEnv(ManagerBasedRlEnv):
     self._depth_camera = None
     self._depth_image = None
     self._randomize_terrain_on_reset = randomize_terrain_on_reset
-    self.foot_reward_names = tuple(name for name in FOOT_REWARD_NAMES
-                                   if collect_foot_rewards and cfg.rewards.get(name) is not None)
-    support = cfg.rewards.get("feet_at_plane")
-    self._sense_before_rewards = support is not None and (
-      support.weight != 0 or "feet_at_plane" in self.foot_reward_names)
+    self.has_episode_time_limit = any(
+      term is not None and term.time_out
+      and getattr(term.func, "supermimic_truncation", None) == "time_limit"
+      for term in cfg.terminations.values())
+    bindings = prediction_bindings(cfg.rewards)
+    self.foot_reward_names = tuple(name for name, _, _ in bindings) if collect_foot_rewards else ()
+    self._sense_before_rewards = any(component.sense_before_reward and
+      (term.weight != 0 or collect_foot_rewards) for _, term, component in bindings)
+    bind_analytic_manager_terms(cfg)
     super().__init__(cfg, **kwargs)
+    # The task owns sensor creation. Reuse its calibration for image readout.
+    depth_camera = next((sensor.pattern.camera for sensor in cfg.scene.sensors
+                         if isinstance(getattr(sensor, "pattern", None), DepthPatternCfg)), None)
     if depth_camera is not None:
-      from .perception.camera import DepthCamera
       self._depth_camera = DepthCamera(depth_camera, self.scene, self.device)
     self._context = self.read_context().clone()
     self.reset_version = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
@@ -46,6 +70,10 @@ class SuperMimicEnv(ManagerBasedRlEnv):
       self.terrain_height_map = TerrainHeightMap.from_model(
         self.sim.mj_model, self.device, resolution=reset_cfg.heightmap_resolution)
     super().load_managers()
+
+  @property
+  def depth_enabled(self):
+    return self._depth_camera is not None
 
   @property
   def depth_image(self):
@@ -94,7 +122,7 @@ class SuperMimicEnv(ManagerBasedRlEnv):
                                            cmd.body_indexes, cmd.root_body_index,
                                            robot.data.soft_joint_pos_limits[0], cfg)
       terrain = self.scene.terrain
-      if cfg.term_height is not None and terrain is not None and terrain.cfg.terrain_type == "generator":
+      if self._functional_mdp.requires_height_offset and terrain is not None and terrain.cfg.terrain_type == "generator":
         self._functional_mdp.termination_ground = self.terrain_height_map.height
     return self._functional_mdp
 
@@ -106,6 +134,15 @@ class SuperMimicEnv(ManagerBasedRlEnv):
         cmd.time_steps, self.action_manager.action, self.action_manager.prev_action,
         terrain_tolerance=self.terrain_tolerance)
     return self._reward_terms
+
+  def shared_failure_terms(self):
+    cmd = self.command_manager.get_term("motion")
+    mdp = self.functional_mdp
+    offset = (mdp.termination_height_offset(cmd.time_steps, self.scene.env_origins,
+                                           cmd.reference_xy_offset)
+              if mdp.requires_height_offset else None)
+    return mdp.failure_terms(state_in_reference_frame(read_state(self), cmd.reference_xy_offset),
+                             cmd.time_steps, height_offset=offset)
 
   @torch.no_grad()
   def reset(self, *, seed=None, env_ids=None, options=None):

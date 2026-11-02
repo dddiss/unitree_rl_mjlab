@@ -8,8 +8,11 @@ from types import SimpleNamespace as NS
 import pytest
 import torch
 
-from supermimic.mdp.logging_metrics import TRACKING_METRICS, capture_step_metrics
-from supermimic.mdp.state import state_in_reference_frame
+from supermimic.rl.logging import TRACKING_METRICS, capture_step_metrics
+from supermimic.core.state import state_in_reference_frame
+from supermimic.core.components import prediction_bindings, bind_analytic_manager_terms
+from supermimic.perception.camera import DepthCamera, DepthPatternCfg
+from supermimic.perception.preprocessing import preprocess_depth
 
 ROOT=Path(__file__).resolve().parents[2]
 
@@ -21,6 +24,50 @@ def methods(path,class_name,names,namespace):
   body += [n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name in names]
   exec(compile(ast.fix_missing_locations(ast.Module(body=body,type_ignores=[])),str(path),'exec'),namespace)
   return namespace
+
+
+@pytest.mark.parametrize('task', ['flat', 'terrain'])
+@pytest.mark.parametrize('play', [False, True])
+def test_environment_reads_depth_from_explicit_task_sensor(task, play):
+  from test_env_cfg_layers import load_config_factories
+  factory = 'unitree_g1_env_cfg' if task == 'flat' else 'unitree_g1_terrain_env_cfg'
+  cfg = load_config_factories()[factory](play=play)
+  cfg.scene.num_envs = 2
+
+  class Parent:
+    def __init__(self, cfg, *, device):
+      self.device, self.num_envs = device, cfg.scene.num_envs
+      self.scene = NS(sensors={})
+      for sensor in cfg.scene.sensors:
+        pattern = getattr(sensor, 'pattern', None)
+        if isinstance(pattern, DepthPatternCfg):
+          # Synthetic fronto-parallel scene; use the actual optical-Z reader.
+          distance = 1.2 / pattern.camera.optical_rays()[..., 2]
+          self.scene.sensors[sensor.name] = NS(data=NS(
+            distances=distance.reshape(1, -1).expand(self.num_envs, -1)))
+
+    def read_context(self):
+      return torch.zeros(self.num_envs, 33)
+
+  path = ROOT / 'src/tasks/supermimic/env.py'
+  cls = next(n for n in ast.parse(path.read_text()).body
+             if isinstance(n, ast.ClassDef) and n.name == 'SuperMimicEnv')
+  cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef)
+              and n.name in ('__init__', 'depth_enabled')]
+  ns = dict(torch=torch, ManagerBasedRlEnv=Parent, DepthCamera=DepthCamera,
+            DepthPatternCfg=DepthPatternCfg, prediction_bindings=prediction_bindings,
+            bind_analytic_manager_terms=bind_analytic_manager_terms)
+  exec(compile(ast.Module(body=[cls], type_ignores=[]), str(path), 'exec'), ns)
+  env = ns['SuperMimicEnv'](cfg, device='cpu')
+  assert env.depth_enabled is (task == 'terrain')
+  assert env.reset_version.eq(0).all()
+  if task == 'terrain':
+    sensor = cfg.scene.sensors[1]
+    assert env._depth_camera.cfg is sensor.pattern.camera
+    torch.testing.assert_close(env._depth_camera.read(),
+                               preprocess_depth(torch.full((2, 36, 64), 1.2)))
+  else:
+    assert env._depth_camera is None
 
 
 def test_command_subset_dt_zero_and_last_frame():
@@ -143,7 +190,7 @@ def test_real_env_reset_and_reward_parity(mdp):
   import sys
   sys.path.insert(0,str(ROOT))
   from src.tasks.supermimic.config import make_env
-  from src.tasks.supermimic.mdp.state import unflatten_state
+  from src.tasks.supermimic.core.state import unflatten_state
   from src.tasks.supermimic.terrain.reset import terrain_tile_xy_bounds
   env=make_env(mdp.motion.motion_files,num_envs=4)
   try:

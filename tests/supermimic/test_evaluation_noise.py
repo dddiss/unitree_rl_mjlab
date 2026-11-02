@@ -9,9 +9,9 @@ from types import ModuleType, SimpleNamespace as NS
 import pytest
 import torch
 
-from supermimic.mdp.state import read_state
-from supermimic.rl.evaluation import evaluate
-from supermimic.rl.networks import Policy
+from supermimic.core.state import read_state
+from supermimic.playback.evaluation import evaluate
+from supermimic.networks import Policy
 from test_algorithm import small_config
 from test_train_resume_eval import TensorEnv
 
@@ -83,10 +83,13 @@ def test_noise_repeats_by_seed_and_does_not_update_policy_or_normalizers(mdp):
   before = {name: value.clone() for name, value in policy.state_dict().items()}
   result = evaluate(env, policy, cfg, observation_noise=True, action_noise=.1, seed=3)
   actions = torch.stack(env.actions)
+  rng_after = torch.get_rng_state().clone()
   env.actions.clear()
-  repeated = evaluate(env, policy, cfg, observation_noise=True, action_noise=.1, seed=3)
+  repeated = evaluate(env, policy, cfg, observation_noise=True, action_noise=.1, seed=3,
+                      progress_desc='Evaluate ckpt_002000.pt | mode=both seed=3')
   assert result == repeated
   torch.testing.assert_close(torch.stack(env.actions), actions, rtol=0, atol=0)
+  assert torch.equal(torch.get_rng_state(), rng_after)
   env.actions.clear()
   evaluate(env, policy, cfg, observation_noise=True, action_noise=.1, seed=4)
   assert not torch.equal(torch.stack(env.actions), actions)
@@ -141,7 +144,8 @@ def test_all_modes_reports_and_cached_run_directory(cli, tmp_path):
   for index, mode in enumerate(cli["NOISE_MODES"]):
     for offset, seed in enumerate((2, 4)):
       assert calls[index * 2 + offset] == dict(seed=seed, observation_noise=mode in ("observation", "both"),
-        action_noise=.2 if mode in ("action", "both") else 0., action_clip=None)
+        action_noise=.2 if mode in ("action", "both") else 0., action_clip=None,
+        progress_desc=f"Evaluate ckpt_064000.pt | mode={mode} seed={seed}")
   root = tmp_path / "noise_evaluation" / checkpoint.stem
   with (root / "eval.csv").open() as handle:
     rows = list(csv.DictReader(handle))
@@ -174,11 +178,12 @@ def test_cli_keeps_legacy_default_and_closes_environment(cli, tmp_path, monkeypa
     env_options.append(kwargs)
     return env
   config_module.make_env = make_env
-  motion_module = ModuleType("src.tasks.supermimic.mdp.motion_lib")
+  motion_module = ModuleType("src.tasks.supermimic.motion.motion_lib")
   motion_module._resolve_motion_files = lambda path: ["a.npz", "b.npz"]
-  eval_module = ModuleType("src.tasks.supermimic.rl.evaluation")
+  eval_module = ModuleType("src.tasks.supermimic.playback.evaluation")
   eval_module.load_policy = lambda *args: (None, small_config(), {"iteration": 42})
-  eval_module.read_checkpoint_config = lambda *args: small_config(depth_enabled=visual)
+  task = 'Unitree-G1-SuperMimic-Terrain' if visual else 'Unitree-G1-SuperMimic'
+  eval_module.read_checkpoint_config = lambda *args: small_config(depth_enabled=visual, task_id=task)
   def score(*args, **kwargs):
     calls.append(kwargs)
     if fail:
@@ -202,9 +207,12 @@ def test_cli_keeps_legacy_default_and_closes_environment(cli, tmp_path, monkeypa
       assert {call["seed"] for call in calls} == {0, 1, 2}
       assert all(call["action_clip"] == 20 for call in calls)
       assert {call["action_noise"] for call in calls} == {0., .15}
+      assert [call["progress_desc"] for call in calls] == [
+        f"Evaluate ckpt.pt | mode={mode} seed={seed}"
+        for mode in cli["NOISE_MODES"] for seed in (0, 1, 2)]
       assert not (tmp_path / "eval.csv").exists()
     else:
-      assert calls == [{}]
+      assert calls == [{"progress_desc": "Evaluate ckpt.pt"}]
       assert (tmp_path / "ckpt.json").exists() and (tmp_path / "eval.csv").exists()
-  assert env_options == [dict(num_envs=2, device="cpu", evaluation=True, depth_enabled=visual)]
+  assert env_options == [dict(num_envs=2, device="cpu", evaluation=True, task_id=task)]
   assert closed == [True]

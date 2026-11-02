@@ -6,8 +6,8 @@ from types import SimpleNamespace as NS
 import pytest
 import torch
 
-from supermimic.mdp.motion_lib import MotionReference
-from supermimic.mdp.state import state_in_reference_frame, unflatten_state
+from supermimic.motion.motion_lib import MotionReference
+from supermimic.core.state import state_in_reference_frame, unflatten_state
 from supermimic.rl.algorithm import SuperMimicAlgorithm
 from supermimic.rl.buffer import ReplayBuffer
 from supermimic.terrain import reset as terrain_reset
@@ -24,7 +24,7 @@ def test_factory_enables_xy_only_for_training_on_generated_tiles(play, kind):
   # Execute the actual configuration branch without importing GPU-only mjlab.
   path = ROOT / 'src/tasks/supermimic/config/g1/env_cfgs.py'
   fn = next(n for n in ast.parse(path.read_text()).body
-            if isinstance(n, ast.FunctionDef) and n.name == 'unitree_g1_flat_tracking_env_cfg')
+            if isinstance(n, ast.FunctionDef) and n.name == 'unitree_g1_terrain_env_cfg')
   branch = next(n for n in fn.body if isinstance(n, ast.If) and 'TerrainResetCfg(' in ast.unparse(n))
   cmd = NS(terrain_reset=None)
   cfg = NS(scene=NS(terrain=NS(terrain_type=kind, terrain_generator=NS(border_width=17.)), sensors=()))

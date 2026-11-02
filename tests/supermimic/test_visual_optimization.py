@@ -9,10 +9,10 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from supermimic.perception.preprocessing import depth_float
-from supermimic.rl import networks
+from supermimic.networks import factory as networks
 from supermimic.rl.algorithm import SuperMimicAlgorithm, frozen
-from supermimic.rl.depth_encoder import DepthEncoder
-from supermimic.mdp.state import normalize_xi, unflatten_state
+from supermimic.networks.depth_encoder import DepthEncoder
+from supermimic.core.state import normalize_xi, unflatten_state
 from test_visual_algorithm import visual_config, visual_buffer
 
 

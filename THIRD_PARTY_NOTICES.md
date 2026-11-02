@@ -5,7 +5,7 @@
 The files `src/tasks/supermimic/perception/camera.py`,
 `src/tasks/supermimic/perception/sensor.py`,
 `src/tasks/supermimic/perception/preprocessing.py`, and
-`src/tasks/supermimic/rl/depth_encoder.py` adapt the G1 depth-camera convention,
+`src/tasks/supermimic/networks/depth_encoder.py` adapt the G1 depth-camera convention,
 `optical_z_maxcrop18_reset_v2` preprocessing, and CNN/GRU encoder from
 [RoboParty/P-BFM](https://github.com/Roboparty/P-BFM), revision
 `2aa985ac50162e446532d1e7231f81902c221e49`. P-BFM builds on
@@ -40,7 +40,7 @@ map. It samples collision geometry, rechecks missed samples with native CPU MuJo
 and uses containing-cell lookups without smoothing. Runtime reset probes and
 padding-miss repair were removed; the adaptive-lift rule is retained.
 
-`src/tasks/supermimic/mdp/foot_rewards.py` and
+`src/tasks/supermimic/mdp/rewards.py` and
 `src/tasks/supermimic/terrain/foot_sensor.py` additionally adapt that revision's
 `feet_stumble`, `feet_at_plane`, fixed sole weights, height-clearance handling,
 and world-down sole scanner. Manager adapters and G1 sensor configuration are

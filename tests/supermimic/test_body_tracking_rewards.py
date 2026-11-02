@@ -1,5 +1,4 @@
 """Root-relative, split-body rewards agree in simulation and imagination."""
-import ast
 import math
 from types import SimpleNamespace as NS
 
@@ -8,24 +7,15 @@ import numpy as np
 import pytest
 import torch
 
-from conftest import BODIES, ROOT
+from conftest import BODIES
 from supermimic.mdp import rewards
-from supermimic.mdp.functional import MdpConfig
-from supermimic.mdp.rotations import so3_exp, mat_to_quat, quat_to_mat, yaw_mat
+from supermimic.core.functional import MdpConfig
+from supermimic.tools.rotations import so3_exp, mat_to_quat, quat_to_mat, yaw_mat
+from test_env_cfg_layers import load_config_factories
 
 
 def configured_rewards():
-  # Evaluate the actual reward configuration without requiring the GPU runtime.
-  path = ROOT / 'src/tasks/supermimic/tracking_env_cfg.py'
-  factory = next(n for n in ast.parse(path.read_text()).body
-                 if isinstance(n, ast.FunctionDef) and n.name == 'make_tracking_env_cfg')
-  nodes = [n for n in factory.body if
-           (isinstance(n, ast.Assign) and n.targets[0].id in {'upper_bodies', 'lower_bodies'})
-           or (isinstance(n, ast.AnnAssign) and n.target.id == 'rewards')]
-  ns = {'mdp': rewards, 'RewardTermCfg': lambda **kw: NS(params={}, **kw) if 'params' not in kw else NS(**kw),
-        'SceneEntityCfg': lambda *a, **kw: NS(**kw), 'math': math}
-  exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), 'exec'), ns)
-  return ns['rewards']
+  return load_config_factories()['unitree_g1_terrain_env_cfg']().rewards
 
 
 def apply_config(mdp):
@@ -45,13 +35,13 @@ def test_split_config_partitions_bodies_and_preserves_total_weights(mdp):
   assert 'motion_body_pos' not in terms and 'motion_body_ori' not in terms
   for suffix in ('pos', 'ori'):
     up, low = terms[f'motion_upper_body_{suffix}'], terms[f'motion_lower_body_{suffix}']
-    assert up.weight == low.weight == .5
+    assert up.weight == low.weight == 1.0
     assert up.params['tolerance'] == 0
     assert up.params['std'] == low.params['std']
   assert terms['motion_lower_body_pos'].params['tolerance'] == .05
   assert terms['motion_lower_body_ori'].params['tolerance'] == math.radians(10)
-  assert mdp.max_step_reward == pytest.approx(.1)
-  assert mdp.cfg.weights['feet_stumble'] == -2
+  assert mdp.max_step_reward == pytest.approx(.14)
+  assert mdp.cfg.weights['feet_stumble'] == -10
   assert mdp.cfg.weights['feet_at_plane'] == 0
 
 

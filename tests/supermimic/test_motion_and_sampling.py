@@ -2,8 +2,8 @@ from pathlib import Path
 
 import pytest
 import torch
-from supermimic.mdp.motion_lib import MotionLibrary, _resolve_motion_files
-from supermimic.mdp.rotations import mat_to_6d,mat_to_quat,so3_exp
+from supermimic.motion.motion_lib import MotionLibrary, _resolve_motion_files
+from supermimic.tools.rotations import mat_to_6d, mat_to_quat, so3_exp
 
 
 @pytest.mark.parametrize('as_string', [False, True])

@@ -21,8 +21,8 @@ from mjlab.utils.lab_api.math import (
 from mjlab.viewer.debug_visualizer import DebugVisualizer
 
 from ..terrain.reset import TerrainResetCfg, place_on_terrain
-from .motion_lib import MotionLibrary, MotionReference
-from .sampling import ReturnBasedSampler
+from ..motion.motion_lib import MotionLibrary, MotionReference
+from ..motion.sampling import ReturnBasedSampler
 
 if TYPE_CHECKING:
   from collections.abc import Callable

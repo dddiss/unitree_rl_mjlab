@@ -8,9 +8,9 @@ import mujoco
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src/tasks"))
-from supermimic.mdp.motion_lib import MotionLibrary
-from supermimic.mdp.kinematics import G1Kinematics
-from supermimic.mdp.functional import FunctionalMDP
+from supermimic.motion.motion_lib import MotionLibrary
+from supermimic.tools.kinematics import G1Kinematics
+from supermimic.core.functional import FunctionalMDP
 
 BODIES = ('pelvis', 'left_hip_roll_link', 'left_knee_link', 'left_ankle_roll_link',
           'right_hip_roll_link', 'right_knee_link', 'right_ankle_roll_link', 'torso_link',

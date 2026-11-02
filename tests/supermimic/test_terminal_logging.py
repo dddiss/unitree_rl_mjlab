@@ -98,6 +98,15 @@ def test_rewards_are_unscaled_and_termination_percentages_are_dynamic():
   assert "Termination/motion_end_fraction" not in render(values)
 
 
+def test_new_reward_prediction_loss_is_displayed_without_a_named_log_rule():
+  values = row()
+  values.update(wm_latent_loss=.1, wm_depth_loss=.2, wm_new_contact_loss=.3, wm_total_loss=.6)
+  text = render(values)
+  assert field(text, "Loss/wm_new_contact_loss") == "0.300000"
+  assert text.index("Loss/wm_depth_loss") < text.index("Loss/wm_new_contact_loss")
+  assert text.index("Loss/wm_new_contact_loss") < text.index("Loss/wm_total_loss")
+
+
 def test_missing_metrics_are_dashes_but_zero_remains_numeric():
   values = row()
   values.pop("wm_loss")

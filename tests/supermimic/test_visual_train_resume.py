@@ -1,8 +1,9 @@
 import csv
 import pytest
 import torch
+from supermimic.config.g1.rl_cfg import SuperMimicConfig, TerrainSuperMimicConfig
 from supermimic.rl.runner import SuperMimicRunner, PolicyController
-from supermimic.rl.evaluation import load_policy, evaluate, read_checkpoint_config
+from supermimic.playback.evaluation import load_policy, evaluate, read_checkpoint_config
 from supermimic.perception.history import select_history
 from test_train_resume_eval import TensorEnv
 from test_visual_algorithm import visual_config
@@ -11,6 +12,7 @@ from test_algorithm import small_config
 
 class VisualTensorEnv(TensorEnv):
   """Real learner/controller; deterministic depth stands in for GPU raycasting."""
+  depth_enabled=True
   def __init__(self,mdp):
     self.depth_image=torch.zeros(2,18,32,dtype=torch.uint8)
     super().__init__(mdp)
@@ -42,6 +44,7 @@ def test_visual_train_resume_and_evaluate(mdp,tmp_path):
   assert all(float(row['wm_depth_loss'])>0 and float(row['wm_latent_loss'])>0 for row in rows)
   checkpoint=tmp_path/'run/last.pt'
   saved=read_checkpoint_config(checkpoint)
+  assert type(saved) is TerrainSuperMimicConfig
   assert saved.depth_enabled and saved.wm_perception_lr==3e-4 and saved.latent_loss_weight==.3
   weights={k:v.clone() for k,v in runner.algorithm.policy.state_dict().items()}
   cfg.iterations=3
@@ -53,6 +56,7 @@ def test_visual_train_resume_and_evaluate(mdp,tmp_path):
   resumed.learn()
   assert resumed.iteration==3 and resumed.buffer.size>=cfg.warmup_steps
   policy,loaded,_=load_policy(checkpoint,VisualTensorEnv(mdp))
+  assert type(loaded) is TerrainSuperMimicConfig
   result=evaluate(VisualTensorEnv(mdp),policy,loaded)
   assert [r['steps'] for r in result['per_clip']]==[50,6]
 
@@ -73,24 +77,23 @@ def test_controller_repeated_calls_and_partial_reset_keep_visual_history(mdp):
   torch.testing.assert_close(windows[-1],select_history(controller.depth_history.data))
 
 
-def test_legacy_nonvisual_checkpoint_is_not_reinterpreted(mdp,tmp_path):
+def test_nonvisual_checkpoint_restores_explicit_depth_setting(mdp,tmp_path):
   cfg=small_config()
-  runner=SuperMimicRunner(TensorEnv(mdp),cfg,tmp_path/'old')
-  runner.save(tmp_path/'old.pt')
-  ck=torch.load(tmp_path/'old.pt',weights_only=False)
-  for key in list(ck['config']):
-    if key.startswith('depth_') or key.endswith('_perception_lr'):ck['config'].pop(key)
-  for key in ('opt_pi','opt_wm','opt_v'):
-    for group in ck['algorithm'][key]['param_groups']:group.pop('base_lr',None)
-  torch.save(ck,tmp_path/'old.pt')
-  assert read_checkpoint_config(tmp_path/'old.pt').depth_enabled is False
-  load_policy(tmp_path/'old.pt',TensorEnv(mdp))
+  runner=SuperMimicRunner(TensorEnv(mdp),cfg,tmp_path/'run')
+  runner.save(tmp_path/'nonvisual.pt')
+  loaded = read_checkpoint_config(tmp_path/'nonvisual.pt')
+  assert type(loaded) is SuperMimicConfig and loaded.depth_enabled is False
+  assert not hasattr(loaded, 'perception_class')
+  load_policy(tmp_path/'nonvisual.pt',TensorEnv(mdp))
+  with pytest.raises(ValueError, match="task's depth sensor"):
+    load_policy(tmp_path/'nonvisual.pt',VisualTensorEnv(mdp))
   restored=SuperMimicRunner(TensorEnv(mdp),cfg,tmp_path/'restored')
-  restored.load(tmp_path/'old.pt')
+  restored.load(tmp_path/'nonvisual.pt')
   assert restored.algorithm.set_lr(0)==cfg.lr
-  visual=SuperMimicRunner(VisualTensorEnv(mdp),visual_config(wm_batch=cfg.wm_batch,pi_batch=cfg.pi_batch),tmp_path/'visual')
+  # Keep the task identical to isolate the depth-structure mismatch on resume.
+  visual=SuperMimicRunner(VisualTensorEnv(mdp),visual_config(task_id=cfg.task_id,wm_batch=cfg.wm_batch,pi_batch=cfg.pi_batch),tmp_path/'visual')
   with pytest.raises(ValueError,match='depth_enabled'):
-    visual.load(tmp_path/'old.pt')
+    visual.load(tmp_path/'nonvisual.pt')
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(),reason='Requires mjlab 1.6 on Linux NVIDIA GPU')
@@ -102,7 +105,7 @@ def test_real_visual_environment_training_and_partial_reset(mdp,tmp_path):
   from src.tasks.supermimic.rl.runner import SuperMimicRunner as Runner
   cfg=visual_config(num_envs=4,wm_window=8,warmup_steps=16,iterations=2,wm_only_iters=1,
                     ckpt_every=1,log_every=1)
-  env=make_env(mdp.motion.motion_files,num_envs=4,depth_enabled=True)
+  env=make_env(mdp.motion.motion_files,num_envs=4)
   try:
     env.reset()
     assert env.depth_image.shape==(4,18,32) and env.depth_image.dtype==torch.uint8
@@ -118,7 +121,7 @@ def test_real_visual_environment_training_and_partial_reset(mdp,tmp_path):
   finally:env.close()
 
 
-def test_old_visual_checkpoint_rejected_for_resume_but_policy_still_loads(mdp,tmp_path):
+def test_old_visual_checkpoint_configuration_is_not_migrated(mdp,tmp_path):
   cfg=visual_config()
   runner=SuperMimicRunner(VisualTensorEnv(mdp),cfg,tmp_path/'run')
   path=tmp_path/'old_visual.pt'
@@ -131,7 +134,7 @@ def test_old_visual_checkpoint_rejected_for_resume_but_policy_still_loads(mdp,tm
   torch.save(ck,path)
   with pytest.raises(ValueError,match='Legacy visual checkpoint'):
     runner.load(path)
-  policy,config,_=load_policy(path,VisualTensorEnv(mdp))
-  assert config.depth_enabled
-  for key,value in runner.algorithm.policy.state_dict().items():
-    torch.testing.assert_close(policy.state_dict()[key],value)
+  with pytest.raises(TypeError,match='actor_perception_lr'):
+    read_checkpoint_config(path)
+  with pytest.raises(TypeError,match='actor_perception_lr'):
+    load_policy(path,VisualTensorEnv(mdp))

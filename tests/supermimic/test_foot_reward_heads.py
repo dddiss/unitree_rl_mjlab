@@ -5,18 +5,19 @@ import csv
 import pytest
 import torch
 
-from supermimic.config.g1.rl_cfg import SuperMimicConfig
-from supermimic.mdp.foot_rewards import FOOT_REWARD_NAMES
-from supermimic.mdp.state import unflatten_state, normalize_xi
+from supermimic.config.g1.rl_cfg import TerrainSuperMimicConfig
+from supermimic.core.components import prediction_bindings
+from supermimic.mdp.rewards import FOOT_REWARD_NAMES
+from supermimic.core.state import unflatten_state, normalize_xi
 from supermimic.rl.algorithm import SuperMimicAlgorithm, frozen
-from supermimic.rl import networks
+from supermimic.networks import auxiliary as networks
 from supermimic.rl.buffer import ReplayBuffer
-from supermimic.rl.networks import WorldModel
+from supermimic.networks import WorldModel
 from supermimic.rl.runner import SuperMimicRunner
 from test_algorithm import small_config, filled_buffer
 from test_train_resume_eval import TensorEnv
 from test_visual_algorithm import visual_config, visual_buffer
-from test_foot_rewards import sensor_configurator
+from test_env_cfg_layers import load_config_factories
 from test_logging_backend import sdk
 from types import SimpleNamespace as NS
 
@@ -24,7 +25,8 @@ from types import SimpleNamespace as NS
 def training_case(mdp, visual=False, **options):
   torch.set_num_threads(2)
   mdp.cfg.weights.update(feet_stumble=0., feet_at_plane=0.)
-  cfg = (visual_config if visual else small_config)(**options)
+  cfg = (visual_config(**options) if visual else
+         small_config(config_type=TerrainSuperMimicConfig, **options))
   alg = SuperMimicAlgorithm(mdp, cfg, 'cpu')
   _, transitions = (visual_buffer if visual else filled_buffer)(mdp, cfg)
   motion = mdp.motion
@@ -42,12 +44,12 @@ def training_case(mdp, visual=False, **options):
 @pytest.mark.parametrize('name,default', [('feet_stumble', 1.), ('feet_at_plane', 0.)])
 def test_cost_loss_weights_configurable_and_separate_from_reward_weights(name, default):
   field = name + '_loss_weight'
-  assert getattr(SuperMimicConfig(), field) == default
-  assert getattr(SuperMimicConfig(**{field: 0.}), field) == 0.
-  assert getattr(SuperMimicConfig(**{field: 1.}), field) == 1.
+  assert getattr(TerrainSuperMimicConfig(), field) == default
+  assert getattr(TerrainSuperMimicConfig(**{field: 0.}), field) == 0.
+  assert getattr(TerrainSuperMimicConfig(**{field: 1.}), field) == 1.
   for value in (-1., float('inf'), float('nan')):
     with pytest.raises(ValueError, match=field):
-      SuperMimicConfig(**{field: value})
+      TerrainSuperMimicConfig(**{field: value})
 
 
 def test_shared_head_branches_from_2048_features_with_two_raw_outputs():
@@ -261,16 +263,20 @@ def test_compiled_cost_rollout_matches_forward_and_parameter_gradients(mdp, visu
     torch.compiler.reset()
 
 
-def test_training_allocates_sensors_for_zero_weight_supervision():
-  cfg = NS(decimation=4, scene=NS(sensors=(), terrain=NS(terrain_type='generator')), rewards={
-    'feet_stumble': NS(weight=0., params={'sensor_name': 'stumble'}),
-    'feet_at_plane': NS(weight=0., params={'sensor_name': 'sole', 'contact_sensor_name': 'support'})})
-  sensor_configurator()(cfg, collect_foot_rewards=True)
-  assert {sensor.name for sensor in cfg.scene.sensors} == {'stumble', 'sole', 'support'}
-  cfg.scene.sensors = ()
+def test_explicit_sensors_keep_zero_weight_prediction_declarations():
+  cfg = load_config_factories()['unitree_g1_terrain_env_cfg'](collect_foot_rewards=True)
+  sensors = cfg.scene.sensors
+  for name in FOOT_REWARD_NAMES:
+    cfg.rewards[name].weight = 0.
+  bindings = prediction_bindings(cfg.rewards)
+  assert tuple(name for name, _, _ in bindings) == FOOT_REWARD_NAMES
+  for name, term, component in bindings:
+    assert component.prediction.loss_weight_field == name + '_loss_weight'
+    assert term.params['sensor_name'] in {sensor.name for sensor in sensors}
+  assert bindings[1][2].sense_before_reward
   del cfg.rewards['feet_stumble']
-  sensor_configurator()(cfg, collect_foot_rewards=True)
-  assert {sensor.name for sensor in cfg.scene.sensors} == {'sole', 'support'}
+  assert tuple(name for name, _, _ in prediction_bindings(cfg.rewards)) == ('feet_at_plane',)
+  assert cfg.scene.sensors is sensors
 
 
 class FootTensorEnv(TensorEnv):
@@ -299,8 +305,8 @@ def test_cost_heads_train_resume_and_log_to_csv_and_wandb(mdp, tmp_path, sdk):
       assert float(row['Reward/'+name]) == 0.
     assert float(row['wm_total_loss']) == pytest.approx(
       cfg.state_loss_weight * float(row['wm_loss'])
-      + cfg.feet_stumble_loss_weight * float(row['wm_feet_stumble_loss'])
-      + cfg.feet_at_plane_loss_weight * float(row['wm_feet_at_plane_loss']))
+      + runner.algorithm.reward_loss_weights['feet_stumble'] * float(row['wm_feet_stumble_loss'])
+      + runner.algorithm.reward_loss_weights['feet_at_plane'] * float(row['wm_feet_at_plane_loss']))
   saved = copy.deepcopy(runner.algorithm.wm.foot_head.state_dict())
   assert torch.load(tmp_path/'first/last.pt', weights_only=False)['format_version'] == 5
   cfg.iterations = 3
@@ -314,7 +320,7 @@ def test_cost_heads_train_resume_and_log_to_csv_and_wandb(mdp, tmp_path, sdk):
 
 
 def test_old_checkpoint_is_playable_but_cannot_silently_resume_without_cost_heads(mdp, tmp_path):
-  from supermimic.rl.evaluation import load_policy
+  from supermimic.playback.evaluation import load_policy
   cfg = small_config()
   old = SuperMimicRunner(TensorEnv(mdp), cfg, tmp_path/'old')
   old.save(tmp_path/'old.pt')

@@ -44,7 +44,7 @@ def test_native_and_viser_geometry_and_checkbox_defaults(monkeypatch):
 
   module.NativeMujocoViewer, module.ViserPlayViewer = Native, Viser
   monkeypatch.setitem(sys.modules, module.__name__, module)
-  classes = runpy.run_path(str(ROOT / 'src/tasks/supermimic/playback_viewer.py'))
+  classes = runpy.run_path(str(ROOT / 'src/tasks/supermimic/playback/playback_viewer.py'))
   native = classes['NativePlayViewer']()
   native.setup()
   assert tuple(native.viewer.opt.geomgroup) == mask

@@ -22,49 +22,68 @@ unitree_rl_mjlab/
 │       ├── g1/                       # LAFAN 格式 CSV 动作
 │       └── g1_npz/                   # 本文示例的 NPZ 输出根目录，可含子目录
 ├── src/tasks/supermimic/
-│   ├── env.py                       # 物理步进、transition 捕获与局部 reset
-│   ├── tracking_env_cfg.py           # 通用环境、奖励、终止和随机化配置
+│   ├── env.py                       # 物理步进、transition 捕获、局部 reset 与地形容忍标签
+│   ├── tracking_env_cfg.py          # 通用环境、奖励、终止和随机化模板
 │   ├── config/
-│   │   ├── __init__.py               # 环境创建工厂 make_env
+│   │   ├── __init__.py              # 按 task_id 创建环境
 │   │   └── g1/
-│   │       ├── env_cfgs.py           # G1 训练与评估环境配置
-│   │       ├── terrain_cfg.py        # P-BFM 六类混合地形与生成参数
-│   │       └── rl_cfg.py             # SuperMimicConfig 与算法默认参数
-│   ├── terrain/
-│   │   ├── primitives.py             # 六类地形的碰撞几何生成
-│   │   ├── pattern.py                # P-BFM reset 使用的 273 点查询网格
-│   │   ├── sensor.py                 # 地形射线与地图外围平地查询
-│   │   └── reset.py                  # 当地地面高度及周边高地抬升
-│   ├── perception/
-│   │   ├── camera.py                # 固定 G1 相机、mjlab raycast 与光轴深度
-│   │   ├── sensor.py                # 仅排除包围相机原点的头部可视外壳
-│   │   ├── preprocessing.py         # P-BFM G1 18×32 深度预处理
-│   │   └── history.py               # 逐步图像历史与间隔采样
-│   ├── mdp/
-│   │   ├── motion_lib.py             # 多 NPZ 加载、帧索引和 bin 划分
-│   │   ├── commands.py               # 参考目标、重置初始化与动作选择
-│   │   ├── sampling.py               # 基于回报的重置采样
-│   │   ├── state.py                  # 状态表达和仿真状态读取
-│   │   ├── rotations.py              # 可微旋转运算
-│   │   ├── kinematics.py             # 可微正向运动学 FK
-│   │   ├── functional.py             # 真实与想象轨迹共用的 MDP 计算
-│   │   ├── observations.py           # 观测管理器适配
-│   │   ├── rewards.py                # 奖励管理器适配
-│   │   ├── terminations.py           # 失败、时间上限与动作结束判据
-│   │   ├── logging_metrics.py        # 目标帧推进前的跟踪、奖励和终止快照
-│   │   └── metrics.py                # 跟踪指标
+│   │       ├── __init__.py          # 注册基础平地 / Terrain 两个任务
+│   │       ├── env_cfgs.py          # 共享 G1 装配与两套环境配置工厂
+│   │       ├── terrain_cfg.py       # 混合地形与生成参数
+│   │       └── rl_cfg.py            # 基础 SuperMimicConfig 及 TerrainSuperMimicConfig 子类
+│   ├── mdp/                        # 四类任务组件
+│   │   ├── commands.py             # 当前参考目标、重置与 GUI
+│   │   ├── observations.py         # 本体观测与参考目标
+│   │   ├── rewards.py              # 跟踪奖励、脚部原始惩罚及组件声明
+│   │   └── terminations.py         # 共享失败误差、硬终止及截断
+│   ├── core/
+│   │   ├── state.py                # 状态表达、打包与仿真状态读取
+│   │   ├── context.py              # StepContext：状态、参考与 FK 缓存
+│   │   ├── components.py           # 奖励、软/硬终止及预测标签契约
+│   │   └── functional.py           # 真实与想象共用的 MDP 组装
+│   ├── motion/
+│   │   ├── motion_lib.py           # 多 NPZ、帧索引及 bin
+│   │   └── sampling.py             # 回报采样、EMA 和概率上限
+│   ├── tools/
+│   │   ├── registry.py             # 独立任务注册与配置加载，不占用 PPO 任务名称
+│   │   ├── rotations.py            # 可微旋转运算
+│   │   └── kinematics.py           # 可微 FK
+│   ├── networks/
+│   │   ├── factory.py              # 训练、恢复、评估、播放统一网络构造
+│   │   ├── world_model.py          # 状态增量、ht 及奖励预测
+│   │   ├── policy.py               # Actor
+│   │   ├── critic.py               # Critic
+│   │   ├── normalization.py        # RunningNorm
+│   │   ├── depth_encoder.py        # 共享 CNN＋GRU
+│   │   ├── depth_decoder.py        # ht → 深度图
+│   │   └── auxiliary.py            # 公共 MLP、混合精度和预测输出范围
 │   ├── rl/
-│   │   ├── networks.py               # 世界模型、策略和 Critic 网络
-│   │   ├── depth_encoder.py          # 三份独立 CNN＋GRU 编码器
-│   │   ├── depth_decoder.py          # WM 预测特征 → 下一帧深度图
-│   │   ├── depth_buffer.py           # uint8 图像缓存与终止前下一帧
-│   │   ├── buffer.py                 # 经验池、WM 窗口和想象起点采样
-│   │   ├── algorithm.py              # WM 更新、策略 BPTT 和 Critic 更新
-│   │   ├── runner.py                 # 采集、更新调度、日志与 checkpoint
-│   │   ├── metrics.py                # 区间指标聚合与采样诊断
-│   │   ├── logging.py                # CSV 与 W&B 写入、资源关闭
-│   │   └── evaluation.py             # 逐动作评估与播放支持
-│   └── doc/supermimic.md             # 本文档
+│   │   ├── algorithm.py            # 学习器装配、优化器与编译入口
+│   │   ├── runner.py               # 采集、更新调度、日志与 checkpoint
+│   │   ├── buffer.py               # ReplayBuffer＋DepthReplay：状态/图像缓存与采样
+│   │   ├── replay_schema.py        # 预测标签顺序与监督损失字段
+│   │   ├── wm_trainer.py           # WM 自回归与监督损失
+│   │   ├── imagination.py          # 想象单步、奖励和软终止
+│   │   ├── policy_trainer.py       # Actor BPTT 和 λ-return
+│   │   ├── critic_trainer.py       # 批量 Critic 前向与更新
+│   │   ├── optim.py                # 参数分组与冻结
+│   │   └── logging.py              # 步级快照、区间聚合、终端/CSV/W&B
+│   ├── playback/
+│   │   ├── evaluation.py           # 逐动作评估、播放适配与 MP4 导出
+│   │   └── playback_viewer.py      # Native/Viser 显示配置
+│   ├── perception/
+│   │   ├── camera.py               # G1 深度相机
+│   │   ├── sensor.py               # 相机外壳过滤
+│   │   ├── preprocessing.py        # 18×32 深度预处理
+│   │   └── history.py              # 逐步图像历史与间隔采样
+│   ├── terrain/
+│   │   ├── primitives.py           # 地形碰撞几何
+│   │   ├── heightmap.py            # 启动建图、CPU 复核、运行时查表
+│   │   ├── reset.py                # 周边采样网格、当地高度、抬升及 XY 放置
+│   │   └── foot_sensor.py          # 足底高度扫描
+│   └── doc/
+│       ├── supermimic.md           # 本文档
+│       └── components.md           # 新增组件、任务和替换网络的方法
 └── logs/supermimic/<run>/            # 运行时生成
     ├── config.json                  # 本次训练配置
     ├── motions.json                 # 动作库清单
@@ -75,6 +94,10 @@ unitree_rl_mjlab/
 ```
 
 算法和网络默认参数定义在 `src/tasks/supermimic/config/g1/rl_cfg.py`；机器人与评估环境配置定义在同目录的 `env_cfgs.py`。SuperMimic 的播放入口为 `scripts/play_supermimic.py`；原有 PPO tracking 使用 `scripts/train.py` 和 `scripts/play.py`，两套入口的 checkpoint 格式不同。
+
+`rl/buffer.py` 中保留两个类：`ReplayBuffer` 管理 transition 和采样，`DepthReplay` 管理 uint8 深度图、终止前下一帧和图像历史。无感知模式不创建图像缓存；带感知模式由 `ReplayBuffer` 按需创建 `DepthReplay`。
+
+增加奖励、终止条件或替换网络请参阅 [组件扩展说明](components.md)。已有默认参数、奖励权重、训练更新顺序和 `k→k+1` 参考时序均保持原样。
 
 ## 2. 动作准备与加载
 
@@ -199,22 +222,24 @@ python scripts/csv_to_npz_multi.py \
 
 ## 3. 训练、恢复与日志
 
-地形在 `src/tasks/supermimic/config/g1/terrain_cfg.py` 中配置。当前默认
-`G1_TERRAIN_MODE = "mixed"`，训练、评估和播放共用这份环境工厂；已有平地
-checkpoint 需要在平地评估时，应先将它改为 `"plane"`。也支持单独选择
-`flat`、`slope`、`stairs_up`、`stairs_down`、`rough`、`platforms`。
-`flat` 是有限大小的平地地图，`plane` 是原有平面环境。Python 工厂还支持
-`make_env(..., terrain_type="plane")`；本次没有增加命令行地形选项。
+同一训练入口支持两套环境配置：
 
-混合地形采用 P-BFM G1 的 10 行 × 6 列相连地图，每块 8×8 米，外围平地宽
-17 米，固定生成种子 0。六类地形的环境分配权重依次为
-15%、15%、20%、20%、15%、15%；每列一种地形，每行一个难度范围，不会给
-每个环境单独生成整张地图。坡度 5～8°，台阶高度 0.10～0.20 米、深度
-0.30 米、10 级；粗糙地形幅度 0.03～0.05 米，平台高度随难度由
-0.05～0.10 米过渡到 0.10～0.18 米。`curriculum=True` 在这里用于按行排列
-生成难度，没有加入运行期间升降难度的课程事件。
+| 训练参数 | 环境与网络 |
+|---|---|
+| `--task Unitree-G1-SuperMimic-Terrain` | 当前分支的地形、奖励及共享感知网络，默认选择 |
+| `--task Unitree-G1-SuperMimic` | main 分支的平面环境、原有 8 项奖励、无深度输入和奖励预测头 |
 
-reset 仍按原方式选择动作帧 k、XY、姿态、速度和关节扰动。仅根高度改为：
+使用 `--task Unitree-G1-SuperMimic` 选择原 main 的无感知平地配置，Terrain 任务在环境工厂中显式创建深度传感器。统一使用 `--task` 指定完整任务名称。新训练未指定任务时使用 `unitree_g1_terrain_runner_cfg()` 的任务，恢复未指定任务时使用 checkpoint 的任务。不再提供 `--depth-enabled` / `--no-depth-enabled`；传感器由具体任务的 `cfg.scene.sensors` 决定，训练入口据此设置网络配置中的 `depth_enabled`。
+
+`config/g1/rl_cfg.py` 中，`SuperMimicConfig` 只定义普通无感知训练与通用算法参数，基础任务为 `Unitree-G1-SuperMimic`、`depth_enabled=False`。`TerrainSuperMimicConfig(SuperMimicConfig)` 继承这些参数，将任务与感知模式设为 Terrain / True，并增加感知网络、深度历史、感知学习率、表征/深度重建及脚部预测损失配置。两个工厂分别返回基础类和 Terrain 子类的新实例。共享超参数在基础类中修改，地形感知专属参数在子类中修改；普通配置不再包含未使用的感知字段。
+
+配置保存会包含所选具体类的全部字段。恢复、评估和播放按保存的 `task_id` 查找注册工厂并恢复相同的配置类，因此 Terrain 的专属参数不会丢失，也不会被加入普通任务。默认任务、命令行覆盖和恢复时的参数优先级保持不变。
+
+`tools/registry.py` 保存环境工厂与训练配置工厂的对应关系；G1 的两个任务在 `config/g1/__init__.py` 注册。新增机器人或任务时注册其工厂即可，训练器不按任务名字分支。
+
+terrain 配置的地形在 `config/g1/terrain_cfg.py` 中选择。`mixed` 使用其中实际启用的类型；当前文件启用了 `flat`、`stairs_down`，其他类型保留为注释配置。各类型 `proportion` 归一化后决定训练环境的类型分配；10 行难度、每种类型一列，每块 8×8 米，外围平地宽 17 米。`curriculum=True` 用于按行排列生成难度，没有运行中升降难度的课程事件。`flat` 是有限平地地图，`plane` 是原有平面。Python 工厂支持 `terrain_type="plane"` 或当前启用的某种地形名，不新增命令行地形选项。
+
+地形高度图在环境启动时从实际碰撞模型构建，默认间隔 0.025 m，射线漏检点由 CPU MuJoCo 复核，不做高斯平滑；reset 与参考 anchor 高度在运行中查表。训练 reset 在所属地形块内选择有效 XY，将机器人和整条参考同步平移；不旋转航向，不改变参考速度。姿态、速度、关节和 Z 扰动仍使用现有配置，根高度为：
 
 ```text
 期望离地高度 = 参考动作 k 的根高度 + 原有 Z 扰动
@@ -223,27 +248,34 @@ reset 仍按原方式选择动作帧 k、XY、姿态、速度和关节扰动。�
          = 周边最高地面 − 根下方地面 + 0.05 m  （高度差 > 1e-4 m）
 ```
 
-周边采用 P-BFM 的前后不对称 273 点地形射线网格，取其中距根水平距离
-不超过 0.65 米的有效点。查询只命中地形，不命中机器人；射线从整张地图
-最高碰撞几何上方 1.5 米发出。这里只用来放置 reset 状态，不添加策略
-观测或可微高度图。局部 reset 仅写入指定环境，目标仍为 k+1，深度历史在
-最终放置并刷新后初始化。平面模式保留原来的 reset 路径。
+周边采用 P-BFM 的前后不对称 273 点网格，取距根水平距离不超过 0.65 米的有效高度图样本。局部 reset 只写入指定环境，目标仍为 k+1，深度历史在最终放置并刷新后初始化。播放和独立评估沿用各自的 XY 放置流程。
 
-**这一步仅迁入地形与 reset 高度，奖励和终止仍采用当前的平地参考定义。**
-参考 NPZ、参考身体位置及其高度没有随地形重定向；因此跨台阶时仍可能因
-原有高度误差终止，不能将这一步视作已经完成地形奖励适配。地图有边界，
-reset XY 若落在地图外会明确报错，不会自动裁剪 XY 或更换动作帧。
-P-BFM 的区域采样、额外随机航向和躺姿 reset 没有加入。
+terrain 配置保留当前的上下肢奖励与地形容忍规则。高度终止使用“参考 anchor Z + 平移后参考 XY 下方的地形高度”，阈值 0.25 m；该高度修正不用于位置奖励或参考速度。经验池继续保存环境原点和本回合 XY 平移量，想象展开沿参考路径查询同一高度图。main 配置使用原有平地参考。
 
 ### 3.1 开始训练
+
+当前带感知地形训练（默认可省略 `--task`）：
 
 ```bash
 python scripts/train_supermimic.py \
   --motion-file src/assets/motions/g1_npz \
+  --task Unitree-G1-SuperMimic-Terrain \
   --log-dir logs/supermimic \
   --run-name g1 \
   --device cuda:0
 ```
+
+main 无感知平地训练：
+
+```bash
+python scripts/train_supermimic.py \
+  --motion-file src/assets/motions/g1_npz \
+  --task Unitree-G1-SuperMimic \
+  --run-name g1_main \
+  --device cuda:0
+```
+
+恢复、评估和播放读取 checkpoint 保存的 `task_id`、感知开关与网络类型。恢复时必须保持任务和网络结构一致；切换任务或网络应启动新训练。当前配置使用重构后的模块路径，不再转换旧 checkpoint 的配置字段或类路径。
 
 训练默认同时记录本地 CSV 和在线 W&B，请先配置 W&B 登录；不需要在线记录时添加 `--logger csv`，或使用 `--wandb-mode offline` 离线记录。配置与动作清单仍保存在本地 JSON。`--motion-file` 也可以直接指定一个 NPZ。常用参数如下，未传入时采用 `config/g1/rl_cfg.py` 的默认值：
 
@@ -267,29 +299,29 @@ python scripts/train_supermimic.py \
 | `--log-every` / `--ckpt-every` | 50 / 2000 | 日志记录 / checkpoint 保存间隔，单位为迭代 |
 | `--amp none` | 默认 `bf16` | 关闭网络 BF16 混合精度 |
 | `--no-compile` | 默认开启编译 | 关闭 `torch.compile` |
-| `--no-depth-enabled` | 默认启用视觉 | 新训练使用无视觉网络；恢复默认遵循 checkpoint |
 
 新训练默认启用视觉 SuperMimic。Actor、WM、Critic 共享同一份 CNN＋GRU，输出历史表征 `h`；共享参数只由 WM 优化器更新。Actor 的动作参考编码器仍为 `640→32`，视觉 latent 接入动作解码器。默认 Actor 解码器输入 1218 维、WM 输入 389 维、Critic 输入 1103 维。数值观测继续使用原来的 RunningNorm；图像归一化到 `[0,1]`，视觉 latent 不加入数值 RunningNorm。
 
-相机使用 P-BFM G1 的固定安装位姿和光轴深度定义，原图 `36×64`，距离上限 2.5 m，裁剪、Gaussian blur 后得到 `18×32`。当前接入固定外参、零传感器延迟，不增加相机随机化，也不改变已有机器人随机化。图像每个控制步采集，历史按 `35、30、25、20、15、10、5、0` 的年龄选出 8 帧（50 Hz 时覆盖 0.7 s）。因此零延迟实现保留 36 帧即可；P-BFM 用于容纳额外 1 帧延迟的第 37 帧不在本次输入中。相机参数在 `perception/camera.py` 的 `DepthCameraCfg` 定义，由 G1 环境工厂接入。
+相机使用 P-BFM G1 的固定安装位姿和光轴深度定义，原图 `36×64`，距离上限 2.5 m，裁剪、Gaussian blur 后得到 `18×32`。当前接入固定外参、零传感器延迟，不增加相机随机化，也不改变已有机器人随机化。图像每个控制步采集，历史按 `35、30、25、20、15、10、5、0` 的年龄选出 8 帧（50 Hz 时覆盖 0.7 s）。因此零延迟实现保留 36 帧即可；P-BFM 用于容纳额外 1 帧延迟的第 37 帧不在本次输入中。相机参数在 `perception/camera.py` 的 `DepthCameraCfg` 定义，由 `unitree_g1_terrain_env_cfg()` 显式添加 `DepthCameraCfg().sensor_cfg()`；公共 G1 工厂和 `unitree_g1_env_cfg()`均不创建深度传感器。环境从传感器配置读取同一份相机标定，不再另传相机开关或相机配置。
 
 当前 G1 的相机原点位于 `head_link` 可视网格内部，因此沿用 P-BFM 的外壳排除方式：把这个可视网格划入射线不读取的 group 4，避免整幅图只看到相机自身外壳。其他身体仍可被相机看到，`contype`、`conaffinity` 等碰撞参数保持不变，也不修改机器人 XML 文件。
 
-感知结构和优化参数均在 `config/g1/rl_cfg.py` 修改：
+感知结构和优化参数在 `config/g1/rl_cfg.py` 的 `unitree_g1_terrain_runner_cfg()` 中显式设置，当前值如下：
 
 ```python
-depth_enabled: bool = True
-depth_frames: int = 8
-depth_skip: int = 5
-depth_frame_dim: int = 256
-depth_latent_dim: int = 256
-wm_perception_lr: float = 2e-4
-depth_decoder_lr: float = 2e-4
-state_loss_weight: float = 1.0
-latent_loss_weight: float = 1.0
-depth_loss_weight: float = 1.0
-depth_checkpoint: bool = True
-depth_batch_size: int = 256
+cfg.depth_frames = 8
+cfg.depth_skip = 5
+cfg.depth_frame_dim = 256
+cfg.depth_latent_dim = 256
+cfg.wm_perception_lr = 2e-4
+cfg.depth_decoder_lr = 2e-4
+cfg.state_loss_weight = 1.0
+cfg.latent_loss_weight = 1.0
+cfg.depth_loss_weight = 1.0
+cfg.feet_stumble_loss_weight = 1.0
+cfg.feet_at_plane_loss_weight = 0.0
+cfg.depth_checkpoint = False
+cfg.depth_batch_size = 256
 ```
 
 共享感知和 Decoder 的学习率独立于 `--lr`，沿用相同的余弦衰减倍率；Actor/Critic 优化器仅包含各自的非共享参数。CNN 通道为 `16→32→64`、步长为 `1→2→1`，池化到 `2×4` 后投影到 256 维，单层 GRU 输出 256 维，对齐 P-BFM 的最终 G1 配置。`depth_checkpoint` 表示反向传播时重新计算视觉激活以节省显存，不是模型保存开关；`depth_batch_size` 限制单次编码的样本数，展开后的批量解码最多每块处理 `depth_batch_size × depth_frames` 张图，不改变学习器 batch 或更新次数。当前 BF16 设置用于原有 MLP，深度 CNN、GRU、解码器及图像缓存计算采用 FP32/uint8。
@@ -300,11 +332,11 @@ Actor 的想象展开同样直接递推 `h`，全程不解码图像、不重新�
 
 WM 总损失为 `state_loss_weight × 状态损失 + latent_loss_weight × 表征一致性损失 + depth_loss_weight × 深度损失`，三个权重均可设为非负值。状态误差缩放保持原样；表征误差对 latent 维度求 MSE，深度误差对归一化图像像素求 MSE，然后各自按现有终止掩码对有效时间步求和、对 batch 求平均。终止那一步包含真实下一帧，其后跨 episode 的数据不参与损失。日志新增 `Loss/wm_latent_loss`；分项日志是未乘权重且除以窗口长度的值，`Loss/wm_total_loss` 使用加权总和。奖励、终止阈值、采样算法、Actor 损失除以固定 horizon 和 motion end 自举方式保持不变。
 
-新视觉 checkpoint 使用格式 3。旧视觉 checkpoint 的 WM 输出代表图像解码中间变量，无法直接恢复为历史表征预测，因此需要重新训练；旧策略仍可用于播放和评估。无视觉 checkpoint 的兼容方式不变。
+checkpoint 同时记录网络类、输入维度和奖励监督标签顺序，恢复时检查一致性；保留原参数键名。含共享奖励预测头的格式为 5；无该预测头的共享视觉格式为 3，无感知格式为 1。更早的独立感知/独立奖励预测头版本仍只能按原约定播放，不能恢复为当前学习器。
 
 经验池每条 transition 只存一张当前 uint8 深度图；普通下一帧由相邻记录复用，终止前下一帧另存在可回收池中，最新 transition 的下一帧暂存。历史不跨 reset 或环形覆盖边界；缺少历史时重复最早可用的同回合图像。4096 环境、1000 步的主图像缓存约 2.20 GiB，此外还有终止图像、索引、网络和反向传播开销；该数值不是总显存，4096 环境下的峰值需在实际 GPU 上测量。首次运行可先降低 `--num-envs`、`--wm-batch`、`--pi-batch` 检查实际资源占用。
 
-本次默认场景仍为原有平地，未新增地形生成器或避障奖励。视觉网络接入并不等同于已经完成地形适应训练。
+配置中注册的传感器奖励还会自动追加对应的原始标量预测损失。`reward_loss_weights` 可按奖励名覆盖其监督权重；奖励本身的权重仍在环境配置中，二者独立。将预测损失设为 0 不会关闭想象奖励；关闭奖励应删除配置项或将奖励权重设为 0。
 
 动作探索的环境比例直接在 `src/tasks/supermimic/config/g1/rl_cfg.py` 中配置，不新增命令行参数：
 
@@ -371,11 +403,11 @@ python scripts/train_supermimic.py \
 
 无视觉 Critic 已移除独立重复的 6 维根相对朝向，并加入 29 维上一动作（无历史）；未来参考目标中的朝向保留，无视觉 Critic 输入为 847 维，视觉版加自己的 256 维图像 latent。此前 824 维 Critic 的 checkpoint 不能直接完整恢复训练。
 
-视觉 checkpoint 保存共享 CNN＋GRU、WM、Actor、Critic、深度解码器及优化器状态。恢复仍重新填充经验池和历史，不保存图像经验池。新视觉训练只能从格式 3 的兼容 checkpoint 恢复；旧视觉策略仍可评估和播放。旧 checkpoint 缺少 `depth_enabled` 时按无视觉版加载，可以继续原有评估、播放与兼容架构的恢复训练；不能把旧模型直接当作视觉模型恢复。评估和播放会在创建环境前读取 checkpoint 配置，自动决定是否加载深度传感器。
+视觉 checkpoint 保存共享 CNN＋GRU、WM、Actor、Critic、深度解码器及优化器状态。恢复仍重新填充经验池和历史，不保存图像经验池。恢复要求 checkpoint 的网络结构与当前配置一致；评估和播放按保存的 `task_id` 选择环境，深度传感器由该任务工厂创建。`depth_enabled` 继续保存为网络结构信息，加载策略时检查它与环境的实际传感器一致。加载直接使用当前格式的配置，不再迁移旧 checkpoint 中的废弃字段，也不再根据缺失的视觉字段推断历史任务。
 
-恢复时可覆盖总迭代数、环境数量、缓存容量、日志/保存周期、初始填充步数、预热开关、编译/精度配置，以及第 3.4 节中的全部 W&B/日志选项；`collect_det_frac` 和 `bin_ema` 始终读取当前 `rl_cfg.py`。其余算法与网络配置应保持 checkpoint 原值。省略参数时沿用 checkpoint 的设置，旧 checkpoint 没有的新日志选项使用当前默认值。
+恢复时可覆盖总迭代数、环境数量、缓存容量、日志/保存周期、初始填充步数、预热开关、编译/精度配置，以及第 3.4 节中的全部 W&B/日志选项；`collect_det_frac` 和 `bin_ema` 始终读取当前 `rl_cfg.py`。其余算法与网络配置应保持 checkpoint 原值。省略参数时沿用 checkpoint 的设置。
 
-每次启动训练（包括恢复）都生成新的带时间戳的实验目录和独立 W&B run，CSV 写入新目录，训练迭代从断点继续，并记录恢复来源 checkpoint 和起始迭代。配置和 checkpoint 保留日志根目录及基础名称，不保存自动追加的后缀，因此恢复时不会叠加旧时间戳。旧 checkpoint 的非空 `wandb_name` 会映射为基础 `run_name`；旧 `log_dir` 按保存值作为新日志根目录，命令行仍可覆盖。
+每次启动训练（包括恢复）都生成新的带时间戳的实验目录和独立 W&B run，CSV 写入新目录，训练迭代从断点继续，并记录恢复来源 checkpoint 和起始迭代。配置和 checkpoint 保留日志根目录 `log_dir` 及基础名称 `run_name`，不保存自动追加的后缀，因此恢复时不会叠加旧时间戳，命令行仍可覆盖。
 
 ### 3.4 日志、W&B 与终端输出
 
@@ -411,7 +443,7 @@ W&B 将网络损失统一归入 `Loss/`：`Loss/wm_loss`、`Loss/wm_err_last`（
 | `Tracking/error_anchor_pos`、`error_anchor_rot`、`error_anchor_lin_vel`、`error_anchor_ang_vel` | 锚点位置、姿态、线速度、角速度误差；按记录区间的环境控制步求平均 |
 | `Tracking/error_body_pos`、`error_body_rot`、`error_body_lin_vel`、`error_body_ang_vel` | 跟踪身体对应误差；先在身体间求平均，再按环境控制步平均 |
 | `Tracking/error_joint_pos`、`error_joint_vel` | 整条关节位置或速度误差向量的 L2 范数，非逐关节 RMSE |
-| `Reward/<奖励项>` | 当前 8 项奖励贡献按环境控制步平均后除以 `step_dt`，跟踪奖励的显示上限为对应权重；各项之和乘以 `step_dt` 等于原始平均单步奖励，实际训练奖励不变 |
+| `Reward/<奖励项>` | 当前启用的奖励贡献按环境控制步平均后除以 `step_dt`，跟踪奖励的显示上限为对应权重；各项之和乘以 `step_dt` 等于原始平均单步奖励，实际训练奖励不变 |
 | `Termination/<原因>_fraction` | `time_out`、`motion_end`、`anchor_pos`、`anchor_ori` 各原因占区间内结束 episode 的比例，不记录各原因的次数 |
 | `Episode/completed`、`return_raw`、`length_seconds` | 结束回合数、原始累计回报均值和实际回合时长均值；按结束的回合数加权 |
 | `Sampling/entropy`、`top1_prob`、`top1_bin` | 当前 bin 采样分布的归一化熵、最大概率、对应整数 bin ID |

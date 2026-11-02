@@ -7,10 +7,9 @@ import torch
 import mujoco
 import numpy as np
 
-from supermimic.mdp.foot_rewards import (
-  clipped_height_clearance, feet_at_plane_penalty, feet_stumble_penalty, fixed_sole_weights,
-)
+from supermimic.mdp.rewards import clipped_height_clearance, feet_at_plane_penalty, feet_stumble_penalty, fixed_sole_weights
 from test_env_lifecycle import ROOT
+from test_env_cfg_layers import load_config_factories
 
 
 def test_stumble_threshold_vertical_support_peak_and_cap():
@@ -94,39 +93,29 @@ def test_manager_adapters_reorder_contact_bodies_and_handle_ray_misses():
       ns[name](env)
 
 
-def sensor_configurator():
-  path = ROOT / 'src/tasks/supermimic/config/g1/env_cfgs.py'
-  func = next(n for n in ast.parse(path.read_text()).body
-              if isinstance(n, ast.FunctionDef) and n.name == 'configure_foot_reward_sensors')
-  func.body = [n for n in func.body if not isinstance(n, ast.ImportFrom)]
-  ns = {name: NS for name in ('ContactSensorCfg', 'ContactMatch', 'GridPatternCfg',
-                              'ObjRef', 'WorldUpTerrainHeightSensorCfg')}
-  exec(compile(ast.fix_missing_locations(ast.Module(body=[func], type_ignores=[])), str(path), 'exec'), ns)
-  return ns[func.name]
-
-
-@pytest.mark.parametrize('stumble', [False, True])
-@pytest.mark.parametrize('support', [False, True])
-@pytest.mark.parametrize('terrain', ['plane', 'generator'])
-def test_only_enabled_costs_allocate_correct_sensors(stumble, support, terrain):
-  cfg = NS(decimation=4, scene=NS(sensors=(), terrain=NS(terrain_type=terrain)), rewards={
-    'feet_stumble': NS(weight=-2. if stumble else 0., params={'sensor_name': 'stumble'}),
-    'feet_at_plane': NS(weight=-1. if support else 0., params={
-      'sensor_name': 'sole', 'contact_sensor_name': 'support'})})
-  sensor_configurator()(cfg)
+@pytest.mark.parametrize('play', [False, True])
+@pytest.mark.parametrize('collect', [False, True])
+@pytest.mark.parametrize('terrain', ['plane', 'mixed'])
+def test_terrain_factory_explicitly_defines_foot_sensors(play, collect, terrain):
+  cfg = load_config_factories()['unitree_g1_terrain_env_cfg'](
+    play=play, terrain_type=terrain, collect_foot_rewards=collect)
   sensors = {s.name: s for s in cfg.scene.sensors}
-  assert set(sensors) == ({'stumble'} if stumble else set()) | ({'sole', 'support'} if support else set())
-  if stumble:
-    s = sensors['stumble']
-    assert s.global_frame and s.reduce == 'maxforce' and s.num_slots == 2 and s.history_length == 4
-    assert s.fields == ('force', 'normal', 'tangent')
-  if support:
-    s = sensors['sole']
-    assert sensors['support'].reduce == 'netforce' and sensors['support'].history_length == 4
-    assert [f.name for f in s.frame] == ['left_ankle_roll_link', 'right_ankle_roll_link']
-    assert s.include_geom_groups == ((5,) if terrain == 'generator' else (0,))
-    assert s.ray_alignment == 'base' and s.local_center == (.025, 0., -.045)
-    assert s.pattern.size == (.23, .04) and s.pattern.resolution == .01
+  assert set(sensors) == {'self_collision', 'supermimic_depth', 'foot_collision_contacts',
+                          'foot_support_contacts', 'foot_height_scanners'}
+  s = sensors['foot_collision_contacts']
+  assert s.global_frame and s.reduce == 'maxforce' and s.num_slots == 2 and s.history_length == 4
+  assert s.fields == ('force', 'normal', 'tangent')
+  assert s.name == cfg.rewards['feet_stumble'].params['sensor_name']
+  support = sensors['foot_support_contacts']
+  assert support.reduce == 'netforce' and support.history_length == 4
+  assert support.name == cfg.rewards['feet_at_plane'].params['contact_sensor_name']
+  s = sensors['foot_height_scanners']
+  assert s.name == cfg.rewards['feet_at_plane'].params['sensor_name']
+  assert [f.name for f in s.frame] == ['left_ankle_roll_link', 'right_ankle_roll_link']
+  assert s.include_geom_groups == ((5,) if terrain == 'mixed' else (0,))
+  assert s.ray_alignment == 'base' and s.local_center == (.025, 0., -.045)
+  assert s.pattern.size == (.23, .04) and s.pattern.resolution == .01
+  assert s.ray_start_height == 20. and s.max_distance == 25. and not s.debug_vis
 
 
 def test_world_down_scanner_preserves_rotated_sole_points_and_refreshes_cache():
@@ -182,11 +171,9 @@ def test_world_down_scanner_preserves_rotated_sole_points_and_refreshes_cache():
 def test_real_foot_sensors_reward_logging_and_local_reset(mdp):
   import sys
   sys.path.insert(0, str(ROOT))
-  from src.tasks.supermimic.config.g1.env_cfgs import (
-    configure_foot_reward_sensors, unitree_g1_flat_tracking_env_cfg,
-  )
+  from src.tasks.supermimic.config.g1.env_cfgs import unitree_g1_terrain_env_cfg
   from src.tasks.supermimic.env import SuperMimicEnv
-  cfg = unitree_g1_flat_tracking_env_cfg(play=True, terrain_type='plane', collect_foot_rewards=True)
+  cfg = unitree_g1_terrain_env_cfg(play=True, terrain_type='plane', collect_foot_rewards=True)
   cfg.scene.num_envs = 4
   cfg.sim.nconmax, cfg.sim.njmax = 128, 512
   cfg.commands['motion'].motion_files = tuple(mdp.motion.motion_files)

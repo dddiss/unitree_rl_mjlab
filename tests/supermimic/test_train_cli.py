@@ -1,5 +1,5 @@
 """Exercise training argument/config merging without requiring a GPU environment."""
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
 import runpy
@@ -11,12 +11,21 @@ import pytest
 import torch
 
 from supermimic.config.g1 import rl_cfg
+from supermimic.tools import registry
 from supermimic.rl.logging import TrainingLogger
+
+
+@pytest.fixture(autouse=True)
+def registry_for_cli(monkeypatch):
+  # The CPU suite imports the standalone package without invoking the PPO registry.
+  monkeypatch.setitem(sys.modules, "src.tasks.supermimic.tools.registry", registry)
 
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts/train_supermimic.py"
 START_TIME = datetime(2026, 10, 24, 18, 30, 45, 123456)
 STAMP = START_TIME.strftime("%Y%m%d_%H%M%S_%f")
+BASE_TASK = "Unitree-G1-SuperMimic"
+TERRAIN_TASK = "Unitree-G1-SuperMimic-Terrain"
 
 
 @pytest.mark.parametrize("saved_setting,flags,expected", [
@@ -31,7 +40,7 @@ STAMP = START_TIME.strftime("%Y%m%d_%H%M%S_%f")
 ])
 def test_warmup_cli_defaults_and_resume_overrides(tmp_path, monkeypatch, saved_setting, flags, expected):
   captured = {}
-  env = SimpleNamespace(close=lambda: captured.update(closed=True))
+  env = SimpleNamespace(depth_enabled=True, close=lambda: captured.update(closed=True))
 
   class Runner:
     def __init__(self, environment, cfg, log_dir):
@@ -62,7 +71,7 @@ def test_warmup_cli_defaults_and_resume_overrides(tmp_path, monkeypatch, saved_s
   args = [str(SCRIPT), "--motion-file", str(tmp_path / "motions"),
           "--log-dir", str(tmp_path / "run"), "--device", "cpu", *flags]
   if saved_setting is not None:
-    saved = asdict(rl_cfg.SuperMimicConfig())
+    saved = asdict(rl_cfg.unitree_g1_terrain_runner_cfg())
     saved["warmup_steps"] = 17
     if saved_setting == "legacy":
       saved.pop("enable_warmup")
@@ -90,6 +99,8 @@ def test_warmup_cli_help():
   assert "initial replay filling always runs" in " ".join(result.stdout.split())
   assert "--collect-det-frac" not in result.stdout
   assert "--bin-ema" not in result.stdout
+  assert "--task" in result.stdout and "--profile" not in result.stdout
+  assert "--depth-enabled" not in result.stdout and "--no-depth-enabled" not in result.stdout
   for option in ("--log-dir", "--run-name", "--logger", "--wandb-project", "--wandb-entity",
                  "--wandb-name", "--wandb-mode"):
     assert option in result.stdout
@@ -99,6 +110,7 @@ def test_warmup_cli_help():
 def logging_cli(tmp_path, monkeypatch):
   captured = {"events": []}
   env = SimpleNamespace(close=lambda: captured["events"].append("env.close"))
+  terrain_defaults = rl_cfg.unitree_g1_terrain_runner_cfg
 
   def run(flags=(), saved=None, fail_at=None, factory_settings=None, use_logging_backend=False,
           start_time=START_TIME):
@@ -142,15 +154,19 @@ def logging_cli(tmp_path, monkeypatch):
           raise RuntimeError("close failed")
 
     config_module = ModuleType("src.tasks.supermimic.config")
-    config_module.make_env = lambda *args, **kwargs: env
+    def make_env(*args, **kwargs):
+      captured["env_kwargs"] = kwargs
+      env.depth_enabled = kwargs['task_id'] != BASE_TASK
+      return env
+    config_module.make_env = make_env
     runner_module = ModuleType("src.tasks.supermimic.rl.runner")
     runner_module.SuperMimicRunner = Runner
     monkeypatch.setitem(sys.modules, config_module.__name__, config_module)
     monkeypatch.setitem(sys.modules, "src.tasks.supermimic.config.g1.rl_cfg", rl_cfg)
     monkeypatch.setitem(sys.modules, runner_module.__name__, runner_module)
     if factory_settings is not None:
-      monkeypatch.setattr(rl_cfg, "unitree_g1_supermimic_runner_cfg",
-                          lambda: rl_cfg.SuperMimicConfig(**factory_settings))
+      monkeypatch.setattr(rl_cfg, "unitree_g1_terrain_runner_cfg",
+                          lambda: replace(terrain_defaults(), **factory_settings))
     monkeypatch.setattr(sys, "path", list(sys.path))
     args = [str(SCRIPT), "--motion-file", str(tmp_path / "motions"),
             "--device", "cpu", *flags]
@@ -167,12 +183,62 @@ def logging_cli(tmp_path, monkeypatch):
   return run, captured
 
 
+@pytest.mark.parametrize("flags,saved,settings,expected", [
+  ([], None, None, (TERRAIN_TASK, True)),
+  (["--task", BASE_TASK], None, None, (BASE_TASK, False)),
+  (["--task", TERRAIN_TASK], None, None, (TERRAIN_TASK, True)),
+  ([], None, {"task_id": BASE_TASK, "depth_enabled": False}, (BASE_TASK, False)),
+  ([], {"task_id": BASE_TASK, "depth_enabled": False}, None, (BASE_TASK, False)),
+  ([], {"task_id": TERRAIN_TASK, "depth_enabled": True}, None, (TERRAIN_TASK, True)),
+  ([], {"depth_enabled": False}, None, (TERRAIN_TASK, True)),
+  ([], None, {"depth_enabled": False}, (TERRAIN_TASK, True)),
+  ([], {"depth_enabled": True}, None, (TERRAIN_TASK, True)),
+  (["--task", BASE_TASK], {"depth_enabled": True}, None, (BASE_TASK, False)),
+])
+def test_task_cli_and_saved_configuration_select_matching_environment(
+    logging_cli, flags, saved, settings, expected):
+  run, captured = logging_cli
+  run(flags, saved=saved, factory_settings=settings)
+  assert (captured["cfg"].task_id, captured["cfg"].depth_enabled) == expected
+  config_type = rl_cfg.TerrainSuperMimicConfig if expected[0] == TERRAIN_TASK else rl_cfg.SuperMimicConfig
+  assert type(captured["cfg"]) is config_type
+  assert captured["env_kwargs"]["task_id"] == expected[0]
+  assert 'depth_enabled' not in captured["env_kwargs"]
+
+
+@pytest.mark.parametrize("task", [BASE_TASK, TERRAIN_TASK])
+def test_resume_keeps_registered_config_type_and_saved_fields(logging_cli, task):
+  run, captured = logging_cli
+  cfg = registry.load_runner_cfg(task)
+  cfg.lr = 1e-4
+  if task == TERRAIN_TASK:
+    cfg.depth_frames = 4
+    cfg.wm_perception_lr = 3e-4
+    cfg.latent_loss_weight = .3
+  run(["--lr", "0.00015"], saved=asdict(cfg))
+  actual = captured["cfg"]
+  assert type(actual) is type(cfg) and actual.lr == 1.5e-4
+  if task == TERRAIN_TASK:
+    assert (actual.depth_frames, actual.wm_perception_lr, actual.latent_loss_weight) == (4, 3e-4, .3)
+  else:
+    assert not hasattr(actual, "perception_class") and not hasattr(actual, "depth_frames")
+
+
+@pytest.mark.parametrize('flag', ['--depth-enabled', '--no-depth-enabled'])
+def test_removed_depth_cli_flags_do_not_override_task_sensors(logging_cli, flag):
+  run, captured = logging_cli
+  with pytest.raises(SystemExit) as error:
+    run([flag])
+  assert error.value.code == 2
+  assert 'env_kwargs' not in captured and captured['events'] == []
+
+
 @pytest.mark.parametrize("saved_fraction", [None, "legacy", 0., .75])
 def test_collection_fraction_always_comes_from_local_config(logging_cli, saved_fraction):
   run, captured = logging_cli
   saved = None
   if saved_fraction is not None:
-    saved = asdict(rl_cfg.SuperMimicConfig())
+    saved = asdict(rl_cfg.unitree_g1_terrain_runner_cfg())
     saved["action_noise"] = .2
     if saved_fraction == "legacy":
       saved.pop("collect_det_frac")
@@ -189,7 +255,7 @@ def test_return_ema_comes_from_local_config_on_start_and_resume(logging_cli, sav
   run, captured = logging_cli
   saved = None
   if saved_ema is not None:
-    saved = asdict(rl_cfg.SuperMimicConfig())
+    saved = asdict(rl_cfg.unitree_g1_terrain_runner_cfg())
     if saved_ema == "legacy":
       saved.pop("bin_ema")
     else:
@@ -204,7 +270,7 @@ def test_softmax_cap_comes_from_rl_config_on_start_and_resume(logging_cli, saved
   run, captured = logging_cli
   saved = None
   if saved_cap is not None:
-    saved = asdict(rl_cfg.SuperMimicConfig())
+    saved = asdict(rl_cfg.unitree_g1_terrain_runner_cfg())
     if saved_cap == "legacy":
       saved.pop("softmax_cap")
     else:
@@ -218,7 +284,7 @@ def test_actor_clipping_comes_from_rl_config_on_start_and_resume(logging_cli, sa
   run, captured = logging_cli
   saved = None
   if saved_bounds is not None:
-    saved = asdict(rl_cfg.SuperMimicConfig())
+    saved = asdict(rl_cfg.unitree_g1_terrain_runner_cfg())
     for field, value in zip(("pi_clip", "pi_clip_value"), (1., .1)):
       if saved_bounds == "legacy":
         saved.pop(field)
@@ -247,7 +313,7 @@ def test_logging_cli_defaults_and_resume(logging_cli, flags, saved_settings, exp
   fields = ("logger", "wandb_project", "wandb_entity", "run_name", "wandb_mode")
   saved = None
   if saved_settings is not None:
-    saved = asdict(rl_cfg.SuperMimicConfig())
+    saved = asdict(rl_cfg.unitree_g1_terrain_runner_cfg())
     for field in fields:
       saved.pop(field)
     saved.update(saved_settings)
@@ -279,7 +345,7 @@ def test_run_directory_and_name_use_factory_config_with_cli_overrides(
 @pytest.mark.parametrize("override", [False, True])
 def test_resume_run_directory_and_name_with_cli_overrides(logging_cli, tmp_path, override):
   run, captured = logging_cli
-  saved = asdict(rl_cfg.SuperMimicConfig())
+  saved = asdict(rl_cfg.unitree_g1_terrain_runner_cfg())
   saved.update(log_dir=str(tmp_path / "saved-run"), run_name="saved-name")
   flags = ["--log-dir", str(tmp_path / "new-run"), "--run-name", "new-name"] if override else []
   run(flags, saved, factory_settings={"log_dir": "configured-dir", "run_name": "configured-name"})
@@ -291,28 +357,14 @@ def test_resume_run_directory_and_name_with_cli_overrides(logging_cli, tmp_path,
   assert captured["clock_calls"] == 1
 
 
-@pytest.mark.parametrize("saved_names,flags,expected_name", [
-  ({}, [], "configured-name"),
-  ({"wandb_name": None}, [], "configured-name"),
-  ({"wandb_name": ""}, [], "configured-name"),
-  ({"wandb_name": "legacy-name"}, [], "legacy-name"),
-  ({"wandb_name": "legacy-name", "run_name": "saved-name"}, [], "saved-name"),
-  ({"wandb_name": "legacy-name"}, ["--run-name", "cli-name"], "cli-name"),
-  ({"wandb_name": "legacy-name"}, ["--wandb-name", "cli-name"], "cli-name"),
-])
-def test_resume_legacy_run_configuration(logging_cli, tmp_path, saved_names, flags, expected_name):
+@pytest.mark.parametrize("field", ["wandb_name", "actor_perception_lr", "critic_perception_lr"])
+def test_resume_rejects_removed_config_fields_before_creating_environment(logging_cli, field):
   run, captured = logging_cli
-  saved = asdict(rl_cfg.SuperMimicConfig())
-  saved.pop("log_dir")
-  saved.pop("run_name")
-  saved.update(saved_names)
-  configured_dir = str(tmp_path / "configured-run")
-  run(flags, saved, factory_settings={"log_dir": configured_dir, "run_name": "configured-name"})
-  assert captured["cfg"].log_dir == configured_dir
-  assert Path(captured["log_dir"]) == Path(configured_dir) / f"{expected_name}_{STAMP}"
-  assert captured["cfg"].run_name == expected_name
-  assert not hasattr(captured["cfg"], "wandb_name")
-  assert captured["clock_calls"] == 1
+  saved = asdict(rl_cfg.unitree_g1_terrain_runner_cfg())
+  saved[field] = "obsolete"
+  with pytest.raises(TypeError, match=field):
+    run(saved=saved)
+  assert "env_kwargs" not in captured and captured["events"] == []
 
 
 def test_cli_directory_and_wandb_share_one_timestamp_and_resume_cleanly(logging_cli, tmp_path, monkeypatch):
@@ -364,7 +416,7 @@ def test_run_name_must_be_one_directory_component(name):
 def test_training_cleanup_on_failure(logging_cli, failure):
   run, captured = logging_cli
   with pytest.raises(RuntimeError, match=f"{failure} failed"):
-    run(saved=asdict(rl_cfg.SuperMimicConfig()), fail_at=failure)
+    run(saved=asdict(rl_cfg.unitree_g1_terrain_runner_cfg()), fail_at=failure)
   assert captured["events"][-1] == "env.close"
   if failure != "init":
     assert captured["events"][-2] == "runner.close"

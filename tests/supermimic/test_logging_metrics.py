@@ -7,9 +7,9 @@ import numpy as np
 import pytest
 import torch
 
-from supermimic.mdp.logging_metrics import TRACKING_METRICS
-from supermimic.mdp.sampling import ReturnBasedSampler
-from supermimic.rl.metrics import IntervalMetrics, sampling_metrics
+from supermimic.rl.logging import TRACKING_METRICS
+from supermimic.motion.sampling import ReturnBasedSampler
+from supermimic.rl.logging import IntervalMetrics, sampling_metrics
 
 
 REWARDS = (

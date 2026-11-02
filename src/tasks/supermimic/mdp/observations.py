@@ -70,7 +70,7 @@ def robot_body_ori_b(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:
 
 
 def supermimic_observation(env):
-  from .state import read_state
+  from ..core.state import read_state
   cmd = env.command_manager.get_term("motion")
   return env.functional_mdp.obs(read_state(env), env.action_manager.action,
                                 env.context, cmd.time_steps)
