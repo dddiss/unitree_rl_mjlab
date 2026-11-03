@@ -10,12 +10,13 @@ from supermimic.motion.motion_lib import MotionReference
 from supermimic.core.state import state_in_reference_frame, unflatten_state
 from supermimic.rl.algorithm import SuperMimicAlgorithm
 from supermimic.rl.buffer import ReplayBuffer
-from supermimic.terrain import reset as terrain_reset
+from supermimic.terrain.heightmap import TerrainHeightMap
 from supermimic.terrain.reset import TerrainResetCfg, place_on_terrain, terrain_tile_xy_bounds
 from test_algorithm import filled_buffer, small_config
 from test_buffer import transition
 from test_env_lifecycle import ROOT, methods
 from test_playback_controls import make_playback_env
+from test_terrain_reset import sphere_geometry
 
 
 @pytest.mark.parametrize('play', [False, True])
@@ -58,20 +59,22 @@ def placement_fixture():
 
 def test_random_xy_retries_only_misses_and_preserves_height_rule_and_velocities(monkeypatch):
   env, ids, root = placement_fixture()
+  env.terrain_height_map = TerrainHeightMap(torch.zeros(16, 16), (-8., -8.), (8., 8.))
   calls = []
-  def probe(env, state, offsets):
+  def probe(xy):
     selected = ids if not calls else ids[1:]
-    calls.append((selected.clone(), state.clone()))
-    height = torch.tensor([.2, .4, .6])[selected, None].expand(-1, 273)
+    calls.append((selected.clone(), xy.clone()))
+    height = torch.tensor([.2, .4, .6])[selected]
     valid = torch.ones_like(height, dtype=torch.bool)
     if len(calls) == 1:
       valid[1] = False
     return height, valid
-  monkeypatch.setattr(terrain_reset, '_sample_ground', probe)
-  placed = place_on_terrain(env, None, ids, root, TerrainResetCfg(randomize_xy=True))
+  monkeypatch.setattr(env.terrain_height_map, 'sample', probe)
+  placed = place_on_terrain(env, ids, root, torch.zeros(2, 0), sphere_geometry(),
+                            TerrainResetCfg(randomize_xy=True))
   assert [call[0].tolist() for call in calls] == [[2, 0], [0]]
   torch.testing.assert_close(placed[0, :2], calls[0][1][0, :2])
-  torch.testing.assert_close(placed[:, 2], torch.tensor([1.4, 1.0]))
+  torch.testing.assert_close(placed[:, 2], torch.tensor([1.41, 1.01]))
   torch.testing.assert_close(placed[:, 3:], root[:, 3:])
   low, high = terrain_tile_xy_bounds(env.scene.terrain, ids, .65)
   torch.testing.assert_close(low, torch.tensor([[.65, .65], [.65, -7.35]]))
@@ -83,13 +86,15 @@ def test_random_xy_retries_only_misses_and_preserves_height_rule_and_velocities(
 
 def test_random_xy_exhausted_retries_still_raises(monkeypatch, capsys):
   env, ids, root = placement_fixture()
+  env.terrain_height_map = TerrainHeightMap(torch.zeros(16, 16), (-8., -8.), (8., 8.))
   calls = []
-  def probe(env, state, offsets):
-    calls.append(state.clone())
-    return torch.full((len(state), 273), float('nan')), torch.zeros(len(state), 273, dtype=torch.bool)
-  monkeypatch.setattr(terrain_reset, '_sample_ground', probe)
+  def probe(xy):
+    calls.append(xy.clone())
+    return torch.full((len(xy),), float('nan')), torch.zeros(len(xy), dtype=torch.bool)
+  monkeypatch.setattr(env.terrain_height_map, 'sample', probe)
   with pytest.raises(RuntimeError, match='Reset XY is outside'):
-    place_on_terrain(env, None, ids, root, TerrainResetCfg(randomize_xy=True, xy_max_attempts=3))
+    place_on_terrain(env, ids, root, torch.zeros(2, 0), sphere_geometry(),
+                      TerrainResetCfg(randomize_xy=True, xy_max_attempts=3))
   assert len(calls) == 3
   # Even missing diagnostic metadata does not hide the original height error.
   assert 'Could not collect height-map diagnostics' in capsys.readouterr().err
@@ -101,7 +106,7 @@ def test_command_moves_whole_reference_but_not_velocity_or_other_environment(mdp
   env.scene.env_origins = torch.tensor([[8., 16., 0.], [-8., 24., 0.]])
   names = {'_write_reference_state_to_sim', 'reference_origin_w', 'get_reference',
            'body_pos_w', 'anchor_pos_w', 'body_lin_vel_w', 'body_ang_vel_w'}
-  def place(env, robot, ids, state, cfg):
+  def place(env, ids, state, joint_pos, geometry, cfg):
     moved = state.clone()
     moved[:, :2] += torch.tensor([-3., 5.])
     return moved
@@ -113,6 +118,7 @@ def test_command_moves_whole_reference_but_not_velocity_or_other_environment(mdp
   cmd.body_indexes = list(range(mdp.motion.body_pos_w.shape[1]))
   cmd.robot_anchor_body_index = 0
   cmd.cfg.terrain_reset = TerrainResetCfg(randomize_xy=True)
+  cmd._reset_collision_bounds = object()
   cmd.reference_xy_offset[:] = torch.tensor([[11., 13.], [17., 19.]])
   written = {}
   def write(state, env_ids): written.update(ids=env_ids.clone(), state=state.clone())

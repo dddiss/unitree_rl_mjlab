@@ -35,7 +35,7 @@ class SuperMimicConfig:
   gamma: float = 0.99
   lam: float = 0.95
   action_noise: float = 0.1  # Gaussian std for environments with exploration noise.
-  collect_det_frac: float = 0.25  # First round(frac * num_envs) collect without action noise.
+  collect_det_frac: float = 0.25  # Random fixed subset of round(frac * num_envs), selected using seed.
   bin_ema: float = 0.1  # New return-score weight: (1 - bin_ema) * old + bin_ema * new.
   softmax_cap: float = 50.0  # Cap current softmax at this multiple of 1 / num_bins; 0 disables.
   critic_epochs: int = 5

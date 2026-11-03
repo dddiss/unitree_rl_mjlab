@@ -207,7 +207,7 @@ def test_real_env_reset_and_reward_parity(mdp):
     if cmd.cfg.terrain_reset is not None:
       assert cmd.cfg.terrain_reset.randomize_xy
       root_xy=cmd.robot.data.body_link_pose_w[ids,cmd.root_body_index,:2]
-      low,high=terrain_tile_xy_bounds(env.scene.terrain,ids,cmd.cfg.terrain_reset.footprint_radius)
+      low,high=terrain_tile_xy_bounds(env.scene.terrain,ids,cmd.cfg.terrain_reset.xy_margin)
       assert ((root_xy>=low)&(root_xy<=high)).all()
       torch.testing.assert_close(root_xy,cmd.motion.body_pos_w[frames,cmd.root_body_index,:2]
                                   +env.scene.env_origins[ids,:2]+cmd.reference_xy_offset[ids])

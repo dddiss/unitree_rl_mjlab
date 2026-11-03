@@ -170,6 +170,55 @@ class TerrainHeightMap:
     return torch.where(valid, height, float('nan')), valid
 
   @torch.no_grad()
+  def max_in_rect(self, xy_lower, xy_upper, *, max_cells=262144):
+    """Maximum over EVERY cell covered by each closed XY rectangle.
+
+    This reset-only query leaves the map and reference point lookups unchanged.
+    Rectangles extending outside the map, or containing invalid cells, are
+    invalid rather than silently clipped. Bounded chunks avoid allocating a
+    full [num_resets, num_geoms, footprint_grid] tensor. Only two window-size
+    integers are read back for batching; all height gathering stays on device.
+    """
+    if xy_lower.shape != xy_upper.shape or xy_lower.shape[-1] != 2:
+      raise ValueError("Rectangle bounds must have matching [..., 2] shapes")
+    if max_cells < 1:
+      raise ValueError("max_cells must be positive")
+    shape = xy_lower.shape[:-1]
+    lower, upper = xy_lower.reshape(-1, 2), xy_upper.reshape(-1, 2)
+    valid = (torch.isfinite(lower).all(-1) & torch.isfinite(upper).all(-1)
+             & (lower <= upper).all(-1) & (lower >= self.xy_min).all(-1)
+             & (upper <= self.xy_max).all(-1))
+    if not len(lower):
+      return self.heights.new_empty(shape), valid.reshape(shape)
+    # Clamp only indices used for safe gathers; validity still rejects any
+    # out-of-map footprint. Include the cell containing the upper edge, just
+    # as sample() does when a point lands exactly on a cell boundary.
+    first = ((lower - self.xy_min) / self.cell_size).nan_to_num(0, 0, 0).floor().long()
+    last = ((upper - self.xy_min) / self.cell_size).nan_to_num(0, 0, 0).floor().long()
+    limit = first.new_tensor(self.heights.shape) - 1
+    first = torch.minimum(first.clamp_min(0), limit)
+    last = torch.minimum(last.clamp_min(0), limit)
+    counts = (last - first + 1).clamp_min(1)
+    nx, ny = counts.amax(dim=0).tolist()
+    area = nx * ny
+    batch_size = max(1, max_cells // min(area, max_cells))
+    result = self.heights.new_full((len(lower),), -torch.inf)
+    for start in range(0, len(lower), batch_size):
+      stop = min(start + batch_size, len(lower))
+      cell_batch = max(1, max_cells // (stop - start))
+      for cell_start in range(0, area, cell_batch):
+        offsets = torch.arange(cell_start, min(cell_start + cell_batch, area), device=lower.device)
+        dx, dy = offsets // ny, offsets % ny
+        inside = (dx[None] < counts[start:stop, :1]) & (dy[None] < counts[start:stop, 1:])
+        ix = (first[start:stop, :1] + dx).clamp_max(self.heights.shape[0] - 1)
+        iy = (first[start:stop, 1:] + dy).clamp_max(self.heights.shape[1] - 1)
+        heights = self.heights[ix, iy]
+        valid[start:stop] &= (~inside | torch.isfinite(heights)).all(-1)
+        maximum = heights.masked_fill(~inside, -torch.inf).amax(-1)
+        result[start:stop] = torch.maximum(result[start:stop], maximum)
+    return torch.where(valid, result, float('nan')).reshape(shape), valid.reshape(shape)
+
+  @torch.no_grad()
   def height(self, xy):
     """Checked reference lookup: never silently clamp an out-of-map target."""
     heights, valid = self.sample(xy)

@@ -20,7 +20,7 @@ from mjlab.utils.lab_api.math import (
 )
 from mjlab.viewer.debug_visualizer import DebugVisualizer
 
-from ..terrain.reset import TerrainResetCfg, place_on_terrain
+from ..terrain.reset import RobotCollisionBounds, TerrainResetCfg, place_on_terrain
 from ..motion.motion_lib import MotionLibrary, MotionReference
 from ..motion.sampling import ReturnBasedSampler
 
@@ -54,6 +54,15 @@ class MotionCommand(CommandTerm):
       dtype=torch.long,
       device=self.device,
     )
+    self._reset_collision_bounds = None
+    if cfg.terrain_reset is not None:
+      self._reset_collision_bounds = RobotCollisionBounds(
+        env.sim.mj_model,
+        self.robot.indexing.joint_ids.tolist(),
+        self.robot.indexing.geom_ids.tolist(),
+        int(self.robot.indexing.body_ids[self.root_body_index]),
+        self.device,
+      )
 
     if cfg.motion_file and cfg.motion_files:
       raise ValueError("Set either motion_file or motion_files, not both")
@@ -269,7 +278,8 @@ class MotionCommand(CommandTerm):
     root_state = torch.cat([root_pos, root_ori, root_lin_vel, root_ang_vel], dim=-1)
     if self.cfg.terrain_reset is not None:
       placed = place_on_terrain(
-        self._env, self.robot, env_ids, root_state, self.cfg.terrain_reset,
+        self._env, env_ids, root_state, joint_pos,
+        self._reset_collision_bounds, self.cfg.terrain_reset,
       )
       if self.cfg.terrain_reset.randomize_xy:
         self.reference_xy_offset[env_ids] = placed[:, :2] - root_state[:, :2]

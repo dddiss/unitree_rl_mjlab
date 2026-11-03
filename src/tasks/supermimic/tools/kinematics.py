@@ -40,6 +40,31 @@ class G1Kinematics:
     self.tracked_idx = [local[b] for b in tracked_body_ids]
     self.q_lo, self.q_hi = tensor(model.jnt_range[joint_ids, 0]), tensor(model.jnt_range[joint_ids, 1])
 
+  def forward_pose(self, p, r, q):
+    """Pose-only FK for placement; includes fixed bodies and joint anchors.
+
+    The training path below keeps its position/velocity calculation unchanged.
+    """
+    ps, rs = [], []
+    for i, parent in enumerate(self.parent):
+      if parent < 0:
+        pi, ri = p, r
+      else:
+        rp = rs[parent]
+        origin = ps[parent] + (rp @ self.off_p[i, :, None]).squeeze(-1)
+        base_r = rp @ self.off_r[i]
+        j = self.joint_idx[i]
+        if j < 0:
+          pi, ri = origin, base_r
+        else:
+          ri = base_r @ axis_angle_to_mat(self.axes[i], q[..., j])
+          pivot = origin + (base_r @ self.anchors[i, :, None]).squeeze(-1)
+          pi = pivot - (ri @ self.anchors[i, :, None]).squeeze(-1)
+      ps.append(pi)
+      rs.append(ri)
+    return (torch.stack([ps[i] for i in self.tracked_idx], -2),
+            torch.stack([rs[i] for i in self.tracked_idx], -3))
+
   def forward(self, p, r, v, w, q, qd):
     ps, rs, vs, ws = [], [], [], []
     for i, parent in enumerate(self.parent):

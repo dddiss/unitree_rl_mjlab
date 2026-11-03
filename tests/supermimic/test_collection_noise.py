@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from supermimic.config.g1.rl_cfg import SuperMimicConfig
-from supermimic.rl.runner import SuperMimicRunner
+from supermimic.rl.runner import SuperMimicRunner, _sample_action_noise_free_mask
 from test_algorithm import small_config
 from test_train_resume_eval import TensorEnv
 
@@ -15,6 +15,33 @@ def test_default_noise_partition():
   assert cfg.action_noise == .1
   assert cfg.collect_det_frac == .25
   assert round(cfg.collect_det_frac * cfg.num_envs) == 1024
+
+
+@pytest.mark.parametrize("num_envs,fraction,count", [
+  (4096, .25, 1024), (10, .25, 2), (6, .25, 2), (8, 0., 0), (8, 1., 8),
+])
+def test_random_partition_size(num_envs, fraction, count):
+  mask = _sample_action_noise_free_mask(num_envs, fraction, seed=0, device="cpu")
+  assert mask.shape == (num_envs,)
+  assert mask.dtype == torch.bool and mask.device == torch.device("cpu")
+  assert mask.sum().item() == count
+
+
+def test_partition_seed_is_reproducible_and_independent_of_training_rng():
+  with torch.random.fork_rng(devices=[]):
+    before = torch.get_rng_state().clone()
+    first = _sample_action_noise_free_mask(4096, .25, seed=7, device="cpu")
+    assert torch.equal(torch.get_rng_state(), before)
+    torch.rand(100)
+    after_training_draws = torch.get_rng_state().clone()
+    repeated = _sample_action_noise_free_mask(4096, .25, seed=7, device="cpu")
+    different = _sample_action_noise_free_mask(4096, .25, seed=8, device="cpu")
+    assert torch.equal(torch.get_rng_state(), after_training_draws)
+  assert torch.equal(first, repeated)
+  assert not torch.equal(first, different)
+  # Both contiguous environment groups contain noisy and noise-free rows.
+  assert 0 < first[:1756].sum().item() < 1756
+  assert 0 < first[1756:].sum().item() < 2340
 
 
 @pytest.mark.parametrize("fraction", [-.01, 1.01, float("nan"), float("inf")])
@@ -28,11 +55,15 @@ def test_fixed_partition_survives_partial_resets_and_stores_executed_actions(
   mdp, tmp_path, monkeypatch, fraction, std,
 ):
   # Two rows let both groups run through different episode boundaries.
-  cfg = small_config(collect_det_frac=fraction, action_noise=std)
+  cfg = small_config(collect_det_frac=fraction, action_noise=std, seed=1)
   env = TensorEnv(mdp)
   runner = SuperMimicRunner(env, cfg, tmp_path)
+  mask = runner._action_noise_free_mask.clone()
+  if fraction == .5:
+    assert mask.tolist() == [False, True]  # Exercise a non-prefix partition.
   env.command.request_frames(mdp.motion.clip_start.clone())
   env.reset()
+  assert torch.equal(runner._action_noise_free_mask, mask)
   clean_actions, draws, history_actions, initial_rows = [], [], [], []
   controller = runner.controller
   assert controller.noise is True and controller.update_norm is True
@@ -66,10 +97,10 @@ def test_fixed_partition_survives_partial_resets_and_stores_executed_actions(
   monkeypatch.setattr(torch, "randn_like", capture_noise)
   monkeypatch.setattr(env, "step", short_first_clip)
   runner.collect(8)
-  count = round(fraction * env.num_envs)
+  assert torch.equal(runner._action_noise_free_mask, mask)
   for i, (clean, draw) in enumerate(zip(clean_actions, draws)):
     expected_noise = std * draw
-    expected_noise[:count] = 0
+    expected_noise[mask] = 0
     expected = (clean + expected_noise).clamp(-20, 20)
     torch.testing.assert_close(runner.buffer.data["a"][i], expected, rtol=0, atol=0)
     torch.testing.assert_close(runner.buffer.data["a_prev"][i], history_actions[i])
@@ -85,8 +116,11 @@ def test_fixed_partition_survives_partial_resets_and_stores_executed_actions(
 
 
 @pytest.mark.parametrize("legacy", [False, True])
-def test_resume_uses_current_partition_and_saves_it(mdp, tmp_path, legacy):
-  original = SuperMimicRunner(TensorEnv(mdp), small_config(collect_det_frac=0.), tmp_path / "original")
+@pytest.mark.parametrize("saved_fraction", [0., .5])
+def test_resume_uses_current_partition_and_saves_it(mdp, tmp_path, legacy, saved_fraction):
+  original = SuperMimicRunner(
+    TensorEnv(mdp), small_config(collect_det_frac=saved_fraction, seed=1), tmp_path / "original",
+  )
   original.collect(2)
   checkpoint = tmp_path / "checkpoint.pt"
   original.save(checkpoint)
@@ -94,9 +128,14 @@ def test_resume_uses_current_partition_and_saves_it(mdp, tmp_path, legacy):
     saved = torch.load(checkpoint, weights_only=False)
     del saved["config"]["collect_det_frac"]
     torch.save(saved, checkpoint)
-  cfg = small_config(collect_det_frac=.5)
+  cfg = small_config(collect_det_frac=.5, seed=1)
   resumed = SuperMimicRunner(TensorEnv(mdp), cfg, tmp_path / "resumed")
+  mask = resumed._action_noise_free_mask.clone()
   resumed.load(checkpoint)
+  assert torch.equal(resumed._action_noise_free_mask, mask)
+  assert mask.tolist() == [False, True]
+  if saved_fraction == .5:
+    assert torch.equal(mask, original._action_noise_free_mask)
   assert resumed.cfg.collect_det_frac == .5
   assert resumed.cfg.action_noise == original.cfg.action_noise
   assert resumed.buffer.size == 0 and resumed.env_steps == original.env_steps

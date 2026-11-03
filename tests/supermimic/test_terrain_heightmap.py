@@ -201,3 +201,50 @@ def test_cuda_raster_and_cpu_repair_match_native_and_leave_model_untouched(monke
   np.testing.assert_array_equal(model.geom_size, original)
   xy = torch.tensor([[[-.001, 0.], [.001, 0.]], [[-.95, .95], [.95, -.95]]])
   torch.testing.assert_close(ground.height(xy.cuda()).cpu(), cpu.height(xy), atol=2e-6, rtol=1e-4)
+
+
+@pytest.mark.parametrize('max_cells', [3, 100000])
+def test_rect_max_covers_interior_and_matches_brute_force(max_cells):
+  gen = torch.Generator().manual_seed(13)
+  grid = torch.rand((19, 17), generator=gen) - 1.
+  ground = TerrainHeightMap(grid, (-4., -3.), (3., 8.))
+  lower = torch.rand((2, 3, 2), generator=gen) * torch.tensor([3., 5.]) + ground.xy_min
+  upper = lower + torch.rand((2, 3, 2), generator=gen) * torch.tensor([4., 6.])
+  upper = torch.minimum(upper, ground.xy_max)
+  before = grid.clone()
+  rng = torch.random.get_rng_state()
+  actual, valid = ground.max_in_rect(lower, upper, max_cells=max_cells)
+  assert valid.all()
+  for n in range(2):
+    for k in range(3):
+      lo = ((lower[n, k] - ground.xy_min) / ground.cell_size).floor().long()
+      hi = ((upper[n, k] - ground.xy_min) / ground.cell_size).floor().long()
+      hi = torch.minimum(hi, torch.tensor(grid.shape) - 1)
+      expected = grid[lo[0]:hi[0]+1, lo[1]:hi[1]+1].max()
+      assert actual[n, k] == expected
+  torch.testing.assert_close(grid, before)
+  assert torch.equal(rng, torch.random.get_rng_state())
+
+
+def test_rect_max_interior_peak_and_closed_boundary():
+  ground = TerrainHeightMap(torch.full((10, 10), -2.), (0., 0.), (10., 10.))
+  ground.heights[3, 4] = 1.7  # Not a corner or the rectangle centre.
+  ground.heights[8, 8] = 2.7
+  actual, valid = ground.max_in_rect(torch.tensor([[1.1, 1.1], [1.1, 1.1]]),
+                                     torch.tensor([[7.9, 7.9], [8., 8.]]))
+  assert valid.all()
+  torch.testing.assert_close(actual, torch.tensor([1.7, 2.7]))
+  assert ground.max_in_rect(torch.tensor([.1, .1]), torch.tensor([.1, .1]))[0] == -2.
+  assert ground.max_in_rect(torch.tensor([10., 10.]), torch.tensor([10., 10.]))[1]
+
+
+def test_rect_max_rejects_outside_bounds_bad_cells_and_reversed_rectangles():
+  ground = TerrainHeightMap(torch.zeros(4, 4), (0., 0.), (4., 4.))
+  ground.heights[1, 1] = float('nan')
+  lo = torch.tensor([[0., 0.], [-.1, 0.], [3., 3.], [float('nan'), 0.], [3., 3.], [2., 2.]])
+  hi = torch.tensor([[2., 2.], [0., 0.], [4.1, 4.], [1., 1.], [2., 2.], [4., 4.]])
+  heights, valid = ground.max_in_rect(lo, hi, max_cells=3)
+  assert valid.tolist() == [False, False, False, False, False, True]
+  assert heights[:5].isnan().all() and heights[-1] == 0.
+  empty, valid = ground.max_in_rect(torch.empty(0, 3, 2), torch.empty(0, 3, 2))
+  assert empty.shape == valid.shape == (0, 3)

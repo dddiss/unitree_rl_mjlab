@@ -42,6 +42,15 @@ def atomic_save(state, path):
   temporary.replace(path)
 
 
+def _sample_action_noise_free_mask(num_envs, fraction, seed, device):
+  """Choose a fixed subset without advancing the training RNGs."""
+  generator = torch.Generator(device="cpu").manual_seed(seed)
+  ids = torch.randperm(num_envs, generator=generator, device="cpu")
+  mask = torch.zeros(num_envs, dtype=torch.bool, device="cpu")
+  mask[ids[:round(fraction * num_envs)]] = True
+  return mask.to(device)
+
+
 class PolicyController:
   """History is advanced once per physical step and reset only for affected rows."""
   def __init__(self, env, policy, cfg, noise=False, update_norm=False):
@@ -84,6 +93,9 @@ class PolicyController:
 class SuperMimicRunner:
   def __init__(self, env, cfg, log_dir):
     self.env, self.cfg = env, cfg
+    self._action_noise_free_mask = _sample_action_noise_free_mask(
+      env.num_envs, cfg.collect_det_frac, cfg.seed, env.device,
+    )
     self.log_dir = Path(log_dir)
     self.log_dir.mkdir(parents=True, exist_ok=True)
     self.algorithm = SuperMimicAlgorithm(env.functional_mdp, cfg, env.device)
@@ -124,9 +136,9 @@ class SuperMimicRunner:
     for _ in range(count):
       action = self.controller()
       noise = self.cfg.action_noise * torch.randn_like(action)
-      # Fixed environment IDs stay noise-free across resets. Keep the full draw
+      # The startup subset stays noise-free across resets. Keep the full draw
       # so changing the fraction does not itself change RNG consumption.
-      noise[:round(self.cfg.collect_det_frac * self.env.num_envs)] = 0
+      noise[self._action_noise_free_mask] = 0
       action = (action + noise).clamp(-20, 20)
       self.env.step(action)
       tr = self.env.last_transition

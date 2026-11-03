@@ -27,13 +27,18 @@ SuperMimic integration are additions here, not claims about P-BFM's algorithm.
 The files in `src/tasks/supermimic/terrain/` and
 `src/tasks/supermimic/config/g1/terrain_cfg.py` additionally adapt the same
 revision's G1 six-family terrain primitives, `terrain_ufo_v0` generation defaults,
-273-point reset grid, generator-padding geom grouping, and local-ground/adaptive-lift
-reset rule. They carry the same CC BY-NC 4.0 attribution and license above.
+generator-padding geom grouping, and local-ground placement convention.
+They carry the same CC BY-NC 4.0 attribution and license above.
 Changes: retained only the G1 mixed-terrain families, used project-local Python
 configuration without Hydra, and applied height placement to SuperMimic's existing
 reset XY/pose/velocity/joint sampling. Startup raster rays start above the compiled
-map's highest collision bound and cover the entire map including its border;
-the final height rule is unchanged. P-BFM's region sampling, random heading,
+map's highest collision bound and cover the entire map including its border.
+The former reset grid and adaptive neighbourhood lift have been replaced with
+full-body collision-AABB clearance plus 1 cm. This is a project-local
+implementation, conceptually informed by
+[DeepMimic's ResolveCharGroundIntersect](https://github.com/xbpeng/DeepMimic/blob/master/DeepMimicCore/scenes/SceneSimChar.cpp),
+without copying its source. It queries every height-map cell covered by each
+rectangle instead of five surface samples. P-BFM's region sampling, random heading,
 lying resets and terrain observations are not imported.
 Reset and reference-XY termination heights now use a project-local startup height
 map. It samples collision geometry, rechecks missed samples with native CPU MuJoCo,
