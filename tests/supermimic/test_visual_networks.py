@@ -4,6 +4,7 @@ import pytest
 import torch
 from supermimic.networks import Policy, WorldModel, Critic
 from supermimic.networks.depth_encoder import DepthEncoder, WindowGRU
+from supermimic.networks.world_model import WM_OUT
 from supermimic.config.g1.rl_cfg import unitree_g1_runner_cfg, unitree_g1_terrain_runner_cfg
 
 
@@ -38,6 +39,39 @@ def test_default_architecture_with_shared_encoder():
   with torch.no_grad():
     image=torch.randint(256,(1,8,18,32),dtype=torch.uint8)
     assert p(torch.zeros(1,10,93),torch.zeros(1,640),image).shape==(1,29)
+
+
+@pytest.mark.parametrize('with_costs',[False,True])
+def test_wm_prediction_bounds_only_h_and_preserves_state_deltas_and_costs(with_costs):
+  cfg=replace(unitree_g1_terrain_runner_cfg(),depth_frame_dim=16,depth_latent_dim=16)
+  wm=WorldModel((16,),depth_cfg=cfg,foot_reward_names=('feet_stumble','feet_at_plane'))
+  raw_h=torch.linspace(-3.,3.,cfg.depth_latent_dim)
+  raw_delta=torch.full((WM_OUT,),2.)
+  raw_delta[3:6]=.1  # Keep the rotation increment inside SO(3)'s principal branch.
+  with torch.no_grad():
+    wm.net[-1].weight.zero_()
+    wm.net[-1].bias.copy_(torch.cat((raw_delta,raw_h)))
+    wm.out_norm.mean.fill_(.1);wm.out_norm.var.fill_(.25)
+    wm.foot_head[0][-1].weight.zero_();wm.foot_head[0][-1].bias.fill_(2.)
+  state=(torch.zeros(2,3),torch.eye(3).expand(2,-1,-1),torch.zeros(2,3),
+         torch.zeros(2,3),torch.zeros(2,29),torch.zeros(2,29))
+  args=(state,torch.zeros(2,29),torch.zeros(2,33),torch.zeros(2,cfg.depth_latent_dim))
+  if with_costs:
+    next_state,h,costs=wm.step_with_foot_costs(*args)
+    torch.testing.assert_close(costs,torch.nn.functional.softplus(torch.full((2,2),2.)))
+    assert costs.gt(1).all()  # The independent reward head is not bounded by tanh.
+  else:
+    next_state,h=wm.step_visual(*args)
+  expected_delta=raw_delta*wm.out_norm.std()+wm.out_norm.mean
+  torch.testing.assert_close(wm.targets(state,next_state),expected_delta.expand(2,-1))
+  assert next_state[0].gt(1).all()  # Physical increments still use their original units.
+  torch.testing.assert_close(h,raw_h.tanh().expand(2,-1))
+  assert h.abs().le(1).all()
+  h.sum().backward()
+  # Overshooting raw predictions must retain gradients (unlike hard clipping).
+  gradient=wm.net[-1].bias.grad
+  torch.testing.assert_close(gradient[WM_OUT:],2*(1-raw_h.tanh().square()))
+  assert gradient[WM_OUT:].gt(0).all() and gradient[:WM_OUT].eq(0).all()
 
 
 def test_chunked_checkpointed_encoder_preserves_outputs_and_input_gradients():

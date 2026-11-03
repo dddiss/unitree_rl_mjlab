@@ -91,7 +91,11 @@ class WorldModel(nn.Module):
         R1 = R @ so3_exp(dth)
         v1 = v + (R @ dv.unsqueeze(-1)).squeeze(-1)
         w1 = w + (R @ dw.unsqueeze(-1)).squeeze(-1)
-        result = (p1, R1, v1, w1, q + dq, qd + dqd), y[..., WM_OUT:]
+        next_h = y[..., WM_OUT:]
+        if self.visual:
+            # Match the real GRU's range for supervision and imagined recurrence.
+            next_h = torch.tanh(next_h)
+        result = (p1, R1, v1, w1, q + dq, qd + dqd), next_h
         return (*result, costs) if with_foot_costs else result
 
     def step_with_foot_costs(self, S, a, xi_n, depth_latent=None):

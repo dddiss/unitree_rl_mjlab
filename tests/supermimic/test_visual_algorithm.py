@@ -4,6 +4,7 @@ import torch
 from supermimic.config.g1.rl_cfg import TerrainSuperMimicConfig
 from supermimic.rl.algorithm import SuperMimicAlgorithm
 from supermimic.rl.buffer import ReplayBuffer
+from supermimic.networks.world_model import WM_OUT
 from supermimic.perception.history import select_history
 from supermimic.perception.preprocessing import depth_float
 from test_algorithm import small_config, filled_buffer
@@ -32,6 +33,7 @@ def test_eight_step_wm_predicts_history_latents_without_image_feedback(mdp,monke
   torch.set_num_threads(2)
   cfg=visual_config(wm_window=8,depth_frames=8,depth_skip=5)
   alg=SuperMimicAlgorithm(mdp,cfg,'cpu')
+  with torch.no_grad():alg.wm.net[-1].bias[WM_OUT:].fill_(2.)
   buffer,transitions=visual_buffer(mdp,cfg)
   for tr in transitions:alg.observe(tr,buffer.xi)
   window=buffer.sample_windows(2,8,strict=True)
@@ -40,15 +42,17 @@ def test_eight_step_wm_predicts_history_latents_without_image_feedback(mdp,monke
   def capture(state,action,xi,latent):
     seen.append(latent)
     result=step(state,action,xi,latent)
+    assert result[1].abs().le(1).all()
     result[1].retain_grad();predictions.append(result[1])
     return result
   monkeypatch.setattr(alg.wm,'step_visual',capture)
-  hook=alg.wm.depth_decoder.register_forward_hook(lambda m,a,o:decoded.append(o))
+  hook=alg.wm.depth_decoder.register_forward_hook(lambda m,a,o:decoded.append((a[0],o)))
   try:
     states,latents=alg._rollout(window['s'],window['a'],window['xi'],window['depth_history'])
     assert not decoded  # Decoder never participates in latent recurrence.
     images=alg.wm.decode_depth(latents)
     assert len(decoded)==1 and images.shape==(2,8,18,32)
+    torch.testing.assert_close(decoded[0][0],latents.flatten(0,1))
     images[:,-1].square().mean().backward()
   finally:hook.remove()
   assert len(seen)==len(predictions)==8
@@ -92,24 +96,30 @@ def test_visual_actor_and_critic_update_only_heads_and_do_not_clip_shared_gradie
     assert p.requires_grad
 
 
-def test_visual_short_motion_bootstrap_uses_true_endpoint_latent(mdp):
-  cfg=visual_config(horizon=4,pi_batch=2)
+@pytest.mark.parametrize('horizon',[4,32])
+def test_visual_short_motion_bootstrap_uses_true_endpoint_latent(mdp,horizon):
+  cfg=visual_config(horizon=horizon,pi_batch=2)
   alg=SuperMimicAlgorithm(mdp,cfg,'cpu')
+  with torch.no_grad():alg.wm.net[-1].bias[WM_OUT:].fill_(2.)
   b,_=visual_buffer(mdp,cfg)
   start,hist=b.sample_starts(2,cfg.hist)
-  start['f']=torch.tensor([50,54])  # remaining lengths 1 and 4
+  start['f']=torch.tensor([50,51-horizon])  # remaining lengths 1 and horizon
   class Fixed:
     def sample_starts(self,*args):return start,hist
-  seen=[]
+  seen,actor_latents=[],[]
   hook=alg.critic.register_forward_pre_hook(
     lambda m,args,kwargs:seen.append(kwargs['depth_latent'].detach().clone()),with_kwargs=True)
+  actor_hook=alg.policy.register_forward_pre_hook(
+    lambda m,args,kwargs:actor_latents.append(kwargs['depth_latent'].detach().clone()),with_kwargs=True)
   try:alg.policy_update(Fixed())
-  finally:hook.remove()
+  finally:hook.remove();actor_hook.remove()
+  assert len(actor_latents)==horizon
+  assert all(h.abs().le(1).all() for h in (*seen,*actor_latents))
   # First call is bootstrap; the second batches V(s_0)...V(s_H).
   assert seen[1].shape==(cfg.horizon+1,cfg.pi_batch,cfg.depth_latent_dim)
   torch.testing.assert_close(seen[0][0],seen[1][1,0])
-  torch.testing.assert_close(seen[0][1],seen[1][4,1])
-  for t in range(2,5):torch.testing.assert_close(seen[1][t,0],seen[1][1,0])
+  torch.testing.assert_close(seen[0][1],seen[1][horizon,1])
+  for t in range(2,horizon+1):torch.testing.assert_close(seen[1][t,0],seen[1][1,0])
 
 
 def test_shared_parameters_have_exactly_one_optimizer_owner_and_lr(mdp):
@@ -179,10 +189,11 @@ def test_actor_gradient_passes_through_predicted_h_with_frozen_perception(mdp,mo
   alg=SuperMimicAlgorithm(mdp,cfg,'cpu')
   b,_=visual_buffer(mdp,cfg)
   saved=[]
+  step=alg.wm.step_visual
   def dynamics(s,a,xi,h):
-    next_h=h+a[:,:cfg.depth_latent_dim]
+    next_state,next_h=step(s,a,xi,h)
     next_h.retain_grad();saved.append(next_h)
-    return s,next_h
+    return next_state,next_h
   monkeypatch.setattr(alg.wm,'step_visual',dynamics)
   monkeypatch.setattr(alg,'_reward_term',lambda s,f,a,prev,**kwargs:(torch.zeros(len(f)),torch.zeros(len(f))))
   # Only the visual endpoint contributes to Actor's return.
@@ -190,12 +201,14 @@ def test_actor_gradient_passes_through_predicted_h_with_frozen_perception(mdp,mo
   result=alg.policy_update(b)
   assert result['pi_gradnorm']>0
   assert len(saved)==cfg.horizon and saved[0].grad.abs().sum()>0
+  assert all(h.abs().le(1).all() for h in saved)
   assert all(p.grad is None for p in alg.wm.depth_encoder.parameters())
 
 
 def test_compiled_visual_rollout_and_decoder_match_eager_gradients(mdp):
   cfg=visual_config(depth_checkpoint=True)
   alg=SuperMimicAlgorithm(mdp,cfg,'cpu')
+  with torch.no_grad():alg.wm.net[-1].bias[WM_OUT:].fill_(2.)
   b,_=visual_buffer(mdp,cfg)
   w=b.sample_windows(2,cfg.wm_window,strict=True)
   image=depth_float(w['depth_history']).requires_grad_()
@@ -206,6 +219,8 @@ def test_compiled_visual_rollout_and_decoder_match_eager_gradients(mdp):
   try:
     state,latent=alg._rollout(w['s'],w['a'],w['xi'],image)
     got_state,got_latent=compiled(w['s'],w['a'],w['xi'],other)
+    torch.testing.assert_close(got_latent,latent)
+    assert got_latent.abs().le(1).all()
     depth=alg.wm.decode_depth(latent);got_depth=decode(got_latent)
     torch.testing.assert_close(got_depth,depth)
     for expected,actual in zip(state,got_state):torch.testing.assert_close(actual,expected)
