@@ -156,9 +156,17 @@ def test_replay_origin_is_snapshot_across_resets_and_ring_overwrite(mdp):
 
 
 @pytest.mark.parametrize('visual', [False, True])
-def test_imagination_queries_future_targets_from_sampled_placement_without_future_rows(mdp, visual):
+@pytest.mark.parametrize('height_reward', [False, True])
+def test_imagination_queries_future_targets_from_sampled_placement_without_future_rows(mdp, visual, height_reward):
   from test_visual_algorithm import visual_buffer, visual_config
+  from supermimic.core.components import RewardBinding
+  from supermimic.mdp.rewards import motion_terrain_anchor_position_error_exp
   torch.set_num_threads(2)
+  if height_reward:
+    mdp.cfg.reward_components = (RewardBinding('motion_global_root_pos',
+      motion_terrain_anchor_position_error_exp.supermimic_reward, {'std': .3}),)
+    mdp.cfg.term_height = None  # The reward must request the lookup on its own.
+    assert mdp.requires_height_offset
   cfg = visual_config() if visual else small_config()
   cfg.horizon = 4
   alg = SuperMimicAlgorithm(mdp, cfg, 'cpu')
@@ -189,6 +197,12 @@ def test_imagination_queries_future_targets_from_sampled_placement_without_futur
     expected = .01*xy[:, 0] + .02*xy[:, 1] - env_origin[:, 2]
     torch.testing.assert_close(kwargs['height_offset'], expected)
     assert not kwargs['height_offset'].requires_grad
+    if height_reward:
+      terms = mdp.reward_terms(state, f, a, prev, **kwargs)
+      target = mdp.reference_root(f)[0].clone()
+      target[:, 2] += expected
+      torch.testing.assert_close(terms['motion_global_root_pos'],
+                                 torch.exp(-(target-state[0]).square().sum(-1)/.3**2))
     return reward(state, f, a, prev, *args, **kwargs)
   alg._reward_term = capture
   metrics = alg.policy_update(b)

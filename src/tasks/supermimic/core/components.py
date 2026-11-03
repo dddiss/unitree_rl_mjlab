@@ -30,6 +30,7 @@ class RewardComponent:
   prepare: Callable | None = None
   prediction: Prediction | None = None
   sense_before_reward: bool = False
+  requires_height: bool = False
 
   def __post_init__(self):
     if (self.tensor is None) == (self.prediction is None):
@@ -70,11 +71,11 @@ class FailureBinding:
 
 
 def reward_component(tensor=None, *, prepare=None, prediction=None,
-                     sense_before_reward=False):
+                     sense_before_reward=False, requires_height=False):
   """Attach the imagined implementation/label metadata to a manager function."""
   def decorate(measured):
     measured.supermimic_reward = RewardComponent(tensor, prepare, prediction,
-                                                sense_before_reward)
+                                                sense_before_reward, requires_height)
     return measured
   return decorate
 
@@ -147,15 +148,18 @@ def bind_analytic_manager_terms(cfg):
       cfg.terminations[name] = replace(term, func=measured_failure)
 
 
-def analytic_reward(function):
+def analytic_reward(function=None, *, requires_height=False):
   """Convenience: define one ``function(StepContext, **params)`` for both paths.
 
   Use the decorated function directly in RewardTermCfg; make_env binds its
-  configured name before managers are constructed.
+  configured name before managers are constructed. Set requires_height=True
+  for reference-ground targets, independently of configured failure terms.
   """
-  function.supermimic_reward = RewardComponent(tensor=function)
-  function.use_tensor_measurement = True
-  return function
+  def decorate(function):
+    function.supermimic_reward = RewardComponent(tensor=function, requires_height=requires_height)
+    function.use_tensor_measurement = True
+    return function
+  return decorate if function is None else decorate(function)
 
 
 def analytic_failure(*, soft_width, requires_height=False):

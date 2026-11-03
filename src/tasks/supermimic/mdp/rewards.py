@@ -341,12 +341,27 @@ def feet_at_plane(
 
 # Components below own the differentiable counterpart of each measured term.
 # Register new terms here (or in another imported module), not in Algorithm.
-from ..core.components import Prediction, reward_component
+from ..core.components import Prediction, analytic_reward, reward_component
 import math
 
 
 def _root_position(ctx, std):
   return torch.exp(-(ctx.reference_root[0] - ctx.state[0]).square().sum(-1) / std**2)
+
+
+@analytic_reward(requires_height=True)
+def motion_terrain_anchor_position_error_exp(ctx, std: float) -> torch.Tensor:
+  """Track reference XY and terrain-adjusted Z in the same frame as state.
+
+  The offset is queried at the placed reference XY, independently of predicted
+  state. Leave the shared reference (including velocities) unchanged.
+  """
+  if ctx.height_offset is None:
+    raise ValueError("Terrain anchor reward requires a reference height_offset")
+  reference = ctx.reference_root[0]
+  target = torch.cat((reference[..., :2],
+                      (reference[..., 2] + ctx.height_offset).unsqueeze(-1)), -1)
+  return torch.exp(-(target - ctx.state[0]).square().sum(-1) / std**2)
 
 
 def _root_orientation(ctx, std):

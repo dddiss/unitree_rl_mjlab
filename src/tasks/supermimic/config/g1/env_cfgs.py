@@ -117,9 +117,10 @@ def unitree_g1_terrain_env_cfg(play=False, terrain_type=None, collect_foot_rewar
     "left_hip_roll_link", "left_knee_link", "left_ankle_roll_link",
     "right_hip_roll_link", "right_knee_link", "right_ankle_roll_link",
   )
-  # Keep the existing reward order as well as weights and formulas.
+  # Keep reward order/weights; only the anchor position target gains terrain Z.
   cfg.rewards = {
-    "motion_global_root_pos": cfg.rewards["motion_global_root_pos"],
+    "motion_global_root_pos": replace(
+      cfg.rewards["motion_global_root_pos"], func=mdp.motion_terrain_anchor_position_error_exp),
     "motion_global_root_ori": cfg.rewards["motion_global_root_ori"],
     "motion_upper_body_pos": RewardTermCfg(
       func=mdp.motion_root_relative_body_position_error_exp,

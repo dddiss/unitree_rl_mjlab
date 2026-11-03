@@ -3,7 +3,8 @@ import torch
 from ..core.state import normalize_xi
 
 def reward_term(self, state, f, action, a_prev, foot_costs=None, *, terrain_tolerance=None, height_offset=None):
-  reward = self.mdp.reward(state, f, action, a_prev, terrain_tolerance=terrain_tolerance)
+  reward = self.mdp.reward(state, f, action, a_prev, terrain_tolerance=terrain_tolerance,
+                           height_offset=height_offset)
   if foot_costs is not None:
     for i, name in enumerate(self.foot_reward_names):
       reward = reward + self.mdp.cfg.weights[name] * foot_costs[..., i] * self.mdp.cfg.step_dt

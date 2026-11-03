@@ -86,7 +86,9 @@ def test_same_error_is_strict_on_flat_and_tolerated_elsewhere_in_both_paths(mdp)
     robot=NS(data=NS(body_link_pos_w=bp+origin[:, None], body_link_quat_w=mat_to_quat(br))))
   env = NS(command_manager=NS(get_term=lambda _: cmd), terrain_tolerance=torch.tensor([False, True]))
   a = torch.zeros(2, 29)
-  imagined = mdp.reward_terms(state, f, a, a, terrain_tolerance=env.terrain_tolerance)
+  height_offset = torch.zeros_like(f, dtype=torch.float32)
+  imagined = mdp.reward_terms(state, f, a, a, terrain_tolerance=env.terrain_tolerance,
+                              height_offset=height_offset)
   for name in (*mdp.cfg.body_position_rewards, *mdp.cfg.body_orientation_rewards):
     measured = terms[name].func(env, **terms[name].params)
     torch.testing.assert_close(measured, imagined[name], rtol=1e-4, atol=1e-5)
@@ -100,7 +102,7 @@ def test_same_error_is_strict_on_flat_and_tolerated_elsewhere_in_both_paths(mdp)
     measured = terms[name].func(env, **terms[name].params)
     torch.testing.assert_close(measured[0], measured[1])
   with pytest.raises(ValueError, match='sampled terrain_tolerance'):
-    mdp.reward(state, f, a, a)
+    mdp.reward(state, f, a, a, height_offset=height_offset)
 
 
 def test_gate_does_not_remove_gradient_outside_tolerance():

@@ -135,7 +135,7 @@ class FunctionalMDP:
     self.body_indexes = torch.as_tensor(body_indexes, device=motion.device, dtype=torch.long)
     self.root_body_index = int(root_body_index)
     self.cfg = cfg or MdpConfig(step_dt=motion.step_dt)
-    # Reference-XY ray query used only for height termination (None = plane).
+    # Reference-XY height lookup shared by terrain rewards/failures (None = plane).
     self.termination_ground = None
     if soft_limits is None:
       mid, half = (kin.q_lo + kin.q_hi) / 2, (kin.q_hi - kin.q_lo) * 0.45
@@ -158,8 +158,13 @@ class FunctionalMDP:
                  if binding.component.prediction is not None and binding.name in self.cfg.weights)
 
   @property
+  def requires_reward_height_offset(self):
+    return any(binding.component.requires_height for binding in self.cfg.resolved_rewards())
+
+  @property
   def requires_height_offset(self):
-    return any(binding.component.requires_height for binding in self.cfg.resolved_failures())
+    return self.requires_reward_height_offset or any(
+      binding.component.requires_height for binding in self.cfg.resolved_failures())
 
   def validate_imagination_rewards(self, learned_rewards=()):
     analytic = {binding.name for binding in self.cfg.resolved_rewards()
@@ -221,13 +226,14 @@ class FunctionalMDP:
     return (anchor.unsqueeze(-2) + (delta.unsqueeze(-3) @ (bp - rp.unsqueeze(-2)).unsqueeze(-1)).squeeze(-1),
             delta.unsqueeze(-3) @ br)
 
-  def reward_terms(self, state, f, action, a_prev, *, terrain_tolerance=None):
-    ctx = StepContext(self, state, f, action, a_prev, terrain_tolerance)
+  def reward_terms(self, state, f, action, a_prev, *, terrain_tolerance=None, height_offset=None):
+    ctx = StepContext(self, state, f, action, a_prev, terrain_tolerance, height_offset=height_offset)
     return {binding.name: binding.value(ctx) for binding in self.cfg.resolved_rewards()
             if binding.component.tensor is not None}
 
-  def reward(self, state, f, action, a_prev, *, terrain_tolerance=None):
-    terms = self.reward_terms(state, f, action, a_prev, terrain_tolerance=terrain_tolerance)
+  def reward(self, state, f, action, a_prev, *, terrain_tolerance=None, height_offset=None):
+    terms = self.reward_terms(state, f, action, a_prev, terrain_tolerance=terrain_tolerance,
+                              height_offset=height_offset)
     return sum(self.cfg.weights.get(k, 0.0) * value for k, value in terms.items()) * self.cfg.step_dt
 
   @torch.no_grad()

@@ -186,13 +186,14 @@ def test_step_captures_state_and_target_before_command_advance(visual, foot_supp
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(),reason='Requires Linux NVIDIA GPU and installed mjlab 1.6.0')
-def test_real_env_reset_and_reward_parity(mdp):
+@pytest.mark.parametrize('task_id', ['Unitree-G1-SuperMimic', 'Unitree-G1-SuperMimic-Terrain'])
+def test_real_env_reset_and_reward_parity(mdp, task_id):
   import sys
   sys.path.insert(0,str(ROOT))
   from src.tasks.supermimic.config import make_env
   from src.tasks.supermimic.core.state import unflatten_state
   from src.tasks.supermimic.terrain.reset import terrain_tile_xy_bounds
-  env=make_env(mdp.motion.motion_files,num_envs=4)
+  env=make_env(mdp.motion.motion_files,num_envs=4,task_id=task_id)
   try:
     cmd=env.command_manager.get_term('motion');env.reset()
     xi=env.context.clone()
@@ -214,9 +215,16 @@ def test_real_env_reset_and_reward_parity(mdp):
     for _ in range(64):
       env.step(torch.zeros(4,29,device=env.device))
       tr=env.last_transition
-      expected=env.functional_mdp.reward(state_in_reference_frame(unflatten_state(tr['s1']),tr['reference_xy_offset']),
-                                         tr['f'],tr['a'],tr['a_prev'],
-                                         terrain_tolerance=tr['terrain_tolerance'])
+      shared=env.functional_mdp
+      height=(shared.termination_height_offset(tr['f'],tr['env_origin'],tr['reference_xy_offset'])
+              if shared.requires_reward_height_offset else None)
+      expected=shared.reward(state_in_reference_frame(unflatten_state(tr['s1']),tr['reference_xy_offset']),
+                             tr['f'],tr['a'],tr['a_prev'],
+                             terrain_tolerance=tr['terrain_tolerance'],height_offset=height)
+      # Sensor rewards have no analytic counterpart; compare their measured
+      # pre-reset labels with exactly the same weights/time step as the manager.
+      for i,name in enumerate(env.foot_reward_names):
+        expected+=shared.cfg.weights[name]*tr['foot_costs'][:,i]*env.step_dt
       torch.testing.assert_close(tr['r'],expected,rtol=1e-4,atol=1e-5)
       assert torch.isfinite(tr['s1']).all()
       done=(tr['terminated']|tr['truncated']).nonzero().flatten()

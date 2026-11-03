@@ -131,7 +131,8 @@ def test_new_manager_rewards_match_fk_with_nonzero_origin_and_root_rotation(mdp,
     body_quat_w=mdp.motion.body_quat_w[f][:, mdp.body_indexes])
   env = NS(command_manager=NS(get_term=lambda name: cmd), terrain_tolerance=torch.ones(1, dtype=torch.bool))
   a = torch.zeros(1, 29)
-  imagined = mdp.reward_terms(state, f, a, a, terrain_tolerance=env.terrain_tolerance)
+  imagined = mdp.reward_terms(state, f, a, a, terrain_tolerance=env.terrain_tolerance,
+                              height_offset=torch.zeros_like(f, dtype=torch.float32))
   for name in (*mdp.cfg.body_position_rewards, *mdp.cfg.body_orientation_rewards):
     actual = terms[name].func(env, **terms[name].params)
     torch.testing.assert_close(actual, imagined[name], rtol=1e-4, atol=1e-5)
@@ -149,7 +150,9 @@ def test_batched_compiled_reward_and_backward_match_eager_and_legacy_terms(mdp):
   a = torch.zeros(2, 2, 29)
   old_terms = mdp.reward_terms(state, f, a, a)
   apply_config(mdp)
-  context = {'terrain_tolerance': torch.tensor([[False, True], [True, False]])}
+  # Zero terrain lift isolates the existing body-reward/gradient comparison.
+  context = {'terrain_tolerance': torch.tensor([[False, True], [True, False]]),
+             'height_offset': torch.zeros_like(f, dtype=torch.float32)}
   new_terms = mdp.reward_terms(state, f, a, a, **context)
   for name, old in old_terms.items():
     torch.testing.assert_close(new_terms[name], old, rtol=0, atol=0)

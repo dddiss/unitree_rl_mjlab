@@ -105,6 +105,7 @@ def test_common_tracking_template_retains_main_defaults():
   cfg = load_config_factories()['make_tracking_env_cfg']()
   assert tuple(cfg.rewards) == FLAT_REWARDS
   assert [term.weight for term in cfg.rewards.values()] == [.5, .5, 1., 1., 1., 1., -.1, -2.]
+  assert cfg.rewards['motion_global_root_pos'].func is rewards.motion_global_anchor_position_error_exp
   assert cfg.rewards['motion_body_pos'].func is rewards.motion_relative_body_position_error_exp
   assert cfg.rewards['motion_body_ori'].func is rewards.motion_relative_body_orientation_error_exp
   assert cfg.scene.terrain.terrain_type == 'plane'
@@ -140,6 +141,11 @@ def test_task_overrides_preserve_play_settings_and_explicit_sensors(task, kind, 
   assert cfg.scene.terrain.geoms[0].friction == ((1.,) if play else (.3,))
   assert cfg.commands['motion'].sampling_mode == ('start' if play else 'return_based')
   assert tuple(cfg.rewards) == names
+  anchor = cfg.rewards['motion_global_root_pos']
+  assert anchor.func is (rewards.motion_global_anchor_position_error_exp if task == 'flat'
+                         else rewards.motion_terrain_anchor_position_error_exp)
+  assert anchor.weight == .5 and anchor.params == {'command_name': 'motion', 'std': .3}
+  assert anchor.func.supermimic_reward.requires_height is (task == 'terrain')
   sensor_names = ['self_collision']
   if task == 'terrain':
     sensor_names += ['supermimic_depth', 'foot_collision_contacts', 'foot_support_contacts', 'foot_height_scanners']

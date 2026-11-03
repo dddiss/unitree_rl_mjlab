@@ -129,10 +129,14 @@ class SuperMimicEnv(ManagerBasedRlEnv):
   def shared_reward_terms(self):
     if self._reward_terms is None:
       cmd = self.command_manager.get_term("motion")
-      self._reward_terms = self.functional_mdp.reward_terms(
+      mdp = self.functional_mdp
+      offset = (mdp.termination_height_offset(cmd.time_steps, self.scene.env_origins,
+                                             cmd.reference_xy_offset)
+                if mdp.requires_reward_height_offset else None)
+      self._reward_terms = mdp.reward_terms(
         state_in_reference_frame(read_state(self), cmd.reference_xy_offset),
         cmd.time_steps, self.action_manager.action, self.action_manager.prev_action,
-        terrain_tolerance=self.terrain_tolerance)
+        terrain_tolerance=self.terrain_tolerance, height_offset=offset)
     return self._reward_terms
 
   def shared_failure_terms(self):
